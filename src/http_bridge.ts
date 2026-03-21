@@ -1,6 +1,6 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { sendChannelNotification } from "./notification.js";
-import { HitlMessage, HitlWebSocket, ReplyPayload } from "./types.js";
+import { HitlAttachment, HitlMessage, HitlWebSocket, ReplyPayload } from "./types.js";
 import { createPairingRequest, consumePairingCode, validatePairingCode } from "./pairing.js";
 import { addToAllowlist, isTokenAllowed, hashToken } from "./allowlist.js";
 import { getIdentity } from "./identity.js";
@@ -73,6 +73,41 @@ export function broadcastReply(text: string, messageId?: string, agentId?: strin
       ws.send(rawPayload);
     }
   }
+}
+
+/**
+ * Save image attachments to the inbox directory and return updated content
+ * with file paths appended.
+ */
+async function processAttachments(
+  message: string,
+  attachments?: HitlAttachment[]
+): Promise<string> {
+  if (!attachments || attachments.length === 0) return message;
+
+  const inboxDir = `${process.env.HOME}/.claude/channels/hitl-channel/inbox`;
+  await Bun.$`mkdir -p ${inboxDir}`.quiet();
+
+  let contentForNotification = message;
+
+  for (const attachment of attachments) {
+    if (attachment.type === "image" && attachment.data) {
+      const ext = attachment.media_type?.split("/")[1] || "jpg";
+      const fileName =
+        attachment.fileName || `img_${Date.now()}.${ext}`;
+      const filePath = `${inboxDir}/${fileName}`;
+
+      const buffer = Buffer.from(attachment.data, "base64");
+      await Bun.write(filePath, buffer);
+
+      contentForNotification += `\n\n[Image: ${filePath}]`;
+      process.stderr.write(
+        `[hitl-channel] Saved image: ${filePath} (${buffer.length} bytes)\n`
+      );
+    }
+  }
+
+  return contentForNotification;
 }
 
 export function startHttpBridge(mcp: Server) {
@@ -216,15 +251,21 @@ export function startHttpBridge(mcp: Server) {
             const message = String(body.message ?? body.content ?? "");
             const senderId = String(body.sender_id ?? "unknown");
             const agentId = body.agent_id ? String(body.agent_id) : undefined;
+            const attachments = body.attachments;
 
-            if (!message.trim()) {
+            if (!message.trim() && (!attachments || attachments.length === 0)) {
               return new Response(
                 JSON.stringify({ error: "empty message" }),
                 { status: 400, headers: { "content-type": "application/json" } }
               );
             }
 
-            await sendChannelNotification(mcp, message, {
+            const contentForNotification = await processAttachments(
+              message,
+              attachments
+            );
+
+            await sendChannelNotification(mcp, contentForNotification, {
               sender_id: senderId,
               ...(agentId ? { agent_id: agentId } : {}),
             });
@@ -259,15 +300,19 @@ export function startHttpBridge(mcp: Server) {
         try {
           const data = JSON.parse(String(raw)) as HitlMessage;
           const message = data.message?.trim() || data.content?.trim();
-          if (message) {
-            sendChannelNotification(mcp, message, {
-              sender_id: data.sender_id ?? "unknown",
-              ...(data.agent_id ? { agent_id: data.agent_id } : {}),
-            }).catch((err) => {
-              process.stderr.write(
-                `[hitl-channel] Failed to send notification: ${err instanceof Error ? err.message : err}\n`
-              );
-            });
+          if (message || (data.attachments && data.attachments.length > 0)) {
+            processAttachments(message ?? "", data.attachments)
+              .then((content) =>
+                sendChannelNotification(mcp, content, {
+                  sender_id: data.sender_id ?? "unknown",
+                  ...(data.agent_id ? { agent_id: data.agent_id } : {}),
+                })
+              )
+              .catch((err) => {
+                process.stderr.write(
+                  `[hitl-channel] Failed to send notification: ${err instanceof Error ? err.message : err}\n`
+                );
+              });
           }
         } catch {
           // Ignore malformed messages

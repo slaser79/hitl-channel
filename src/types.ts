@@ -1,8 +1,16 @@
+export interface HitlAttachment {
+  type: string;
+  media_type: string;
+  data: string;
+  fileName?: string;
+}
+
 export interface HitlMessage {
   message?: string;
   content?: string;
   sender_id?: string;
   agent_id?: string;
+  attachments?: HitlAttachment[];
 }
 
 export interface ChannelMeta {
