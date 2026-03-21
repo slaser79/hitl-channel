@@ -20,8 +20,11 @@ export function startMDNS(port: number, instanceId?: string, displayName?: strin
     const { Bonjour } = require("bonjour-service") as { Bonjour: new () => Bonjour };
     bonjour = new Bonjour();
 
-    const serviceName = displayName
-      || (instanceId ? `hitl-channel-${instanceId.slice(0, 8)}` : "hitl-channel");
+    // Always include instanceId suffix for uniqueness — displayName is in TXT records
+    const baseName = displayName || "hitl-channel";
+    const serviceName = instanceId
+      ? `${baseName}-${instanceId.slice(0, 8)}`
+      : baseName;
 
     advertisedService = bonjour.publish({
       name: serviceName,
