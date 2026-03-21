@@ -14,6 +14,7 @@ const IDENTITY_FILE = `${IDENTITY_DIR}/identity.json`;
 export interface InstanceIdentity {
   instanceId: string;
   hostname: string;
+  displayName: string;
   createdAt: string;
 }
 
@@ -54,9 +55,11 @@ export async function loadIdentity(): Promise<InstanceIdentity> {
  */
 async function createIdentity(): Promise<InstanceIdentity> {
   const hostname = await getHostname();
+  const displayName = process.env.HITL_CHANNEL_NAME || hostname;
   const identity: InstanceIdentity = {
     instanceId: crypto.randomUUID(),
     hostname,
+    displayName,
     createdAt: new Date().toISOString(),
   };
   process.stderr.write(`[hitl-channel] Created new instance identity: ${identity.instanceId}\n`);
@@ -76,7 +79,14 @@ async function saveIdentity(identity: InstanceIdentity): Promise<void> {
  * Get the current instance identity.
  */
 export async function getIdentity(): Promise<InstanceIdentity> {
-  return loadIdentity();
+  const identity = await loadIdentity();
+  // Always prefer HITL_CHANNEL_NAME env var over stored displayName
+  const envName = process.env.HITL_CHANNEL_NAME;
+  if (envName && envName !== identity.displayName) {
+    identity.displayName = envName;
+    await saveIdentity(identity);
+  }
+  return identity;
 }
 
 /**
