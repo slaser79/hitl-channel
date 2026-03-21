@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "hitl-channel": {
+      "command": "bun",
+      "args": ["src/server.ts"],
+      "env": {
+        "HITL_CHANNEL_API_KEY": "your-secret-key-here",
+        "HITL_CHANNEL_PORT": "8789"
+      }
+    }
+  }
+}
