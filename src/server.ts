@@ -84,9 +84,10 @@ process.stderr.write(
   `[hitl-channel] HITL Channel server listening on http://0.0.0.0:${PORT}\n`
 );
 process.stderr.write(`[hitl-channel] Instance ID: ${identity.instanceId}\n`);
+process.stderr.write(`[hitl-channel] Display Name: ${identity.displayName}\n`);
 
 // Start mDNS advertising
-startMDNS(PORT, identity.instanceId);
+startMDNS(PORT, identity.instanceId, identity.displayName);
 
 // Start periodic cleanup of expired pairing codes (every minute)
 setInterval(() => {

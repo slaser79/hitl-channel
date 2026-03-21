@@ -14,16 +14,15 @@ let advertisedService: Service | null = null;
 /**
  * Start advertising the hitl-channel service via mDNS.
  */
-export function startMDNS(port: number, instanceId?: string): void {
+export function startMDNS(port: number, instanceId?: string, displayName?: string): void {
   try {
     // Dynamically import bonjour-service
     const { Bonjour } = require("bonjour-service") as { Bonjour: new () => Bonjour };
     bonjour = new Bonjour();
-    
-    const serviceName = instanceId 
-      ? `hitl-channel-${instanceId.slice(0, 8)}`
-      : "hitl-channel";
-    
+
+    const serviceName = displayName
+      || (instanceId ? `hitl-channel-${instanceId.slice(0, 8)}` : "hitl-channel");
+
     advertisedService = bonjour.publish({
       name: serviceName,
       type: "_hitl-channel._tcp",
@@ -31,6 +30,7 @@ export function startMDNS(port: number, instanceId?: string): void {
       txt: {
         version: "0.0.1",
         instanceId: instanceId || "unknown",
+        displayName: displayName || "",
       },
     });
     

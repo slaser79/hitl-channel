@@ -102,6 +102,7 @@ export function startHttpBridge(mcp: Server) {
             JSON.stringify({
               instanceId: identity.instanceId,
               hostname: identity.hostname,
+              displayName: identity.displayName,
             }),
             { headers: { "content-type": "application/json" } }
           );
