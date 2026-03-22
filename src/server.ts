@@ -5,7 +5,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { startHttpBridge, broadcastReply } from "./http_bridge.js";
+import { startHttpBridge, broadcastReply, clients } from "./http_bridge.js";
 import { getIdentity } from "./identity.js";
 import { startMDNS } from "./mdns.js";
 import { cleanupExpiredPairings } from "./pairing.js";
@@ -53,6 +53,31 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["text"],
       },
     },
+    {
+      name: "present_choices_to_hitl",
+      description:
+        "Present choices to the HITL mobile app user for selection. " +
+        "The user's selection will arrive as an inbound channel message.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          prompt: {
+            type: "string",
+            description: "The question or prompt to show the user",
+          },
+          choices: {
+            type: "array",
+            items: { type: "string" },
+            description: "List of choice labels",
+          },
+          multi_select: {
+            type: "boolean",
+            description: "Allow multiple selections (default: false)",
+          },
+        },
+        required: ["prompt", "choices"],
+      },
+    },
   ],
 }));
 
@@ -72,6 +97,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     return {
       content: [{ type: "text" as const, text: `Sent to HITL app: ${text}` }],
+    };
+  }
+
+  if (req.params.name === "present_choices_to_hitl") {
+    const prompt = args.prompt as string;
+    const choices = args.choices as string[];
+    const multiSelect = args.multi_select as boolean | undefined;
+
+    process.stderr.write(
+      `[hitl-channel] Choices: ${prompt} [${choices.join(", ")}] (multi: ${multiSelect ?? false})\n`
+    );
+
+    // Broadcast choices to connected apps via WebSocket
+    const payload = JSON.stringify({
+      type: "choices",
+      content: prompt,
+      choices: choices,
+      multiSelect: multiSelect ?? false,
+      id: `c${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      ts: new Date().toISOString(),
+    });
+
+    for (const ws of clients) {
+      if (ws.readyState === 1) ws.send(payload);
+    }
+
+    return {
+      content: [{ type: "text" as const, text: `Choices presented to user: ${choices.join(", ")}` }],
     };
   }
 
