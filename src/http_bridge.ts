@@ -4,8 +4,31 @@ import { HitlAttachment, HitlMessage, HitlWebSocket, ReplyPayload } from "./type
 import { createPairingRequest, consumePairingCode, validatePairingCode } from "./pairing.js";
 import { addToAllowlist, isTokenAllowed, hashToken } from "./allowlist.js";
 import { getIdentity } from "./identity.js";
+import { FrameCorrelator } from "./correlator.js";
+import { appendAudit, sha256Hex } from "./audit.js";
 
 export const clients = new Set<HitlWebSocket>();
+
+// SPEC-HITL-CC-001 §4.2 — single correlator instance shared with server.ts so
+// inbound `tool_call_result` / `list_tools_result` frames can resolve waiters.
+export const correlator = new FrameCorrelator();
+
+/**
+ * Broadcast a JSON frame to every connected phone WS. Used by `call_phone_tool`
+ * / `list_phone_tools` to push a request frame. Returns the number of clients
+ * the frame was actually delivered to.
+ */
+export function broadcastFrame(frame: Record<string, unknown>): number {
+  const raw = JSON.stringify(frame);
+  let count = 0;
+  for (const ws of clients) {
+    if (ws.readyState === 1) {
+      ws.send(raw);
+      count++;
+    }
+  }
+  return count;
+}
 
 /**
  * Generate a new device token (UUID).
@@ -298,7 +321,48 @@ export function startHttpBridge(mcp: Server) {
       },
       message(_ws, raw) {
         try {
-          const data = JSON.parse(String(raw)) as HitlMessage;
+          const data = JSON.parse(String(raw)) as Record<string, unknown> & HitlMessage;
+          // SPEC-HITL-CC-001 §4.2 — `type`-first routing: control frames must
+          // never fall through to the chat-notification path. A
+          // `tool_call_result` arriving for an unknown / already-resolved
+          // request_id is logged at warn level and dropped (no waiter, no
+          // audit double-count) per the idempotency contract.
+          const frameType = typeof data.type === "string" ? data.type : undefined;
+          if (frameType === "tool_call_result" || frameType === "list_tools_result") {
+            const reqId = typeof data.request_id === "string" ? data.request_id : undefined;
+            if (!reqId) {
+              process.stderr.write(
+                `[hitl-channel] WARN ${frameType} missing request_id — dropped\n`
+              );
+              return;
+            }
+            const resolved = correlator.resolve(reqId, data);
+            if (!resolved) {
+              process.stderr.write(
+                `[hitl-channel] WARN ${frameType} for unknown request_id ${reqId} — dropped\n`
+              );
+              return;
+            }
+            // Async audit; don't block WS path.
+            void appendAudit({
+              ts: new Date().toISOString(),
+              instance_id: process.env.HITL_INSTANCE_ID ?? "unknown",
+              direction: "phone_returns_to_cc",
+              kind: "tool_result",
+              tool_name:
+                frameType === "tool_call_result"
+                  ? (typeof data.tool_name === "string" ? data.tool_name : null)
+                  : null,
+              approval:
+                frameType === "tool_call_result"
+                  ? ((data.approval as "auto" | "user_approved" | "user_denied" | "timeout" | undefined) ?? null)
+                  : null,
+              prompt_hash: sha256Hex(JSON.stringify(data)),
+              duration_ms: null,
+            });
+            return;
+          }
+
           const message = data.message?.trim() || data.content?.trim();
           if (message || (data.attachments && data.attachments.length > 0)) {
             processAttachments(message ?? "", data.attachments)
@@ -313,6 +377,16 @@ export function startHttpBridge(mcp: Server) {
                   `[hitl-channel] Failed to send notification: ${err instanceof Error ? err.message : err}\n`
                 );
               });
+            void appendAudit({
+              ts: new Date().toISOString(),
+              instance_id: process.env.HITL_INSTANCE_ID ?? "unknown",
+              direction: "phone_to_cc",
+              kind: "message",
+              tool_name: null,
+              approval: null,
+              prompt_hash: sha256Hex(message ?? ""),
+              duration_ms: null,
+            });
           }
         } catch {
           // Ignore malformed messages
