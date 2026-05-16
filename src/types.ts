@@ -35,3 +35,51 @@ export interface HitlWebSocket {
   readyState: number;
   send: (data: string) => void;
 }
+
+// ─── SPEC-HITL-CC-001 frame types ──────────────────────────────────────────
+// New WS frame types added by Phase 1 of the Companion Agent spec. All frames
+// are JSON text frames on the existing `/ws` endpoint and co-exist with the
+// pre-existing `reply` / `choices` shapes.
+
+export interface ToolCallRequestFrame {
+  type: "tool_call_request";
+  request_id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  timeout_seconds: number;
+  cc_instance_id: string;
+}
+
+export interface ToolCallResultFrame {
+  type: "tool_call_result";
+  request_id: string;
+  success: boolean;
+  output?: unknown;
+  error?: string | null;
+  approval?: "auto" | "user_approved" | "user_denied" | "timeout";
+}
+
+export interface ListToolsRequestFrame {
+  type: "list_tools_request";
+  request_id: string;
+  filter?: string;
+}
+
+export interface ListedTool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  tier: string; // free | softConfirm | hardConfirm
+}
+
+export interface ListToolsResultFrame {
+  type: "list_tools_result";
+  request_id: string;
+  tools: ListedTool[];
+}
+
+export interface BootstrapFrame {
+  type: "bootstrap";
+  content: string;
+  meta: { type: "bootstrap" };
+}

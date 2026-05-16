@@ -5,15 +5,43 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { startHttpBridge, broadcastReply, clients } from "./http_bridge.js";
+import {
+  startHttpBridge,
+  broadcastReply,
+  broadcastFrame,
+  correlator,
+  clients,
+} from "./http_bridge.js";
 import { getIdentity } from "./identity.js";
 import { startMDNS } from "./mdns.js";
 import { cleanupExpiredPairings } from "./pairing.js";
+import {
+  appendAudit,
+  pruneOldAuditFiles,
+  sha256Hex,
+} from "./audit.js";
+import type {
+  ListToolsResultFrame,
+  ToolCallResultFrame,
+} from "./types.js";
 
 const PORT = Number(process.env.HITL_CHANNEL_PORT ?? 8789);
 
+// SPEC-HITL-CC-001 §4.2 — standing-orders contract APPENDED (not replacing)
+// the existing chat-relay instructions, so Claude Code defaults to the new
+// production tool-call path without a paste-in bootstrap prompt.
+const STANDING_ORDERS = [
+  "Treat inbound channel notifications as user queries from the paired HITL phone.",
+  "For phone-relevant questions or actions (calendar, contacts, agents, navigation, send/compose, file ops, …),",
+  "default to `call_phone_tool(name, arguments)` — see `list_phone_tools()` for the live catalog.",
+  "Trust-tier confirms are gated on the phone UI; you do not need to ask the user for yes/no in chat —",
+  "the user will tap Approve or Deny on a system sheet and the call returns with `approval:` populated.",
+  "When you do speak back to the user, use `reply_to_hitl` with the inbound `message_id`.",
+  "Requires Claude Code v2.1.80+ for `--dangerously-load-development-channels`.",
+].join(" ");
+
 const mcp = new Server(
-  { name: "hitl-channel", version: "0.0.1" },
+  { name: "hitl-channel", version: "0.1.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -23,6 +51,7 @@ const mcp = new Server(
       'Messages from the HITL mobile app arrive as <channel source="hitl-channel" sender_id="..." message_id="...">.',
       "Use the reply_to_hitl tool to send responses back to the mobile app user.",
       "The sender_id indicates who sent the message (e.g., 'ceo', 'xo').",
+      STANDING_ORDERS,
     ].join(" "),
   }
 );
@@ -78,11 +107,62 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["prompt", "choices"],
       },
     },
+    // ─── SPEC-HITL-CC-001 Phase 1 ────────────────────────────────────────
+    {
+      name: "list_phone_tools",
+      description:
+        "List the on-device tools available on the paired HITL phone. " +
+        "Returns the catalog of InternalToolsService tools (~60) with name, " +
+        "description, inputSchema, and trust tier (free | softConfirm | hardConfirm). " +
+        "Excludes UI-flow primitives tagged inAppOnly.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          filter: {
+            type: "string",
+            description: "Optional substring filter on tool name.",
+          },
+        },
+      },
+    },
+    {
+      name: "call_phone_tool",
+      description:
+        "Invoke an on-device tool on the paired HITL phone (e.g. list_events, " +
+        "compose_email, navigate_to_agent, create_local_agent). " +
+        "Soft/hard-confirm tools surface the existing trust-tier sheet on the " +
+        "phone; the call returns with approval = 'auto' | 'user_approved' | " +
+        "'user_denied' | 'timeout'. Free-tier tools run silently. " +
+        "Use list_phone_tools() for the live catalog.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "Tool name (from list_phone_tools).",
+          },
+          arguments: {
+            type: "object",
+            description: "Tool arguments matching the tool's inputSchema.",
+          },
+          timeout_seconds: {
+            type: "number",
+            description: "Round-trip timeout. Default 60, hard cap 300.",
+          },
+        },
+        required: ["name"],
+      },
+    },
   ],
 }));
 
+function generateRequestId(): string {
+  return globalThis.crypto.randomUUID();
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>;
+  const identity = await getIdentity();
 
   if (req.params.name === "reply_to_hitl") {
     const text = args.text as string;
@@ -94,6 +174,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     );
 
     broadcastReply(text, messageId, agentId);
+    void appendAudit({
+      ts: new Date().toISOString(),
+      instance_id: identity.instanceId,
+      direction: "cc_to_phone",
+      kind: "reply",
+      tool_name: null,
+      approval: null,
+      prompt_hash: sha256Hex(text ?? ""),
+      duration_ms: null,
+    });
 
     return {
       content: [{ type: "text" as const, text: `Sent to HITL app: ${text}` }],
@@ -109,7 +199,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       `[hitl-channel] Choices: ${prompt} [${choices.join(", ")}] (multi: ${multiSelect ?? false})\n`
     );
 
-    // Broadcast choices to connected apps via WebSocket
     const payload = JSON.stringify({
       type: "choices",
       content: prompt,
@@ -122,10 +211,197 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     for (const ws of clients) {
       if (ws.readyState === 1) ws.send(payload);
     }
+    void appendAudit({
+      ts: new Date().toISOString(),
+      instance_id: identity.instanceId,
+      direction: "cc_to_phone",
+      kind: "choices",
+      tool_name: null,
+      approval: null,
+      prompt_hash: sha256Hex(prompt ?? ""),
+      duration_ms: null,
+    });
 
     return {
-      content: [{ type: "text" as const, text: `Choices presented to user: ${choices.join(", ")}` }],
+      content: [
+        {
+          type: "text" as const,
+          text: `Choices presented to user: ${choices.join(", ")}`,
+        },
+      ],
     };
+  }
+
+  // ─── SPEC-HITL-CC-001 Phase 1 ─────────────────────────────────────────
+  if (req.params.name === "list_phone_tools") {
+    if (clients.size === 0) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: "No paired HITL phone is currently connected.",
+          },
+        ],
+      };
+    }
+    const filter = (args.filter as string | undefined) ?? undefined;
+    const requestId = generateRequestId();
+    const frame = {
+      type: "list_tools_request" as const,
+      request_id: requestId,
+      ...(filter ? { filter } : {}),
+    };
+    const waiter = correlator.register<ListToolsResultFrame>(requestId, 30_000);
+    const delivered = broadcastFrame(frame);
+    if (delivered === 0) {
+      correlator.reject(requestId, new Error("no_phone_connected_post_check"));
+    }
+    try {
+      const result = await waiter;
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              { tools: result.tools ?? [] },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `list_phone_tools failed: ${err instanceof Error ? err.message : err}`,
+          },
+        ],
+      };
+    }
+  }
+
+  if (req.params.name === "call_phone_tool") {
+    if (clients.size === 0) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: "No paired HITL phone is currently connected.",
+          },
+        ],
+      };
+    }
+    const name = args.name as string | undefined;
+    if (!name || typeof name !== "string") {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: "call_phone_tool requires `name` (string).",
+          },
+        ],
+      };
+    }
+    const toolArgs = (args.arguments as Record<string, unknown> | undefined) ?? {};
+    const rawTimeout = Number(args.timeout_seconds ?? 60);
+    const timeoutSeconds = Math.min(
+      300,
+      Math.max(1, Number.isFinite(rawTimeout) ? rawTimeout : 60),
+    );
+    const requestId = generateRequestId();
+    const frame = {
+      type: "tool_call_request" as const,
+      request_id: requestId,
+      name,
+      arguments: toolArgs,
+      timeout_seconds: timeoutSeconds,
+      cc_instance_id: identity.instanceId,
+    };
+    const startedAt = Date.now();
+    void appendAudit({
+      ts: new Date(startedAt).toISOString(),
+      instance_id: identity.instanceId,
+      direction: "cc_calls_phone",
+      kind: "tool_call",
+      tool_name: name,
+      approval: null,
+      prompt_hash: sha256Hex(JSON.stringify(toolArgs)),
+      duration_ms: null,
+    });
+    const waiter = correlator.register<ToolCallResultFrame>(
+      requestId,
+      timeoutSeconds * 1000,
+    );
+    const delivered = broadcastFrame(frame);
+    if (delivered === 0) {
+      correlator.reject(requestId, new Error("no_phone_connected_post_check"));
+    }
+    try {
+      const result = await waiter;
+      const duration = Date.now() - startedAt;
+      void appendAudit({
+        ts: new Date().toISOString(),
+        instance_id: identity.instanceId,
+        direction: "phone_returns_to_cc",
+        kind: "tool_result",
+        tool_name: name,
+        approval: result.approval ?? null,
+        prompt_hash: sha256Hex(JSON.stringify(result.output ?? null)),
+        duration_ms: duration,
+      });
+      if (result.success === false) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  success: false,
+                  error: result.error ?? "unknown_error",
+                  approval: result.approval ?? null,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                success: true,
+                output: result.output ?? null,
+                approval: result.approval ?? null,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `call_phone_tool failed: ${msg}`,
+          },
+        ],
+      };
+    }
   }
 
   throw new Error(`Unknown tool: ${req.params.name}`);
@@ -133,11 +409,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // Initialize instance identity and start services
 const identity = await getIdentity();
+// Propagate to env so http_bridge audit-on-message can stamp instance_id
+// without re-reading the identity file on every WS frame.
+process.env.HITL_INSTANCE_ID = identity.instanceId;
 process.stderr.write(
   `[hitl-channel] HITL Channel server listening on http://0.0.0.0:${PORT}\n`
 );
 process.stderr.write(`[hitl-channel] Instance ID: ${identity.instanceId}\n`);
 process.stderr.write(`[hitl-channel] Display Name: ${identity.displayName}\n`);
+
+// SPEC-HITL-CC-001 §4.2 — best-effort audit retention prune at startup.
+void pruneOldAuditFiles();
 
 // Start mDNS advertising
 startMDNS(PORT, identity.instanceId, identity.displayName);
