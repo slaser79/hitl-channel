@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { ReplyBuffer } from "../reply_buffer.js";
-import { drainBufferToClient } from "../http_bridge.js";
+import { drainBufferToClient, drainBufferToClientSync } from "../http_bridge.js";
 import type {
   BufferDrainAuditLine,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars -- imported for shape sanity
@@ -151,5 +151,116 @@ describe("ReplyBuffer — SPEC-HITL-CC-001 AC#26", () => {
     const n = await drainBufferToClient(ws, buf, fakeAudit);
     expect(n).toBe(0);
     expect(auditCalls.length).toBe(0);
+  });
+
+  // ─── P0 regression: peek + per-entry commit ───────────────────────────
+  // The buffer used to call `drain()` (destructive clear) BEFORE confirming
+  // ws.send succeeded. If the WS dropped mid-loop, remaining entries were
+  // permanently lost. peek + commit now leaves un-sent entries in the buffer.
+  it("P0 regression: partial-send (ws dies mid-loop) leaves remaining entries in buffer", () => {
+    const buf = new ReplyBuffer();
+    buf.push(makeReply("a", "m1", "agentA", "1"));
+    buf.push(makeReply("b", "m2", "agentA", "2"));
+    buf.push(makeReply("c", "m3", "agentA", "3"));
+    expect(buf.size()).toBe(3);
+
+    // Fake WS that closes after the first send.
+    const sent: string[] = [];
+    let sendCount = 0;
+    const ws: HitlWebSocket = {
+      readyState: 1,
+      send: (data: string) => {
+        sent.push(data);
+        sendCount++;
+        if (sendCount >= 1) ws.readyState = 3; // CLOSED after first send
+      },
+    };
+
+    const { sent: sentCount } = drainBufferToClientSync(ws, buf);
+    expect(sentCount).toBe(1);          // only the first entry was sent
+    expect(sent.length).toBe(1);
+    expect(buf.size()).toBe(2);         // m2 + m3 still in buffer for next reconnect
+
+    // Second reconnect: a healthy WS drains the rest.
+    const { ws: ws2, sent: sent2 } = makeFakeWs();
+    const r2 = drainBufferToClientSync(ws2, buf);
+    expect(r2.sent).toBe(2);
+    expect(sent2.length).toBe(2);
+    const ids = sent2.map((s) => JSON.parse(s).message_id);
+    expect(ids).toEqual(["m2", "m3"]);
+    expect(buf.size()).toBe(0);
+  });
+
+  // ─── P2 regression: audit `replies_drained` reflects actual sends ─────
+  it("P2 regression: audit replies_drained counts actual ws.send successes, not peek snapshot length", async () => {
+    const buf = new ReplyBuffer();
+    buf.push(makeReply("a", "m1", "agentA", "1"));
+    buf.push(makeReply("b", "m2", "agentA", "2"));
+    buf.push(makeReply("c", "m3", "agentA", "3"));
+
+    // Fake WS that dies after 2 sends.
+    const sent: string[] = [];
+    let sendCount = 0;
+    const ws: HitlWebSocket = {
+      readyState: 1,
+      send: (data: string) => {
+        sent.push(data);
+        sendCount++;
+        if (sendCount >= 2) ws.readyState = 3;
+      },
+    };
+
+    const auditCalls: BufferDrainAuditLine[] = [];
+    const fakeAudit = async (line: BufferDrainAuditLine) => {
+      auditCalls.push(line);
+    };
+
+    const n = await drainBufferToClient(ws, buf, fakeAudit, () => Date.now());
+    expect(n).toBe(2);                       // 2 actually sent
+    expect(auditCalls.length).toBe(1);
+    expect(auditCalls[0]!.replies_drained).toBe(2); // not 3 (the peek snapshot length)
+    expect(buf.size()).toBe(1);              // m3 still buffered
+  });
+
+  // ─── P1#2 regression: concurrent drains are safe ──────────────────────
+  // Removing the `clients.size === 1` guard relies on peek+commit being
+  // idempotent: a second drainer sees an empty buffer (the first drainer
+  // already committed every entry) and returns zero. No double-send, no
+  // audit double-emit.
+  it("P1#2 regression: a second sync drain on the same buffer returns zero and emits no double-send", () => {
+    const buf = new ReplyBuffer();
+    buf.push(makeReply("a", "m1", "agentA", "1"));
+    buf.push(makeReply("b", "m2", "agentA", "2"));
+
+    const { ws: ws1, sent: sent1 } = makeFakeWs();
+    const r1 = drainBufferToClientSync(ws1, buf);
+    expect(r1.sent).toBe(2);
+    expect(sent1.length).toBe(2);
+
+    const { ws: ws2, sent: sent2 } = makeFakeWs();
+    const r2 = drainBufferToClientSync(ws2, buf);
+    expect(r2.sent).toBe(0);
+    expect(r2.oldestQueuedAt).toBeNull();
+    expect(sent2.length).toBe(0);
+  });
+
+  // ─── peek/commit contract ─────────────────────────────────────────────
+  it("peek does not remove entries; commit removes a specific entry by reference", () => {
+    const buf = new ReplyBuffer();
+    buf.push(makeReply("a", "m1", "agentA", "1"));
+    buf.push(makeReply("b", "m2", "agentA", "2"));
+
+    const snap1 = buf.peek();
+    expect(snap1.length).toBe(2);
+    expect(buf.size()).toBe(2);             // peek did NOT remove
+
+    const snap2 = buf.peek();
+    expect(snap2.length).toBe(2);           // peek is idempotent
+
+    expect(buf.commit(snap1[0]!)).toBe(true);
+    expect(buf.size()).toBe(1);
+    expect(buf.commit(snap1[0]!)).toBe(false); // double-commit is safe (idempotent)
+    expect(buf.commit(snap1[1]!)).toBe(true);
+    expect(buf.size()).toBe(0);
   });
 });

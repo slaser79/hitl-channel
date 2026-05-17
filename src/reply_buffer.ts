@@ -4,13 +4,17 @@
  *
  * - Keyed on `agent_id` (empty string when unset).
  * - Bucket cap = 32 (R2). FIFO eviction once a bucket exceeds the cap.
- * - Entry TTL = 24h (R2). Expired entries are dropped at drain time, never
- *   replayed.
+ * - Entry TTL = 24h (R2). Expired entries are dropped at peek/drain time,
+ *   never replayed.
  * - In-memory only — daemon restart clears the buffer (acceptable since
  *   hitl-channel runs alongside CC on the user's desktop; restart is rare
  *   and explicit per umbrella issue hitl-app#4043).
  * - Cross-instance isolation: each ReplyBuffer holds its own buckets, so
  *   two daemons (or two test fixtures) never share state.
+ *
+ * Production delivery via WS uses peek() + per-entry commit() so a WS that
+ * drops mid-loop leaves un-sent entries in the buffer for the next reconnect.
+ * Tests and shutdown paths can use drain() as a convenience (peek + commit-all).
  */
 
 import type { BufferedReply, ReplyPayload } from "./types.js";
@@ -59,20 +63,55 @@ export class ReplyBuffer {
   }
 
   /**
-   * Drain every live (non-expired) entry across all agent_id buckets in
-   * arrival order. The buffer is fully cleared on return — expired entries
-   * are dropped silently and never replayed.
+   * Snapshot of live (non-expired) entries in arrival order. Expired entries
+   * are pruned as a side effect. Buffer state is otherwise NOT modified —
+   * callers MUST invoke commit(entry) for each successfully delivered entry
+   * to remove it from the buffer.
+   *
+   * This is the contract that protects against partial-send failure: a WS
+   * that drops mid-loop leaves uncommitted entries in the buffer for the
+   * next reconnect.
+   */
+  peek(): BufferedReply[] {
+    this.evictExpired();
+    const all: BufferedReply[] = [];
+    for (const bucket of this.buckets.values()) {
+      all.push(...bucket);
+    }
+    all.sort((a, b) => a.queuedAt - b.queuedAt);
+    return all;
+  }
+
+  /**
+   * Remove a specific entry from the buffer (identified by reference equality
+   * on the BufferedReply object returned from peek). Returns true if the
+   * entry was found and removed; false if it was already absent (idempotent
+   * against double-commit / concurrent drainers).
+   */
+  commit(entry: BufferedReply): boolean {
+    const key = entry.payload.agent_id ?? "";
+    const bucket = this.buckets.get(key);
+    if (!bucket) return false;
+    const idx = bucket.indexOf(entry);
+    if (idx === -1) return false;
+    bucket.splice(idx, 1);
+    if (bucket.length === 0) this.buckets.delete(key);
+    return true;
+  }
+
+  /**
+   * Convenience: peek + commit-all in one call. Returns live entries in
+   * arrival order and removes them from the buffer. Expired entries are
+   * dropped silently.
+   *
+   * Production WS delivery MUST use peek + per-entry commit so partial-send
+   * failures (ws.readyState != OPEN mid-loop) don't lose data. This helper
+   * is for tests, shutdown, and any path that has already confirmed receipt
+   * for the entire batch.
    */
   drain(): BufferedReply[] {
-    const cutoff = this.nowFn() - this.ttlMs;
-    const live: BufferedReply[] = [];
-    for (const bucket of this.buckets.values()) {
-      for (const entry of bucket) {
-        if (entry.queuedAt >= cutoff) live.push(entry);
-      }
-    }
-    this.buckets.clear();
-    live.sort((a, b) => a.queuedAt - b.queuedAt);
+    const live = this.peek();
+    for (const entry of live) this.commit(entry);
     return live;
   }
 
@@ -81,5 +120,18 @@ export class ReplyBuffer {
     let n = 0;
     for (const bucket of this.buckets.values()) n += bucket.length;
     return n;
+  }
+
+  /** Drop expired entries from every bucket. Pure pruning — no replay. */
+  private evictExpired(): void {
+    const cutoff = this.nowFn() - this.ttlMs;
+    for (const [key, bucket] of this.buckets) {
+      const live = bucket.filter((e) => e.queuedAt >= cutoff);
+      if (live.length === 0) {
+        this.buckets.delete(key);
+      } else if (live.length !== bucket.length) {
+        this.buckets.set(key, live);
+      }
+    }
   }
 }
