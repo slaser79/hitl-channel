@@ -83,3 +83,14 @@ export interface BootstrapFrame {
   content: string;
   meta: { type: "bootstrap" };
 }
+
+// ─── SPEC-HITL-CC-001 Phase 4 AC#26 — ReplyBuffer types ───────────────────
+// Per-instance in-memory ring buffer for replies that arrive while no WS
+// clients are connected. Entries drain in arrival order on WS reconnect.
+
+export interface BufferedReply {
+  /** The reply frame to replay on drain. */
+  payload: ReplyPayload;
+  /** Wall-clock ms epoch when push() was called. Used for TTL + drain age. */
+  queuedAt: number;
+}

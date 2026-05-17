@@ -5,13 +5,19 @@ import { createPairingRequest, consumePairingCode, validatePairingCode } from ".
 import { addToAllowlist, isTokenAllowed, hashToken } from "./allowlist.js";
 import { getIdentity } from "./identity.js";
 import { FrameCorrelator } from "./correlator.js";
-import { appendAudit, sha256Hex } from "./audit.js";
+import { appendAudit, appendBufferDrainAudit, sha256Hex, type BufferDrainAuditLine } from "./audit.js";
+import { ReplyBuffer } from "./reply_buffer.js";
 
 export const clients = new Set<HitlWebSocket>();
 
 // SPEC-HITL-CC-001 §4.2 — single correlator instance shared with server.ts so
 // inbound `tool_call_result` / `list_tools_result` frames can resolve waiters.
 export const correlator = new FrameCorrelator();
+
+// SPEC-HITL-CC-001 Phase 4 AC#26 — per-instance ReplyBuffer. Replies that
+// arrive while no WS clients are connected get queued here and drained on the
+// next WS reconnect (see `drainBufferToClient` + the WS `open` handler).
+export const replyBuffer = new ReplyBuffer();
 
 /**
  * Broadcast a JSON frame to every connected phone WS. Used by `call_phone_tool`
@@ -91,11 +97,51 @@ export function broadcastReply(text: string, messageId?: string, agentId?: strin
     ts: new Date().toISOString(),
   };
   const rawPayload = JSON.stringify(payload);
+  let sent = 0;
   for (const ws of clients) {
     if (ws.readyState === 1) {
       ws.send(rawPayload);
+      sent++;
     }
   }
+  // SPEC-HITL-CC-001 Phase 4 AC#26 — instead of silently dropping when no
+  // OPEN WS client received the frame, queue for replay on next WS reconnect.
+  if (sent === 0) {
+    replyBuffer.push(payload);
+  }
+}
+
+/**
+ * SPEC-HITL-CC-001 Phase 4 AC#26 — drain `buffer` to `ws` in arrival order
+ * and emit one `phone_offline_buffer_drain` audit line per non-empty drain.
+ * Expired entries (past TTL) are silently dropped, not replayed.
+ *
+ * The `audit` parameter is injected for test isolation (default = the real
+ * appendBufferDrainAudit). Returns the number of entries actually sent.
+ */
+export async function drainBufferToClient(
+  ws: HitlWebSocket,
+  buffer: ReplyBuffer = replyBuffer,
+  audit: (line: BufferDrainAuditLine) => Promise<void> = appendBufferDrainAudit,
+  nowMs: () => number = () => Date.now(),
+): Promise<number> {
+  if (buffer.size() === 0) return 0;
+  const drained = buffer.drain();
+  if (drained.length === 0) return 0;
+  const oldestSeconds = Math.max(0, Math.floor((nowMs() - drained[0].queuedAt) / 1000));
+  for (const entry of drained) {
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify(entry.payload));
+    }
+  }
+  await audit({
+    ts: new Date().toISOString(),
+    instance_id: process.env.HITL_INSTANCE_ID ?? "unknown",
+    event: "phone_offline_buffer_drain",
+    replies_drained: drained.length,
+    oldest_buffered_seconds: oldestSeconds,
+  });
+  return drained.length;
 }
 
 /**
@@ -312,8 +358,18 @@ export function startHttpBridge(mcp: Server) {
     },
     websocket: {
       open(ws) {
-        clients.add(ws as unknown as HitlWebSocket);
+        const typedWs = ws as unknown as HitlWebSocket;
+        clients.add(typedWs);
         process.stderr.write(`[hitl-channel] Client connected (${clients.size} total)\n`);
+        // SPEC-HITL-CC-001 Phase 4 AC#26 — drain only on the FIRST reconnect
+        // so a second concurrent client doesn't double-replay the buffer.
+        if (clients.size === 1) {
+          void drainBufferToClient(typedWs).catch((err) => {
+            process.stderr.write(
+              `[hitl-channel] buffer drain failed: ${err instanceof Error ? err.message : err}\n`
+            );
+          });
+        }
       },
       close(ws) {
         clients.delete(ws as unknown as HitlWebSocket);
