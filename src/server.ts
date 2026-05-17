@@ -27,18 +27,10 @@ import type {
 
 const PORT = Number(process.env.HITL_CHANNEL_PORT ?? 8789);
 
-// SPEC-HITL-CC-001 §4.2 — standing-orders contract APPENDED (not replacing)
-// the existing chat-relay instructions, so Claude Code defaults to the new
-// production tool-call path without a paste-in bootstrap prompt.
-const STANDING_ORDERS = [
-  "Treat inbound channel notifications as user queries from the paired HITL phone.",
-  "For phone-relevant questions or actions (calendar, contacts, agents, navigation, send/compose, file ops, …),",
-  "default to `call_phone_tool(name, arguments)` — see `list_phone_tools()` for the live catalog.",
-  "Trust-tier confirms are gated on the phone UI; you do not need to ask the user for yes/no in chat —",
-  "the user will tap Approve or Deny on a system sheet and the call returns with `approval:` populated.",
-  "When you do speak back to the user, use `reply_to_hitl` with the inbound `message_id`.",
-  "Requires Claude Code v2.1.80+ for `--dangerously-load-development-channels`.",
-].join(" ");
+// SPEC-HITL-CC-001 §4.2 + Phase 3 standing-orders contract is composed in
+// `mcp_instructions.ts` so the AC#23a snapshot test can import it without
+// triggering this module's top-level `await mcp.connect(...)`.
+import { MCP_INSTRUCTIONS } from "./mcp_instructions.js";
 
 const mcp = new Server(
   { name: "hitl-channel", version: "0.1.0" },
@@ -47,12 +39,7 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: [
-      'Messages from the HITL mobile app arrive as <channel source="hitl-channel" sender_id="..." message_id="...">.',
-      "Use the reply_to_hitl tool to send responses back to the mobile app user.",
-      "The sender_id indicates who sent the message (e.g., 'ceo', 'xo').",
-      STANDING_ORDERS,
-    ].join(" "),
+    instructions: MCP_INSTRUCTIONS,
   }
 );
 
