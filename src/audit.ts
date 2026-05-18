@@ -46,6 +46,14 @@ export interface AuditEvent {
   approval: AuditApproval;       // null unless kind === 'tool_result'
   prompt_hash: string;           // SHA-256 hex of content / JSON.stringify(arguments)
   duration_ms: number | null;    // null unless this is an outbound result
+  // SPEC-HITL-CC-001 Phase 6 carry-forward (issue #12) — attachment metadata
+  // for `tool_call_result` frames. Required + closed-schema; non-tool-result
+  // lines default to 0/0. Inbound `tool_call_request` attachments (the
+  // `cc_calls_phone` direction) stay out of scope: no phone tool today
+  // consumes a CC-supplied attachment as input, so the count would always
+  // be 0. If/when that changes, extract the same way for symmetry.
+  attachment_count: number;      // count of attachments on the source frame
+  attachment_bytes: number;      // sum of DECODED bytes across attachments
 }
 
 function utcDateStamp(date = new Date()): string {
@@ -59,6 +67,45 @@ function fileForDate(date = new Date()): string {
 
 export function sha256Hex(input: string): string {
   return createHash("sha256").update(input).digest("hex");
+}
+
+/**
+ * SPEC-HITL-CC-001 Phase 6 carry-forward (issue #12) — summarise an attachment
+ * array for audit emission. Returns `{count, bytes}` where:
+ *
+ * - `count` is `attachments?.length ?? 0` (zero for missing / non-array).
+ * - `bytes` is the sum of DECODED base64 byte lengths across all entries with
+ *   a string `data` field. Formula: `floor(len * 3 / 4) - padding`, where
+ *   padding is the number of trailing `=` chars (0, 1, or 2). Non-string /
+ *   undefined `data` contributes 0.
+ *
+ * Intentionally tolerant — base64 input that includes whitespace or wraps is
+ * normalised by stripping any char outside the base64 alphabet before the
+ * length calculation. Audit lines must NEVER carry the raw bytes themselves
+ * (closed-schema rule + privacy + log size) — callers extract count/bytes
+ * via this helper and discard the original array before calling appendAudit.
+ */
+export function summariseAttachments(
+  attachments: unknown,
+): { count: number; bytes: number } {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return { count: 0, bytes: 0 };
+  }
+  let bytes = 0;
+  for (const a of attachments) {
+    if (!a || typeof a !== "object") continue;
+    const data = (a as { data?: unknown }).data;
+    if (typeof data !== "string" || data.length === 0) continue;
+    // Strip everything outside the base64 alphabet (handles whitespace, CR/LF
+    // line wraps, stray characters). Padding `=` is counted separately.
+    const normalised = data.replace(/[^A-Za-z0-9+/=]/g, "");
+    if (normalised.length === 0) continue;
+    let padding = 0;
+    if (normalised.endsWith("==")) padding = 2;
+    else if (normalised.endsWith("=")) padding = 1;
+    bytes += Math.floor((normalised.length * 3) / 4) - padding;
+  }
+  return { count: attachments.length, bytes };
 }
 
 /**
