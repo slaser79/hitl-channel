@@ -492,6 +492,6 @@ httpServer = startHttpBridge(mcp);
 // Belt-and-braces: if stdin already reached end while we were awaiting the
 // transport / HTTP bridge, the `end` event has already fired and our late
 // listener will never see it. Check the readable state explicitly.
-if ((process.stdin as NodeJS.ReadableStream).readableEnded) {
+if ((process.stdin as { readableEnded?: boolean }).readableEnded) {
   shutdown("stdin-already-ended");
 }
