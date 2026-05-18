@@ -36,19 +36,25 @@ bun src/server.ts
 - **Allowlist** (`src/allowlist.ts`): Device token management (SHA-256 hashed)
 - **Identity** (`src/identity.ts`): Persistent instance ID for multi-instance support
 - **mDNS** (`src/mdns.ts`): Local network discovery (known issue in subprocess mode)
+- **Reply Buffer** (`src/reply_buffer.ts`): Per-instance in-memory ring buffer (cap 32/agent, 24h TTL) that queues `reply_to_hitl` frames when no WS client is connected and replays them on reconnect. Peek + per-entry commit so partial-send failures don't lose data. SPEC-HITL-CC-001 AC#26.
+- **Frame Correlator** (`src/correlator.ts`): request_id ↔ pending-Promise map for round-trip `tool_call_*` / `list_tools_*` frames.
+- **Audit Log** (`src/audit.ts`): Append-only JSONL at `~/.hitl/channels/audit/<YYYY-MM-DD>.jsonl`, closed-schema `AuditEvent` + `BufferDrainAuditLine`, 30-day local retention with oldest-first prune at startup.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
 | `src/server.ts` | Main entry point, MCP server setup |
-| `src/http_bridge.ts` | HTTP/WS bridge for mobile app |
+| `src/http_bridge.ts` | HTTP/WS bridge for mobile app; `broadcastReply` + `drainBufferToClient(Sync)` |
+| `src/reply_buffer.ts` | Per-instance offline-reply ring buffer (AC#26) |
+| `src/correlator.ts` | request_id ↔ pending-Promise map for tool-call round-trips |
+| `src/audit.ts` | JSONL audit log with closed-schema event types |
 | `src/pairing.ts` | Pairing code logic |
 | `src/allowlist.ts` | Device token allowlist |
 | `src/identity.ts` | Instance identity management |
 | `src/mdns.ts` | mDNS service advertisement |
 | `src/notification.ts` | Channel notification helper |
-| `src/types.ts` | TypeScript interfaces |
+| `src/types.ts` | TypeScript interfaces (incl. `HitlWebSocket`, `BufferedReply`, frame shapes) |
 
 ## API Endpoints
 

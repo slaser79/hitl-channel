@@ -12,6 +12,8 @@
 ## Lessons
 | Page | Products | Last Updated | Summary |
 |------|----------|--------------|---------|
+| [reply-buffer-contract](lessons/reply-buffer-contract.md) | hitl-channel | 2026-05-18 | SPEC-HITL-CC-001 AC#26 ReplyBuffer contract — five named lessons codifying peek+commit drain, monotonic sequence sort, `wsSendAccepted` helper, idempotency-replaces-guard, sync-before-await race-freedom. Verified at commit `8639aa0` (PR #11, 4 rinse cycles + 2× clean Approve). |
+| [meta-learning](lessons/meta-learning.md) | hitl-channel | 2026-05-18 | Session-level retro log from empire self-reflection runs. |
 
 ## Decisions
 | Page | Products | Last Updated | Summary |
