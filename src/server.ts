@@ -1,4 +1,7 @@
 #!/usr/bin/env bun
+import { readFile, stat } from "node:fs/promises";
+import { basename, extname, resolve as resolvePath } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -211,10 +214,42 @@ const MIME_BY_EXT: Record<string, string> = {
   mov: "video/quicktime",
 };
 
+// Per-attachment file-read cap. Matches the spec's 5 MB per-attachment
+// limit (SPEC-HITL-CC-001 AC#35) and bounds memory pressure if a caller
+// supplies an absurdly large file path. Bigger files are rejected at
+// stat time, before any base64 encoding.
+const kMaxFileReadBytes = 5 * 1024 * 1024;
+
+// Allowlist of directory prefixes a `path` attachment may resolve under.
+// Defaults to the user's home directory + tmpdir; an operator can widen
+// or narrow via HITL_CHANNEL_ATTACHMENT_ROOTS (colon-separated absolute
+// paths). The check uses `path.resolve` to normalise away `..` segments
+// before the prefix match so a caller can't escape via `~/../etc/passwd`.
+function attachmentRoots(): string[] {
+  const env = process.env.HITL_CHANNEL_ATTACHMENT_ROOTS;
+  if (env && env.trim().length > 0) {
+    return env
+      .split(":")
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0)
+      .map((p) => resolvePath(p));
+  }
+  return [resolvePath(homedir()), resolvePath(tmpdir())];
+}
+
+function isPathAllowed(absolute: string, roots: string[]): boolean {
+  for (const root of roots) {
+    if (absolute === root) return true;
+    // Append a separator to the root so /home/foo doesn't match /home/foobar.
+    const prefix = root.endsWith("/") ? root : root + "/";
+    if (absolute.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
 async function resolveAttachments(raw: unknown): Promise<HitlAttachment[]> {
   if (!Array.isArray(raw)) return [];
-  const { readFile } = await import("node:fs/promises");
-  const { basename, extname } = await import("node:path");
+  const roots = attachmentRoots();
   const out: HitlAttachment[] = [];
   for (const att of raw) {
     if (att == null || typeof att !== "object") continue;
@@ -231,17 +266,37 @@ async function resolveAttachments(raw: unknown): Promise<HitlAttachment[]> {
     let fileName =
       typeof a.fileName === "string" ? a.fileName : undefined;
     if (typeof a.path === "string" && a.path.length > 0) {
+      const absolute = resolvePath(a.path);
+      if (!isPathAllowed(absolute, roots)) {
+        process.stderr.write(
+          `[hitl-channel] reply_to_hitl: rejecting path outside allowlisted roots: ${absolute}\n`,
+        );
+        continue;
+      }
       try {
-        const buf = await readFile(a.path);
+        const st = await stat(absolute);
+        if (!st.isFile()) {
+          process.stderr.write(
+            `[hitl-channel] reply_to_hitl: path is not a regular file: ${absolute}\n`,
+          );
+          continue;
+        }
+        if (st.size > kMaxFileReadBytes) {
+          process.stderr.write(
+            `[hitl-channel] reply_to_hitl: attachment_too_large size=${st.size} max=${kMaxFileReadBytes} path=${absolute}\n`,
+          );
+          continue;
+        }
+        const buf = await readFile(absolute);
         data = buf.toString("base64");
-        if (!fileName) fileName = basename(a.path);
+        if (!fileName) fileName = basename(absolute);
         if (!mediaType) {
-          const ext = extname(a.path).slice(1).toLowerCase();
+          const ext = extname(absolute).slice(1).toLowerCase();
           mediaType = MIME_BY_EXT[ext] ?? "application/octet-stream";
         }
       } catch (err) {
         process.stderr.write(
-          `[hitl-channel] reply_to_hitl: failed to read ${a.path}: ${
+          `[hitl-channel] reply_to_hitl: failed to read ${absolute}: ${
             err instanceof Error ? err.message : String(err)
           }\n`,
         );
@@ -249,6 +304,12 @@ async function resolveAttachments(raw: unknown): Promise<HitlAttachment[]> {
       }
     } else if (typeof a.data === "string" && a.data.length > 0) {
       data = a.data;
+      // When the caller supplies pre-encoded bytes via `data` and omits
+      // `media_type`, default to a generic binary type rather than
+      // silently dropping the entry. The phone-side codec uses this
+      // for `type` inference; falling back to octet-stream keeps the
+      // attachment round-tripping as a file-chip rather than disappearing.
+      if (!mediaType) mediaType = "application/octet-stream";
     } else {
       continue;
     }
