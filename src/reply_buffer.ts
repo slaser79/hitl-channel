@@ -24,6 +24,10 @@ const DEFAULT_CAP_PER_AGENT = 32;
 /** SPEC-HITL-CC-001 R2: 24h TTL. */
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 
+interface BufferedReplyEntry extends BufferedReply {
+  sequence: number;
+}
+
 export interface ReplyBufferOptions {
   /** Override the per-agent_id ring cap (default 32). */
   capPerAgent?: number;
@@ -34,10 +38,11 @@ export interface ReplyBufferOptions {
 }
 
 export class ReplyBuffer {
-  private readonly buckets = new Map<string, BufferedReply[]>();
+  private readonly buckets = new Map<string, BufferedReplyEntry[]>();
   private readonly cap: number;
   private readonly ttlMs: number;
   private readonly nowFn: () => number;
+  private nextSequence = 0;
 
   constructor(opts: ReplyBufferOptions = {}) {
     this.cap = opts.capPerAgent ?? DEFAULT_CAP_PER_AGENT;
@@ -56,7 +61,11 @@ export class ReplyBuffer {
       bucket = [];
       this.buckets.set(key, bucket);
     }
-    bucket.push({ payload, queuedAt: this.nowFn() });
+    bucket.push({
+      payload,
+      queuedAt: this.nowFn(),
+      sequence: this.nextSequence++,
+    });
     while (bucket.length > this.cap) {
       bucket.shift();
     }
@@ -74,11 +83,11 @@ export class ReplyBuffer {
    */
   peek(): BufferedReply[] {
     this.evictExpired();
-    const all: BufferedReply[] = [];
+    const all: BufferedReplyEntry[] = [];
     for (const bucket of this.buckets.values()) {
       all.push(...bucket);
     }
-    all.sort((a, b) => a.queuedAt - b.queuedAt);
+    all.sort((a, b) => a.sequence - b.sequence);
     return all;
   }
 
@@ -92,7 +101,7 @@ export class ReplyBuffer {
     const key = entry.payload.agent_id ?? "";
     const bucket = this.buckets.get(key);
     if (!bucket) return false;
-    const idx = bucket.indexOf(entry);
+    const idx = bucket.indexOf(entry as BufferedReplyEntry);
     if (idx === -1) return false;
     bucket.splice(idx, 1);
     if (bucket.length === 0) this.buckets.delete(key);

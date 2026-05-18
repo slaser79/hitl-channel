@@ -35,6 +35,7 @@ function makeFakeWs(): { ws: HitlWebSocket; sent: string[] } {
     readyState: 1,
     send: (data: string) => {
       sent.push(data);
+      return data.length;
     },
   };
   return { ws, sent };
@@ -242,6 +243,53 @@ describe("ReplyBuffer — SPEC-HITL-CC-001 AC#26", () => {
     expect(r2.sent).toBe(0);
     expect(r2.oldestQueuedAt).toBeNull();
     expect(sent2.length).toBe(0);
+  });
+
+  // ─── P1 regression: ws.send return value gates commit ─────────────────
+  it("P1 regression: failed ws.send result leaves current and remaining entries buffered", () => {
+    const buf = new ReplyBuffer();
+    buf.push(makeReply("a", "m1", "agentA", "1"));
+    buf.push(makeReply("b", "m2", "agentA", "2"));
+    buf.push(makeReply("c", "m3", "agentA", "3"));
+
+    const accepted: string[] = [];
+    let attempts = 0;
+    const ws: HitlWebSocket = {
+      readyState: 1,
+      send: (data: string) => {
+        attempts++;
+        if (attempts === 1) {
+          accepted.push(data);
+          return data.length;
+        }
+        return 0;
+      },
+    };
+
+    const r1 = drainBufferToClientSync(ws, buf);
+    expect(r1.sent).toBe(1);
+    expect(accepted.length).toBe(1);
+    expect(buf.size()).toBe(2);
+
+    const { ws: ws2, sent: sent2 } = makeFakeWs();
+    const r2 = drainBufferToClientSync(ws2, buf);
+    expect(r2.sent).toBe(2);
+    expect(sent2.map((s) => JSON.parse(s).message_id)).toEqual(["m2", "m3"]);
+    expect(buf.size()).toBe(0);
+  });
+
+  // ─── P1 regression: arrival order is monotonic, not wall-clock sorted ─
+  it("P1 regression: clock rollback does not reorder buffered replies", () => {
+    const times = [1_000, 900, 1_100, 1_200];
+    const buf = new ReplyBuffer({ now: () => times.shift()! });
+
+    buf.push(makeReply("first", "m1", "agentA", "1"));
+    buf.push(makeReply("second", "m2", "agentA", "2"));
+    buf.push(makeReply("third", "m3", "agentA", "3"));
+
+    const drained = buf.drain();
+    expect(drained.map((e) => e.queuedAt)).toEqual([1_000, 900, 1_100]);
+    expect(drained.map((e) => e.payload.message_id)).toEqual(["m1", "m2", "m3"]);
   });
 
   // ─── peek/commit contract ─────────────────────────────────────────────

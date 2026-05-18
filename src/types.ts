@@ -33,7 +33,7 @@ export interface ReplyPayload {
 
 export interface HitlWebSocket {
   readyState: number;
-  send: (data: string) => void;
+  send: (data: string) => number | void;
 }
 
 // ─── SPEC-HITL-CC-001 frame types ──────────────────────────────────────────

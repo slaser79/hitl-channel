@@ -19,6 +19,15 @@ export const correlator = new FrameCorrelator();
 // next WS reconnect (see `drainBufferToClient` + the WS `open` handler).
 export const replyBuffer = new ReplyBuffer();
 
+function wsSendAccepted(ws: HitlWebSocket, data: string): boolean {
+  try {
+    const result = ws.send(data);
+    return typeof result !== "number" || result > 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Broadcast a JSON frame to every connected phone WS. Used by `call_phone_tool`
  * / `list_phone_tools` to push a request frame. Returns the number of clients
@@ -28,8 +37,7 @@ export function broadcastFrame(frame: Record<string, unknown>): number {
   const raw = JSON.stringify(frame);
   let count = 0;
   for (const ws of clients) {
-    if (ws.readyState === 1) {
-      ws.send(raw);
+    if (ws.readyState === 1 && wsSendAccepted(ws, raw)) {
       count++;
     }
   }
@@ -99,8 +107,7 @@ export function broadcastReply(text: string, messageId?: string, agentId?: strin
   const rawPayload = JSON.stringify(payload);
   let sent = 0;
   for (const ws of clients) {
-    if (ws.readyState === 1) {
-      ws.send(rawPayload);
+    if (ws.readyState === 1 && wsSendAccepted(ws, rawPayload)) {
       sent++;
     }
   }
@@ -136,7 +143,7 @@ export function drainBufferToClientSync(
   let sent = 0;
   for (const entry of peeked) {
     if (ws.readyState !== 1) break;
-    ws.send(JSON.stringify(entry.payload));
+    if (!wsSendAccepted(ws, JSON.stringify(entry.payload))) break;
     buffer.commit(entry);
     sent++;
   }
