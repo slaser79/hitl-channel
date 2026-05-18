@@ -21,12 +21,16 @@ describe("audit.ts", () => {
       approval: null,
       prompt_hash: sha256Hex("{}"),
       duration_ms: null,
+      attachment_count: 0,
+      attachment_bytes: 0,
     };
     expect(evt.direction).toBe("cc_calls_phone");
     expect(evt.kind).toBe("tool_call");
     expect(evt.tool_name).toBe("list_events");
     expect(evt.approval).toBeNull();
     expect(evt.duration_ms).toBeNull();
+    expect(evt.attachment_count).toBe(0);
+    expect(evt.attachment_bytes).toBe(0);
 
     const resultEvt: AuditEvent = {
       ...evt,
@@ -34,8 +38,12 @@ describe("audit.ts", () => {
       kind: "tool_result",
       approval: "user_approved",
       duration_ms: 1234,
+      attachment_count: 2,
+      attachment_bytes: 4_096,
     };
     expect(resultEvt.approval).toBe("user_approved");
     expect(resultEvt.duration_ms).toBe(1234);
+    expect(resultEvt.attachment_count).toBe(2);
+    expect(resultEvt.attachment_bytes).toBe(4_096);
   });
 });

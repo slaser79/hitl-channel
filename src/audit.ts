@@ -46,6 +46,14 @@ export interface AuditEvent {
   approval: AuditApproval;       // null unless kind === 'tool_result'
   prompt_hash: string;           // SHA-256 hex of content / JSON.stringify(arguments)
   duration_ms: number | null;    // null unless this is an outbound result
+  // SPEC-HITL-CC-001 Phase 6 carry-forward (issue #12) — attachment metadata
+  // for `tool_call_result` frames. Required + closed-schema; non-tool-result
+  // lines default to 0/0. Inbound `tool_call_request` attachments (the
+  // `cc_calls_phone` direction) stay out of scope: no phone tool today
+  // consumes a CC-supplied attachment as input, so the count would always
+  // be 0. If/when that changes, extract the same way for symmetry.
+  attachment_count: number;      // count of attachments on the source frame
+  attachment_bytes: number;      // sum of DECODED bytes across attachments
 }
 
 function utcDateStamp(date = new Date()): string {
@@ -59,6 +67,56 @@ function fileForDate(date = new Date()): string {
 
 export function sha256Hex(input: string): string {
   return createHash("sha256").update(input).digest("hex");
+}
+
+/**
+ * SPEC-HITL-CC-001 Phase 6 carry-forward (issue #12) — summarise an attachment
+ * array for audit emission. Returns `{count, bytes}` where:
+ *
+ * - `count` is `attachments?.length ?? 0` (zero for missing / non-array).
+ * - `bytes` is the sum of DECODED base64 byte lengths across all entries with
+ *   a well-formed base64 `data` string. Non-string / malformed `data`
+ *   contributes 0 — no negative totals, no garbage decode of non-base64
+ *   strings.
+ *
+ * Validation uses a structural regex (alphabet + 0–2 trailing `=` only, with
+ * length multiple of 4 after whitespace stripping) so non-base64 strings
+ * like `"hello"` or `"=="` cleanly return 0. Whitespace / CR-LF wraps are
+ * stripped before validation (PEM-style wrapping is real on the wire).
+ *
+ * Audit lines must NEVER carry the raw bytes themselves (closed-schema rule
+ * + privacy + log size) — callers extract count/bytes via this helper and
+ * discard the original array before calling appendAudit.
+ */
+const BASE64_SHAPE_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+function decodedBase64ByteLength(raw: string): number {
+  // Strip all whitespace (spaces, tabs, CR, LF) — PEM-style wrapping is
+  // permitted on the wire. Anything else falling outside the base64 alphabet
+  // means the string is not base64; return 0 rather than guessing.
+  const stripped = raw.replace(/\s+/g, "");
+  if (stripped.length === 0) return 0;
+  if (stripped.length % 4 !== 0) return 0;
+  if (!BASE64_SHAPE_RE.test(stripped)) return 0;
+  // Bun / Node natively decode base64 length without allocating a Buffer —
+  // exact byte count, handles padding correctly, never returns negative.
+  return Buffer.byteLength(stripped, "base64");
+}
+
+export function summariseAttachments(
+  attachments: unknown,
+): { count: number; bytes: number } {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return { count: 0, bytes: 0 };
+  }
+  let bytes = 0;
+  for (const a of attachments) {
+    if (!a || typeof a !== "object") continue;
+    const data = (a as { data?: unknown }).data;
+    if (typeof data !== "string" || data.length === 0) continue;
+    bytes += decodedBase64ByteLength(data);
+  }
+  return { count: attachments.length, bytes };
 }
 
 /**

@@ -19,6 +19,7 @@ import {
   appendAudit,
   pruneOldAuditFiles,
   sha256Hex,
+  summariseAttachments,
 } from "./audit.js";
 import type {
   ListToolsResultFrame,
@@ -170,6 +171,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       approval: null,
       prompt_hash: sha256Hex(text ?? ""),
       duration_ms: null,
+      // No attachments on reply frames today (issue #12 closed-schema default).
+      attachment_count: 0,
+      attachment_bytes: 0,
     });
 
     return {
@@ -207,6 +211,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       approval: null,
       prompt_hash: sha256Hex(prompt ?? ""),
       duration_ms: null,
+      // No attachments on choices frames today (issue #12 closed-schema default).
+      attachment_count: 0,
+      attachment_bytes: 0,
     });
 
     return {
@@ -320,6 +327,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       approval: null,
       prompt_hash: sha256Hex(JSON.stringify(toolArgs)),
       duration_ms: null,
+      // Issue #12 AC4 boundary — `cc_calls_phone` audit emission for
+      // CC-supplied attachments-as-input is out-of-scope (no phone tool today
+      // consumes a CC-supplied attachment). File a follow-up if that changes.
+      attachment_count: 0,
+      attachment_bytes: 0,
     });
     const waiter = correlator.register<ToolCallResultFrame>(
       requestId,
@@ -332,6 +344,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     try {
       const result = await waiter;
       const duration = Date.now() - startedAt;
+      // Issue #12 — `result` is the resolved `tool_call_result` frame; the
+      // top-level `attachments` array (typed as unknown here because
+      // ToolCallResultFrame doesn't enumerate it — see HitlAttachment in
+      // types.ts) is summarised the same way as in http_bridge.ts's WS
+      // handler so both audit emissions for this event carry consistent
+      // attachment metadata.
+      const { count: attachmentCount, bytes: attachmentBytes } =
+        summariseAttachments((result as { attachments?: unknown }).attachments);
       void appendAudit({
         ts: new Date().toISOString(),
         instance_id: identity.instanceId,
@@ -341,6 +361,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         approval: result.approval ?? null,
         prompt_hash: sha256Hex(JSON.stringify(result.output ?? null)),
         duration_ms: duration,
+        attachment_count: attachmentCount,
+        attachment_bytes: attachmentBytes,
       });
       if (result.success === false) {
         return {

@@ -5,7 +5,7 @@ import { createPairingRequest, consumePairingCode, validatePairingCode } from ".
 import { addToAllowlist, isTokenAllowed, hashToken } from "./allowlist.js";
 import { getIdentity } from "./identity.js";
 import { FrameCorrelator } from "./correlator.js";
-import { appendAudit, appendBufferDrainAudit, sha256Hex, type BufferDrainAuditLine } from "./audit.js";
+import { appendAudit, appendBufferDrainAudit, sha256Hex, summariseAttachments, type BufferDrainAuditLine } from "./audit.js";
 import { ReplyBuffer } from "./reply_buffer.js";
 
 export const clients = new Set<HitlWebSocket>();
@@ -444,6 +444,29 @@ export function startHttpBridge(mcp: Server) {
               );
               return;
             }
+            // SPEC-HITL-CC-001 Phase 6 carry-forward (issue #12) — extract
+            // attachment count/bytes from the `tool_call_result` frame BEFORE
+            // emitting the audit line. summariseAttachments handles missing
+            // / non-array / non-base64 `data` defensively (returns 0/0).
+            // The raw attachments array is NOT included in the audit payload —
+            // the closed-schema appendAudit call below only spreads named
+            // fields, so even if `data.attachments` carried 5 MB of base64
+            // the audit line stays bounded (AC#36 + AC3 of issue #12).
+            const { count: attachmentCount, bytes: attachmentBytes } =
+              frameType === "tool_call_result"
+                ? summariseAttachments((data as { attachments?: unknown }).attachments)
+                : { count: 0, bytes: 0 };
+            // Hash only `output` for tool_call_result (matches the CC-side
+            // emit in server.ts → consistent prompt_hash across both audit
+            // rows for the same logical event). Hashing the whole frame
+            // would pull large base64 attachments into the sha256 input and
+            // risk an event-loop stall / memory spike on multi-MB images.
+            // list_tools_result has no `output` field, so for that branch
+            // we hash the (small) frame itself.
+            const hashSource =
+              frameType === "tool_call_result"
+                ? JSON.stringify((data as { output?: unknown }).output ?? null)
+                : JSON.stringify(data);
             // Async audit; don't block WS path.
             void appendAudit({
               ts: new Date().toISOString(),
@@ -458,8 +481,10 @@ export function startHttpBridge(mcp: Server) {
                 frameType === "tool_call_result"
                   ? ((data.approval as "auto" | "user_approved" | "user_denied" | "timeout" | undefined) ?? null)
                   : null,
-              prompt_hash: sha256Hex(JSON.stringify(data)),
+              prompt_hash: sha256Hex(hashSource),
               duration_ms: null,
+              attachment_count: attachmentCount,
+              attachment_bytes: attachmentBytes,
             });
             return;
           }
@@ -487,6 +512,8 @@ export function startHttpBridge(mcp: Server) {
               approval: null,
               prompt_hash: sha256Hex(message ?? ""),
               duration_ms: null,
+              attachment_count: 0,
+              attachment_bytes: 0,
             });
           }
         } catch {
