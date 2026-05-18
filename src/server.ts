@@ -1,4 +1,7 @@
 #!/usr/bin/env bun
+import { readFile, stat } from "node:fs/promises";
+import { basename, extname, resolve as resolvePath } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -22,6 +25,7 @@ import {
   summariseAttachments,
 } from "./audit.js";
 import type {
+  HitlAttachment,
   ListToolsResultFrame,
   ToolCallResultFrame,
 } from "./types.js";
@@ -50,7 +54,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "reply_to_hitl",
       description:
         "Send a reply message back to the HITL mobile app user. " +
-        "Pass the message_id from the inbound channel tag for threading.",
+        "Pass the message_id from the inbound channel tag for threading. " +
+        "Optionally include image/file attachments — they render inline " +
+        "on the phone CC chat (images = thumbnail + tap-to-zoom; other " +
+        "mime types = filename chip).",
       inputSchema: {
         type: "object",
         properties: {
@@ -65,6 +72,51 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           agent_id: {
             type: "string",
             description: "Optional agent identity for multi-instance routing",
+          },
+          attachments: {
+            type: "array",
+            description:
+              "Optional attachments to render in the phone chat bubble. " +
+              "Prefer `path` (absolute filesystem path on the channel host) — " +
+              "the server reads the file and encodes it. Use `data` (base64) " +
+              "only for in-memory bytes you've already encoded. " +
+              "Per-attachment cap 5 MB; per-frame cap 20 MB (decoded). " +
+              "Oversize attachments are dropped phone-side with a warning.",
+            items: {
+              type: "object",
+              properties: {
+                path: {
+                  type: "string",
+                  description:
+                    "Absolute filesystem path. Channel reads + base64-encodes. " +
+                    "If omitted, `data` is required.",
+                },
+                type: {
+                  type: "string",
+                  description:
+                    "'image' or 'file'. If omitted, inferred from media_type. " +
+                    "Image attachments render inline; files render as a " +
+                    "filename chip with mime icon.",
+                },
+                media_type: {
+                  type: "string",
+                  description:
+                    "MIME type (e.g. 'image/png', 'application/pdf'). " +
+                    "If omitted with `path`, inferred from file extension.",
+                },
+                data: {
+                  type: "string",
+                  description:
+                    "Base64-encoded attachment bytes. Ignored if `path` is set.",
+                },
+                fileName: {
+                  type: "string",
+                  description:
+                    "Optional filename for chip rendering. If omitted with " +
+                    "`path`, derived from the path's basename.",
+                },
+              },
+            },
           },
         },
         required: ["text"],
@@ -148,6 +200,137 @@ function generateRequestId(): string {
   return globalThis.crypto.randomUUID();
 }
 
+const MIME_BY_EXT: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  pdf: "application/pdf",
+  txt: "text/plain",
+  json: "application/json",
+  csv: "text/csv",
+  mp4: "video/mp4",
+  mov: "video/quicktime",
+};
+
+// Per-attachment file-read cap. Matches the spec's 5 MB per-attachment
+// limit (SPEC-HITL-CC-001 AC#35) and bounds memory pressure if a caller
+// supplies an absurdly large file path. Bigger files are rejected at
+// stat time, before any base64 encoding.
+const kMaxFileReadBytes = 5 * 1024 * 1024;
+
+// Allowlist of directory prefixes a `path` attachment may resolve under.
+// Defaults to the user's home directory + tmpdir; an operator can widen
+// or narrow via HITL_CHANNEL_ATTACHMENT_ROOTS (colon-separated absolute
+// paths). The check uses `path.resolve` to normalise away `..` segments
+// before the prefix match so a caller can't escape via `~/../etc/passwd`.
+function attachmentRoots(): string[] {
+  const env = process.env.HITL_CHANNEL_ATTACHMENT_ROOTS;
+  if (env && env.trim().length > 0) {
+    return env
+      .split(":")
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0)
+      .map((p) => resolvePath(p));
+  }
+  return [resolvePath(homedir()), resolvePath(tmpdir())];
+}
+
+function isPathAllowed(absolute: string, roots: string[]): boolean {
+  for (const root of roots) {
+    if (absolute === root) return true;
+    // Append a separator to the root so /home/foo doesn't match /home/foobar.
+    const prefix = root.endsWith("/") ? root : root + "/";
+    if (absolute.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+async function resolveAttachments(raw: unknown): Promise<HitlAttachment[]> {
+  if (!Array.isArray(raw)) return [];
+  const roots = attachmentRoots();
+  const out: HitlAttachment[] = [];
+  for (const att of raw) {
+    if (att == null || typeof att !== "object") continue;
+    const a = att as {
+      path?: unknown;
+      type?: unknown;
+      media_type?: unknown;
+      data?: unknown;
+      fileName?: unknown;
+    };
+    let data: string | undefined;
+    let mediaType =
+      typeof a.media_type === "string" ? a.media_type : undefined;
+    let fileName =
+      typeof a.fileName === "string" ? a.fileName : undefined;
+    if (typeof a.path === "string" && a.path.length > 0) {
+      const absolute = resolvePath(a.path);
+      if (!isPathAllowed(absolute, roots)) {
+        process.stderr.write(
+          `[hitl-channel] reply_to_hitl: rejecting path outside allowlisted roots: ${absolute}\n`,
+        );
+        continue;
+      }
+      try {
+        const st = await stat(absolute);
+        if (!st.isFile()) {
+          process.stderr.write(
+            `[hitl-channel] reply_to_hitl: path is not a regular file: ${absolute}\n`,
+          );
+          continue;
+        }
+        if (st.size > kMaxFileReadBytes) {
+          process.stderr.write(
+            `[hitl-channel] reply_to_hitl: attachment_too_large size=${st.size} max=${kMaxFileReadBytes} path=${absolute}\n`,
+          );
+          continue;
+        }
+        const buf = await readFile(absolute);
+        data = buf.toString("base64");
+        if (!fileName) fileName = basename(absolute);
+        if (!mediaType) {
+          const ext = extname(absolute).slice(1).toLowerCase();
+          mediaType = MIME_BY_EXT[ext] ?? "application/octet-stream";
+        }
+      } catch (err) {
+        process.stderr.write(
+          `[hitl-channel] reply_to_hitl: failed to read ${absolute}: ${
+            err instanceof Error ? err.message : String(err)
+          }\n`,
+        );
+        continue;
+      }
+    } else if (typeof a.data === "string" && a.data.length > 0) {
+      data = a.data;
+      // When the caller supplies pre-encoded bytes via `data` and omits
+      // `media_type`, default to a generic binary type rather than
+      // silently dropping the entry. The phone-side codec uses this
+      // for `type` inference; falling back to octet-stream keeps the
+      // attachment round-tripping as a file-chip rather than disappearing.
+      if (!mediaType) mediaType = "application/octet-stream";
+    } else {
+      continue;
+    }
+    if (!mediaType) continue;
+    const type =
+      typeof a.type === "string" && a.type.length > 0
+        ? a.type
+        : mediaType.startsWith("image/")
+          ? "image"
+          : "file";
+    const entry: HitlAttachment = {
+      type,
+      media_type: mediaType,
+      data,
+    };
+    if (fileName) entry.fileName = fileName;
+    out.push(entry);
+  }
+  return out;
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>;
   const identity = await getIdentity();
@@ -156,12 +339,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const text = args.text as string;
     const messageId = args.message_id as string | undefined;
     const agentId = args.agent_id as string | undefined;
+    const rawAttachments = args.attachments;
+    const attachments: HitlAttachment[] = await resolveAttachments(
+      rawAttachments,
+    );
+    const { count: attachmentCount, bytes: attachmentBytes } =
+      summariseAttachments(attachments);
 
     process.stderr.write(
-      `[hitl-channel] Reply: ${text} (msg: ${messageId}, agent: ${agentId})\n`
+      `[hitl-channel] Reply: ${text} (msg: ${messageId}, agent: ${agentId}, attachments: ${attachmentCount})\n`
     );
 
-    broadcastReply(text, messageId, agentId);
+    broadcastReply(text, messageId, agentId, attachments);
     void appendAudit({
       ts: new Date().toISOString(),
       instance_id: identity.instanceId,
@@ -171,13 +360,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       approval: null,
       prompt_hash: sha256Hex(text ?? ""),
       duration_ms: null,
-      // No attachments on reply frames today (issue #12 closed-schema default).
-      attachment_count: 0,
-      attachment_bytes: 0,
+      attachment_count: attachmentCount,
+      attachment_bytes: attachmentBytes,
     });
 
     return {
-      content: [{ type: "text" as const, text: `Sent to HITL app: ${text}` }],
+      content: [
+        {
+          type: "text" as const,
+          text: `Sent to HITL app: ${text} (attachments: ${attachmentCount})`,
+        },
+      ],
     };
   }
 
@@ -383,22 +576,46 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           ],
         };
       }
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(
-              {
-                success: true,
-                output: result.output ?? null,
-                approval: result.approval ?? null,
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      const content: Array<
+        | { type: "text"; text: string }
+        | { type: "image"; data: string; mimeType: string }
+      > = [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              success: true,
+              output: result.output ?? null,
+              approval: result.approval ?? null,
+              attachment_count: attachmentCount,
+              attachment_bytes: attachmentBytes,
+            },
+            null,
+            2,
+          ),
+        },
+      ];
+      const rawAttachments = (result as { attachments?: unknown }).attachments;
+      if (Array.isArray(rawAttachments)) {
+        for (const att of rawAttachments) {
+          if (
+            att != null &&
+            typeof att === "object" &&
+            typeof (att as { type?: unknown }).type === "string" &&
+            (att as { type: string }).type === "image" &&
+            typeof (att as { data?: unknown }).data === "string" &&
+            typeof (att as { media_type?: unknown }).media_type === "string"
+          ) {
+            const a = att as { data: string; media_type: string };
+            content.push({
+              type: "image" as const,
+              data: a.data,
+              mimeType: a.media_type,
+            });
+          }
+        }
+      }
+      return { content };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return {
