@@ -332,6 +332,39 @@ describe("ReplyBuffer — SPEC-HITL-CC-001 AC#26", () => {
     expect(buf.size()).toBe(2);             // nothing sent, nothing committed
   });
 
+  // ─── R3 P2#2 regression: pre-stringified raw is cached at push time ───
+  it("R3 P2#2: BufferedReply.raw is cached at push time and matches JSON.stringify(payload)", () => {
+    const buf = new ReplyBuffer();
+    const payload = makeReply("hello", "m1", "agentA", "1");
+    buf.push(payload);
+    const [entry] = buf.peek();
+    expect(entry!.raw).toBe(JSON.stringify(payload));
+  });
+
+  // ─── R3 P3#1 regression: Math.min for oldest_buffered_seconds ─────────
+  // Sequence-sort puts the earliest-pushed entry first, but under clock
+  // rollback that entry's queuedAt is NOT the minimum. The audit's
+  // oldest_buffered_seconds must reflect the TRUE minimum wall-clock value.
+  it("R3 P3#1: oldest_buffered_seconds reflects min(queuedAt) under clock rollback", async () => {
+    // Push 3 entries with clock going forward, then backward, then forward.
+    const times = [1_000, 2_000, 500, 1_500];
+    const buf = new ReplyBuffer({ now: () => times.shift()! });
+    buf.push(makeReply("a", "m1", "agentA", "1"));   // queuedAt=1000, seq=0
+    buf.push(makeReply("b", "m2", "agentA", "2"));   // queuedAt=2000, seq=1
+    buf.push(makeReply("c", "m3", "agentA", "3"));   // queuedAt= 500, seq=2 ← oldest by wall-clock
+
+    const { ws } = makeFakeWs();
+    const auditCalls: BufferDrainAuditLine[] = [];
+    const fakeAudit = async (line: BufferDrainAuditLine) => {
+      auditCalls.push(line);
+    };
+
+    // Wall-clock at drain time = 7000ms. Oldest queuedAt = 500. Age = 6.5s → 6s floor.
+    await drainBufferToClient(ws, buf, fakeAudit, () => 7_000);
+    expect(auditCalls.length).toBe(1);
+    expect(auditCalls[0]!.oldest_buffered_seconds).toBe(6);
+  });
+
   // ─── R2 P1#1 sibling: broadcastReply also gates on send return ────────
   // wsSendAccepted is applied at the broadcastReply call site too, so a
   // backpressure-drop on the only OPEN client doesn't suppress the buffer

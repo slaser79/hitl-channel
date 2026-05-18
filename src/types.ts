@@ -91,6 +91,11 @@ export interface BootstrapFrame {
 export interface BufferedReply {
   /** The reply frame to replay on drain. */
   payload: ReplyPayload;
+  /**
+   * Pre-stringified `payload` cached at push time. Sent verbatim during
+   * drain so we don't re-serialize on every reconnect.
+   */
+  raw: string;
   /** Wall-clock ms epoch when push() was called. Used for TTL + drain age. */
   queuedAt: number;
 }

@@ -139,11 +139,19 @@ export function drainBufferToClientSync(
 ): { sent: number; oldestQueuedAt: number | null } {
   const peeked = buffer.peek();
   if (peeked.length === 0) return { sent: 0, oldestQueuedAt: null };
-  const oldestQueuedAt = peeked[0]!.queuedAt;
+  // sequence-sort puts the earliest-pushed entry first, but under clock
+  // rollback that entry's queuedAt is NOT necessarily the minimum — scan
+  // the whole peek to find the true oldest wall-clock value for audit.
+  let oldestQueuedAt = peeked[0]!.queuedAt;
+  for (const e of peeked) {
+    if (e.queuedAt < oldestQueuedAt) oldestQueuedAt = e.queuedAt;
+  }
   let sent = 0;
   for (const entry of peeked) {
     if (ws.readyState !== 1) break;
-    if (!wsSendAccepted(ws, JSON.stringify(entry.payload))) break;
+    // entry.raw is the JSON.stringify(payload) cached at push time —
+    // re-using it avoids re-serializing on every reconnect.
+    if (!wsSendAccepted(ws, entry.raw)) break;
     buffer.commit(entry);
     sent++;
   }

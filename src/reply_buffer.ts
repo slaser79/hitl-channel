@@ -63,6 +63,7 @@ export class ReplyBuffer {
     }
     bucket.push({
       payload,
+      raw: JSON.stringify(payload),
       queuedAt: this.nowFn(),
       sequence: this.nextSequence++,
     });
