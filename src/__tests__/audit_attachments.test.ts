@@ -73,6 +73,38 @@ describe("summariseAttachments", () => {
     expect(bytes).toBe(5);
   });
 
+  // Regression — R1 P2 bot review: malformed non-base64 input must never
+  // produce non-zero or negative `attachment_bytes`. Previously the helper
+  // approximated bytes via `floor(len*3/4) - padding` which made
+  // `"hello"` → 3 and `"=="` → -1; both classes are now rejected at the
+  // structural-shape gate and contribute 0.
+  it("returns 0 bytes for malformed non-base64 strings (R1 P2 regression)", () => {
+    const malformed = [
+      { type: "image", media_type: "image/png", data: "hello" },        // 5 chars, not %4, no padding
+      { type: "image", media_type: "image/png", data: "==" },           // pure padding
+      { type: "image", media_type: "image/png", data: "abc" },          // 3 chars, not %4
+      { type: "image", media_type: "image/png", data: "ZZ==ZZ==" },     // padding mid-string (shape regex rejects)
+      { type: "image", media_type: "image/png", data: "!!!!!!!!" },     // outside base64 alphabet
+    ];
+    const { count, bytes } = summariseAttachments(malformed);
+    expect(count).toBe(malformed.length);  // array length still bumps count
+    expect(bytes).toBe(0);
+  });
+
+  it("never returns negative attachment_bytes (R1 P2 invariant)", () => {
+    // Property-style spot check: a mix of valid + malformed entries must
+    // always sum to ≥ 0. The negative-bytes class was the actual harm in
+    // the previous approximation formula (`"=="` → -1).
+    const mix = [
+      { type: "image", media_type: "image/png", data: "==" },
+      { type: "image", media_type: "image/png", data: b64("ok") }, // 2 bytes
+      { type: "image", media_type: "image/png", data: "garbage" },
+    ];
+    const { bytes } = summariseAttachments(mix);
+    expect(bytes).toBeGreaterThanOrEqual(0);
+    expect(bytes).toBe(2);  // only the "ok" entry contributes
+  });
+
   it("tolerates base64 with embedded whitespace / line wraps", () => {
     // PEM-style 64-char-wrapped base64 — the helper strips non-alphabet chars
     // before measuring length. Decoded bytes match the un-wrapped form.

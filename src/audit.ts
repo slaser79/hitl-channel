@@ -75,16 +75,34 @@ export function sha256Hex(input: string): string {
  *
  * - `count` is `attachments?.length ?? 0` (zero for missing / non-array).
  * - `bytes` is the sum of DECODED base64 byte lengths across all entries with
- *   a string `data` field. Formula: `floor(len * 3 / 4) - padding`, where
- *   padding is the number of trailing `=` chars (0, 1, or 2). Non-string /
- *   undefined `data` contributes 0.
+ *   a well-formed base64 `data` string. Non-string / malformed `data`
+ *   contributes 0 — no negative totals, no garbage decode of non-base64
+ *   strings.
  *
- * Intentionally tolerant — base64 input that includes whitespace or wraps is
- * normalised by stripping any char outside the base64 alphabet before the
- * length calculation. Audit lines must NEVER carry the raw bytes themselves
- * (closed-schema rule + privacy + log size) — callers extract count/bytes
- * via this helper and discard the original array before calling appendAudit.
+ * Validation uses a structural regex (alphabet + 0–2 trailing `=` only, with
+ * length multiple of 4 after whitespace stripping) so non-base64 strings
+ * like `"hello"` or `"=="` cleanly return 0. Whitespace / CR-LF wraps are
+ * stripped before validation (PEM-style wrapping is real on the wire).
+ *
+ * Audit lines must NEVER carry the raw bytes themselves (closed-schema rule
+ * + privacy + log size) — callers extract count/bytes via this helper and
+ * discard the original array before calling appendAudit.
  */
+const BASE64_SHAPE_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+function decodedBase64ByteLength(raw: string): number {
+  // Strip all whitespace (spaces, tabs, CR, LF) — PEM-style wrapping is
+  // permitted on the wire. Anything else falling outside the base64 alphabet
+  // means the string is not base64; return 0 rather than guessing.
+  const stripped = raw.replace(/\s+/g, "");
+  if (stripped.length === 0) return 0;
+  if (stripped.length % 4 !== 0) return 0;
+  if (!BASE64_SHAPE_RE.test(stripped)) return 0;
+  // Bun / Node natively decode base64 length without allocating a Buffer —
+  // exact byte count, handles padding correctly, never returns negative.
+  return Buffer.byteLength(stripped, "base64");
+}
+
 export function summariseAttachments(
   attachments: unknown,
 ): { count: number; bytes: number } {
@@ -96,14 +114,7 @@ export function summariseAttachments(
     if (!a || typeof a !== "object") continue;
     const data = (a as { data?: unknown }).data;
     if (typeof data !== "string" || data.length === 0) continue;
-    // Strip everything outside the base64 alphabet (handles whitespace, CR/LF
-    // line wraps, stray characters). Padding `=` is counted separately.
-    const normalised = data.replace(/[^A-Za-z0-9+/=]/g, "");
-    if (normalised.length === 0) continue;
-    let padding = 0;
-    if (normalised.endsWith("==")) padding = 2;
-    else if (normalised.endsWith("=")) padding = 1;
-    bytes += Math.floor((normalised.length * 3) / 4) - padding;
+    bytes += decodedBase64ByteLength(data);
   }
   return { count: attachments.length, bytes };
 }

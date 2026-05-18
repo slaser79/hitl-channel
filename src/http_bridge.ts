@@ -456,6 +456,17 @@ export function startHttpBridge(mcp: Server) {
               frameType === "tool_call_result"
                 ? summariseAttachments((data as { attachments?: unknown }).attachments)
                 : { count: 0, bytes: 0 };
+            // Hash only `output` for tool_call_result (matches the CC-side
+            // emit in server.ts → consistent prompt_hash across both audit
+            // rows for the same logical event). Hashing the whole frame
+            // would pull large base64 attachments into the sha256 input and
+            // risk an event-loop stall / memory spike on multi-MB images.
+            // list_tools_result has no `output` field, so for that branch
+            // we hash the (small) frame itself.
+            const hashSource =
+              frameType === "tool_call_result"
+                ? JSON.stringify((data as { output?: unknown }).output ?? null)
+                : JSON.stringify(data);
             // Async audit; don't block WS path.
             void appendAudit({
               ts: new Date().toISOString(),
@@ -470,7 +481,7 @@ export function startHttpBridge(mcp: Server) {
                 frameType === "tool_call_result"
                   ? ((data.approval as "auto" | "user_approved" | "user_denied" | "timeout" | undefined) ?? null)
                   : null,
-              prompt_hash: sha256Hex(JSON.stringify(data)),
+              prompt_hash: sha256Hex(hashSource),
               duration_ms: null,
               attachment_count: attachmentCount,
               attachment_bytes: attachmentBytes,
