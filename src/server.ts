@@ -13,7 +13,7 @@ import {
   clients,
 } from "./http_bridge.js";
 import { getIdentity } from "./identity.js";
-import { startMDNS } from "./mdns.js";
+import { startMDNS, stopMDNS } from "./mdns.js";
 import { cleanupExpiredPairings } from "./pairing.js";
 import {
   appendAudit,
@@ -416,6 +416,53 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   throw new Error(`Unknown tool: ${req.params.name}`);
 });
 
+// Graceful shutdown: Claude Code spawns us as a stdio subprocess. When the
+// parent claude exits, stdin closes — that's our cue to release the HTTP
+// listener on $HITL_CHANNEL_PORT (default 8789) so the next session's spawn
+// can bind. Without this, `Bun.serve()` + the pairing-cleanup interval keep
+// the event loop alive indefinitely; the process is reparented to PID 1 and
+// blocks every future spawn with EADDRINUSE.
+//
+// Handlers MUST be registered BEFORE any await — if the parent exits during
+// `getIdentity()` / `mcp.connect()` / `startHttpBridge()`, the close event
+// is otherwise missed and the late-registered handlers never fire.
+// `httpServer` / `pairingCleanupInterval` are declared `let` (not `const`)
+// because shutdown can fire during the init window, before they're assigned;
+// null-checks inside shutdown() avoid the TDZ ReferenceError that a hoisted
+// function declaration over `const` declarations would otherwise hit.
+let httpServer: ReturnType<typeof startHttpBridge> | undefined;
+let pairingCleanupInterval: ReturnType<typeof setInterval> | undefined;
+let shuttingDown = false;
+function shutdown(reason: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  process.stderr.write(`[hitl-channel] Shutting down on ${reason}\n`);
+  if (httpServer !== undefined) {
+    try {
+      httpServer.stop(true);
+    } catch (e) {
+      process.stderr.write(
+        `[hitl-channel] httpServer.stop error: ${String(e)}\n`
+      );
+    }
+  }
+  try {
+    stopMDNS();
+  } catch (e) {
+    process.stderr.write(`[hitl-channel] stopMDNS error: ${String(e)}\n`);
+  }
+  if (pairingCleanupInterval !== undefined) {
+    clearInterval(pairingCleanupInterval);
+  }
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGHUP", () => shutdown("SIGHUP"));
+process.stdin.on("end", () => shutdown("stdin-EOF"));
+process.stdin.on("close", () => shutdown("stdin-close"));
+
 // Initialize instance identity and start services
 const identity = await getIdentity();
 // Propagate to env so http_bridge audit-on-message can stamp instance_id
@@ -434,10 +481,17 @@ void pruneOldAuditFiles();
 startMDNS(PORT, identity.instanceId, identity.displayName);
 
 // Start periodic cleanup of expired pairing codes (every minute)
-setInterval(() => {
+pairingCleanupInterval = setInterval(() => {
   cleanupExpiredPairings();
 }, 60000);
 
 await mcp.connect(new StdioServerTransport());
 
-startHttpBridge(mcp);
+httpServer = startHttpBridge(mcp);
+
+// Belt-and-braces: if stdin already reached end while we were awaiting the
+// transport / HTTP bridge, the `end` event has already fired and our late
+// listener will never see it. Check the readable state explicitly.
+if ((process.stdin as { readableEnded?: boolean }).readableEnded) {
+  shutdown("stdin-already-ended");
+}
