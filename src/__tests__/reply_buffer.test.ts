@@ -311,4 +311,47 @@ describe("ReplyBuffer — SPEC-HITL-CC-001 AC#26", () => {
     expect(buf.commit(snap1[1]!)).toBe(true);
     expect(buf.size()).toBe(0);
   });
+
+  // ─── R2 P1#1 coverage: ws.send returning -1 (closed) ──────────────────
+  // Different failure mode from the backpressure-drop (return 0) case above:
+  // Bun returns -1 when the socket has already been closed at the OS level.
+  // wsSendAccepted treats both as not-accepted, so the loop bails on the
+  // first attempt and nothing gets committed.
+  it("R2 P1#1: ws.send returning -1 (closed) bails without committing", () => {
+    const buf = new ReplyBuffer();
+    buf.push(makeReply("a", "m1", "agentA", "1"));
+    buf.push(makeReply("b", "m2", "agentA", "2"));
+
+    const ws: HitlWebSocket = {
+      readyState: 1,
+      send: (_data: string): number => -1,
+    };
+
+    const { sent: sentCount } = drainBufferToClientSync(ws, buf);
+    expect(sentCount).toBe(0);
+    expect(buf.size()).toBe(2);             // nothing sent, nothing committed
+  });
+
+  // ─── R2 P1#1 sibling: broadcastReply also gates on send return ────────
+  // wsSendAccepted is applied at the broadcastReply call site too, so a
+  // backpressure-drop on the only OPEN client doesn't suppress the buffer
+  // push and lose the reply.
+  it("R2 P1#1 sibling: broadcastReply pushes to buffer when the only OPEN client backpressure-drops", async () => {
+    const { broadcastReply, clients, replyBuffer } = await import("../http_bridge.js");
+    replyBuffer.drain();   // reset state for test isolation
+
+    const dropping: HitlWebSocket = {
+      readyState: 1,
+      send: (_data: string): number => 0,   // backpressure-drop on every send
+    };
+    clients.add(dropping);
+    try {
+      broadcastReply("hello", "m-bp", "agentBP");
+      const buffered = replyBuffer.drain();
+      expect(buffered.length).toBe(1);
+      expect(buffered[0]!.payload.message_id).toBe("m-bp");
+    } finally {
+      clients.delete(dropping);
+    }
+  });
 });

@@ -392,32 +392,21 @@ export function startHttpBridge(mcp: Server) {
         const typedWs = ws as unknown as HitlWebSocket;
         clients.add(typedWs);
         process.stderr.write(`[hitl-channel] Client connected (${clients.size} total)\n`);
-        // SPEC-HITL-CC-001 Phase 4 AC#26 — replay queued replies SYNCHRONOUSLY
-        // before this open handler yields. Bun runs WS event handlers on a
-        // single thread, so no `broadcastReply` call can interleave between
-        // `clients.add(ws)` above and the sync send loop here. Peek+commit
+        // SPEC-HITL-CC-001 Phase 4 AC#26 — replay queued replies to this
+        // client. drainBufferToClient invokes drainBufferToClientSync first
+        // (no awaits before the ws.send loop), so all sends complete before
+        // the async wrapper yields to await the audit emit. Bun runs WS
+        // handlers single-threaded, so no broadcastReply can interleave
+        // between `clients.add(ws)` above and the sync send loop. Peek+commit
         // makes the drain idempotent against concurrent reconnects (a second
-        // client's open handler will peek an empty buffer and return zero),
-        // so the guard for `clients.size === 1` is unnecessary and would
+        // client's open handler peeks an empty buffer and returns zero), so
+        // the previous `clients.size === 1` guard is unnecessary and would
         // wrongly skip the drain when a stale client lingers in `clients`.
-        const { sent, oldestQueuedAt } = drainBufferToClientSync(typedWs);
-        if (sent > 0 && oldestQueuedAt !== null) {
-          const oldestSeconds = Math.max(
-            0,
-            Math.floor((Date.now() - oldestQueuedAt) / 1000),
+        void drainBufferToClient(typedWs).catch((err) => {
+          process.stderr.write(
+            `[hitl-channel] buffer drain failed: ${err instanceof Error ? err.message : err}\n`
           );
-          void appendBufferDrainAudit({
-            ts: new Date().toISOString(),
-            instance_id: process.env.HITL_INSTANCE_ID ?? "unknown",
-            event: "phone_offline_buffer_drain",
-            replies_drained: sent,
-            oldest_buffered_seconds: oldestSeconds,
-          }).catch((err) => {
-            process.stderr.write(
-              `[hitl-channel] buffer drain audit failed: ${err instanceof Error ? err.message : err}\n`
-            );
-          });
-        }
+        });
       },
       close(ws) {
         clients.delete(ws as unknown as HitlWebSocket);
