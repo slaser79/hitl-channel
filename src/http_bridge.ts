@@ -94,7 +94,12 @@ async function isAuthenticated(req: Request): Promise<{ valid: boolean; reason?:
   return { valid: false, reason: "invalid_token" };
 }
 
-export function broadcastReply(text: string, messageId?: string, agentId?: string): void {
+export function broadcastReply(
+  text: string,
+  messageId?: string,
+  agentId?: string,
+  attachments?: HitlAttachment[],
+): void {
   const payload: ReplyPayload = {
     type: "reply",
     text,
@@ -103,6 +108,7 @@ export function broadcastReply(text: string, messageId?: string, agentId?: strin
     message_id: messageId,
     agent_id: agentId,
     ts: new Date().toISOString(),
+    ...(attachments && attachments.length > 0 ? { attachments } : {}),
   };
   const rawPayload = JSON.stringify(payload);
   let sent = 0;

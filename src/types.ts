@@ -29,6 +29,7 @@ export interface ReplyPayload {
   message_id?: string;
   agent_id?: string;
   ts: string;
+  attachments?: HitlAttachment[];
 }
 
 export interface HitlWebSocket {
