@@ -33,7 +33,7 @@ export interface ReplyPayload {
 
 export interface HitlWebSocket {
   readyState: number;
-  send: (data: string) => void;
+  send: (data: string) => number | void;
 }
 
 // ─── SPEC-HITL-CC-001 frame types ──────────────────────────────────────────
@@ -82,4 +82,20 @@ export interface BootstrapFrame {
   type: "bootstrap";
   content: string;
   meta: { type: "bootstrap" };
+}
+
+// ─── SPEC-HITL-CC-001 Phase 4 AC#26 — ReplyBuffer types ───────────────────
+// Per-instance in-memory ring buffer for replies that arrive while no WS
+// clients are connected. Entries drain in arrival order on WS reconnect.
+
+export interface BufferedReply {
+  /** The reply frame to replay on drain. */
+  payload: ReplyPayload;
+  /**
+   * Pre-stringified `payload` cached at push time. Sent verbatim during
+   * drain so we don't re-serialize on every reconnect.
+   */
+  raw: string;
+  /** Wall-clock ms epoch when push() was called. Used for TTL + drain age. */
+  queuedAt: number;
 }

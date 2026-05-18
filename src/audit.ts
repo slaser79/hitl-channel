@@ -78,6 +78,37 @@ export async function appendAudit(event: AuditEvent): Promise<void> {
 }
 
 /**
+ * SPEC-HITL-CC-001 Phase 4 AC#26 — distinct audit line shape for ReplyBuffer
+ * drains. Emitted on each non-empty drain (i.e. when ≥1 buffered reply was
+ * replayed to a reconnecting client). Lives in the same daily JSONL file as
+ * AuditEvent but uses its own closed schema, discriminated by the `event`
+ * field.
+ */
+export interface BufferDrainAuditLine {
+  ts: string;                       // ISO-8601 UTC
+  instance_id: string;
+  event: "phone_offline_buffer_drain";
+  replies_drained: number;          // count of entries replayed
+  oldest_buffered_seconds: number;  // floor((now - oldest.queuedAt) / 1000)
+}
+
+/**
+ * Append one `phone_offline_buffer_drain` line. Same fire-and-forget shape
+ * as appendAudit — failures are logged to stderr but never block the WS path.
+ */
+export async function appendBufferDrainAudit(line: BufferDrainAuditLine): Promise<void> {
+  try {
+    await mkdir(AUDIT_DIR, { recursive: true });
+    const raw = JSON.stringify(line) + "\n";
+    await appendFile(fileForDate(), raw, { encoding: "utf8" });
+  } catch (err) {
+    process.stderr.write(
+      `[hitl-channel] buffer-drain audit append failed: ${err instanceof Error ? err.message : err}\n`
+    );
+  }
+}
+
+/**
  * Oldest-first prune of audit files older than RETENTION_DAYS. Best-effort —
  * any failure is logged but does not block startup. Returns the number of
  * files deleted (useful for tests).
