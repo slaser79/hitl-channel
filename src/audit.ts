@@ -28,7 +28,8 @@ export type AuditKind =
   | "reply"
   | "choices"
   | "tool_call"
-  | "tool_result";
+  | "tool_result"
+  | "questions_batch";
 
 export type AuditApproval =
   | "auto"

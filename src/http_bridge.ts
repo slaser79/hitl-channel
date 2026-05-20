@@ -435,7 +435,11 @@ export function startHttpBridge(mcp: Server) {
           // request_id is logged at warn level and dropped (no waiter, no
           // audit double-count) per the idempotency contract.
           const frameType = typeof data.type === "string" ? data.type : undefined;
-          if (frameType === "tool_call_result" || frameType === "list_tools_result") {
+          if (
+            frameType === "tool_call_result" ||
+            frameType === "list_tools_result" ||
+            frameType === "questions_batch_result"
+          ) {
             const reqId = typeof data.request_id === "string" ? data.request_id : undefined;
             if (!reqId) {
               process.stderr.write(
@@ -443,11 +447,49 @@ export function startHttpBridge(mcp: Server) {
               );
               return;
             }
+            // SPEC-HC-004 — `questions_batch_result` payload validation: drop
+            // frames missing the `answers` array. Keeps the closed-schema
+            // contract symmetric with the missing-request_id branch above.
+            if (frameType === "questions_batch_result") {
+              if (!Array.isArray((data as { answers?: unknown }).answers)) {
+                process.stderr.write(
+                  `[hitl-channel] WARN questions_batch_result missing answers — dropped\n`
+                );
+                return;
+              }
+              if (typeof (data as { cancelled?: unknown }).cancelled !== "boolean") {
+                process.stderr.write(
+                  `[hitl-channel] WARN questions_batch_result missing/non-boolean cancelled — dropped\n`
+                );
+                return;
+              }
+            }
             const resolved = correlator.resolve(reqId, data);
             if (!resolved) {
               process.stderr.write(
                 `[hitl-channel] WARN ${frameType} for unknown request_id ${reqId} — dropped\n`
               );
+              return;
+            }
+            if (frameType === "questions_batch_result") {
+              // SPEC-HC-004 — closed-schema audit emission for the return path.
+              // prompt_hash is computed over `answers` so the dispatch row's
+              // hash (over `questions`) and the result row's hash differ for
+              // the same logical event.
+              void appendAudit({
+                ts: new Date().toISOString(),
+                instance_id: process.env.HITL_INSTANCE_ID ?? "unknown",
+                direction: "phone_returns_to_cc",
+                kind: "questions_batch",
+                tool_name: null,
+                approval: null,
+                prompt_hash: sha256Hex(
+                  JSON.stringify((data as { answers?: unknown }).answers ?? null)
+                ),
+                duration_ms: null,
+                attachment_count: 0,
+                attachment_bytes: 0,
+              });
               return;
             }
             // SPEC-HITL-CC-001 Phase 6 carry-forward (issue #12) — extract

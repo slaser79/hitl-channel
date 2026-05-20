@@ -46,4 +46,20 @@ describe("audit.ts", () => {
     expect(resultEvt.attachment_count).toBe(2);
     expect(resultEvt.attachment_bytes).toBe(4_096);
   });
+
+  it("AuditKind accepts the new SPEC-HC-004 `questions_batch` variant", () => {
+    const evt: AuditEvent = {
+      ts: new Date("2026-05-20T00:00:00.000Z").toISOString(),
+      instance_id: "abc-123",
+      direction: "cc_to_phone",
+      kind: "questions_batch",
+      tool_name: null,
+      approval: null,
+      prompt_hash: sha256Hex("[]"),
+      duration_ms: null,
+      attachment_count: 0,
+      attachment_bytes: 0,
+    };
+    expect(evt.kind).toBe("questions_batch");
+  });
 });
