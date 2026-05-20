@@ -450,14 +450,19 @@ export function startHttpBridge(mcp: Server) {
             // SPEC-HC-004 — `questions_batch_result` payload validation: drop
             // frames missing the `answers` array. Keeps the closed-schema
             // contract symmetric with the missing-request_id branch above.
-            if (
-              frameType === "questions_batch_result" &&
-              !Array.isArray((data as { answers?: unknown }).answers)
-            ) {
-              process.stderr.write(
-                `[hitl-channel] WARN questions_batch_result missing answers — dropped\n`
-              );
-              return;
+            if (frameType === "questions_batch_result") {
+              if (!Array.isArray((data as { answers?: unknown }).answers)) {
+                process.stderr.write(
+                  `[hitl-channel] WARN questions_batch_result missing answers — dropped\n`
+                );
+                return;
+              }
+              if (typeof (data as { cancelled?: unknown }).cancelled !== "boolean") {
+                process.stderr.write(
+                  `[hitl-channel] WARN questions_batch_result missing/non-boolean cancelled — dropped\n`
+                );
+                return;
+              }
             }
             const resolved = correlator.resolve(reqId, data);
             if (!resolved) {

@@ -83,6 +83,54 @@ describe("hitl-channel WS routing for SPEC-HC-004", () => {
     }
   });
 
+  it("AV8: questions_batch_result with missing `cancelled` is dropped, waiter not resolved", async () => {
+    const ws = await openWS();
+    try {
+      const requestId = `req-no-cancel-${Date.now()}`;
+      const waiter = correlator.register<QuestionsBatchResultFrame>(
+        requestId,
+        200,
+      );
+      ws.send(
+        JSON.stringify({
+          type: "questions_batch_result",
+          request_id: requestId,
+          answers: [{ header: "X", selected: ["A"] }],
+          // cancelled intentionally omitted
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 50));
+      expect(correlator.size).toBe(1);
+      await expect(waiter).rejects.toThrow(/timeout/);
+    } finally {
+      ws.close();
+    }
+  });
+
+  it("AV8: questions_batch_result with non-boolean `cancelled` is dropped", async () => {
+    const ws = await openWS();
+    try {
+      const requestId = `req-bad-cancel-${Date.now()}`;
+      const waiter = correlator.register<QuestionsBatchResultFrame>(
+        requestId,
+        200,
+      );
+      ws.send(
+        JSON.stringify({
+          type: "questions_batch_result",
+          request_id: requestId,
+          answers: [],
+          cancelled: "no", // wrong type
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 50));
+      expect(correlator.size).toBe(1);
+      await expect(waiter).rejects.toThrow(/timeout/);
+    } finally {
+      ws.close();
+    }
+  });
+
   it("AV4 (deviation): with no WS client connected, present_questions_to_hitl handler short-circuits with isError — frame is NOT buffered (matches call_phone_tool semantics; ReplyBuffer accepts ReplyPayload only)", async () => {
     // No WS client opened in this test — relies on handler-level guard.
     // This documents the deviation from the spec's AV4 wording.
