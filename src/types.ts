@@ -85,6 +85,39 @@ export interface BootstrapFrame {
   meta: { type: "bootstrap" };
 }
 
+// ─── SPEC-HC-004 — Batched-question frame types ───────────────────────────
+// Mirror of the relay-side SPEC-AW-311 shapes so a payload captured on either
+// transport is structurally identical. `allow_other` is accepted in the type
+// definition but has no MV-time semantics on the channel side (Phase 2 deferred).
+
+export interface QuestionSpec {
+  header: string;
+  question: string;
+  choices: string[];
+  multi_select?: boolean;
+  allow_other?: boolean;
+}
+
+export interface QuestionAnswer {
+  header: string;
+  selected: string[];
+  other_text?: string;
+}
+
+export interface QuestionsBatchRequestFrame {
+  type: "questions_batch_request";
+  request_id: string;
+  questions: QuestionSpec[];
+  ts: string;
+}
+
+export interface QuestionsBatchResultFrame {
+  type: "questions_batch_result";
+  request_id: string;
+  answers: QuestionAnswer[];
+  cancelled: boolean;
+}
+
 // ─── SPEC-HITL-CC-001 Phase 4 AC#26 — ReplyBuffer types ───────────────────
 // Per-instance in-memory ring buffer for replies that arrive while no WS
 // clients are connected. Entries drain in arrival order on WS reconnect.

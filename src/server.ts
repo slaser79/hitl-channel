@@ -29,6 +29,10 @@ import type {
   ListToolsResultFrame,
   ToolCallResultFrame,
 } from "./types.js";
+import {
+  PRESENT_QUESTIONS_TOOL_DEFINITION,
+  presentQuestionsToHitl,
+} from "./questions_batch.js";
 
 const PORT = Number(process.env.HITL_CHANNEL_PORT ?? 8789);
 
@@ -193,6 +197,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["name"],
       },
     },
+    // ─── SPEC-HC-004 ─────────────────────────────────────────────────────
+    PRESENT_QUESTIONS_TOOL_DEFINITION,
   ],
 }));
 
@@ -628,6 +634,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         ],
       };
     }
+  }
+
+  if (req.params.name === "present_questions_to_hitl") {
+    return presentQuestionsToHitl(args, {
+      correlator,
+      broadcastFrame,
+      clientsSize: () => clients.size,
+      instanceId: identity.instanceId,
+      generateRequestId,
+    });
   }
 
   throw new Error(`Unknown tool: ${req.params.name}`);
