@@ -22,6 +22,7 @@ import {
   appendAudit,
   pruneOldAuditFiles,
   sha256Hex,
+  stableStringify,
   summariseAttachments,
 } from "./audit.js";
 import type {
@@ -357,7 +358,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     );
 
     broadcastReply(text, messageId, agentId, attachments);
-    void appendAudit({
+    appendAudit({
       ts: new Date().toISOString(),
       instance_id: identity.instanceId,
       direction: "cc_to_phone",
@@ -368,7 +369,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       duration_ms: null,
       attachment_count: attachmentCount,
       attachment_bytes: attachmentBytes,
-    });
+    }).catch((err) =>
+      process.stderr.write(
+        `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
+      )
+    );
 
     return {
       content: [
@@ -401,7 +406,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     for (const ws of clients) {
       if (ws.readyState === 1) ws.send(payload);
     }
-    void appendAudit({
+    appendAudit({
       ts: new Date().toISOString(),
       instance_id: identity.instanceId,
       direction: "cc_to_phone",
@@ -413,7 +418,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       // No attachments on choices frames today (issue #12 closed-schema default).
       attachment_count: 0,
       attachment_bytes: 0,
-    });
+    }).catch((err) =>
+      process.stderr.write(
+        `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
+      )
+    );
 
     return {
       content: [
@@ -517,21 +526,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       cc_instance_id: identity.instanceId,
     };
     const startedAt = Date.now();
-    void appendAudit({
+    appendAudit({
       ts: new Date(startedAt).toISOString(),
       instance_id: identity.instanceId,
       direction: "cc_calls_phone",
       kind: "tool_call",
       tool_name: name,
       approval: null,
-      prompt_hash: sha256Hex(JSON.stringify(toolArgs)),
+      prompt_hash: sha256Hex(stableStringify(toolArgs)),
       duration_ms: null,
       // Issue #12 AC4 boundary — `cc_calls_phone` audit emission for
       // CC-supplied attachments-as-input is out-of-scope (no phone tool today
       // consumes a CC-supplied attachment). File a follow-up if that changes.
       attachment_count: 0,
       attachment_bytes: 0,
-    });
+    }).catch((err) =>
+      process.stderr.write(
+        `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
+      )
+    );
     const waiter = correlator.register<ToolCallResultFrame>(
       requestId,
       timeoutSeconds * 1000,
@@ -551,18 +564,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       // attachment metadata.
       const { count: attachmentCount, bytes: attachmentBytes } =
         summariseAttachments((result as { attachments?: unknown }).attachments);
-      void appendAudit({
+      appendAudit({
         ts: new Date().toISOString(),
         instance_id: identity.instanceId,
         direction: "phone_returns_to_cc",
         kind: "tool_result",
         tool_name: name,
         approval: result.approval ?? null,
-        prompt_hash: sha256Hex(JSON.stringify(result.output ?? null)),
+        prompt_hash: sha256Hex(stableStringify(result.output ?? null)),
         duration_ms: duration,
         attachment_count: attachmentCount,
         attachment_bytes: attachmentBytes,
-      });
+      }).catch((err) =>
+        process.stderr.write(
+          `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
+        )
+      );
       if (result.success === false) {
         return {
           isError: true,

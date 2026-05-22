@@ -18,7 +18,7 @@
  * without booting the stdio MCP transport (server.ts has a top-level
  * `await mcp.connect(...)`).
  */
-import { appendAudit, sha256Hex } from "./audit.js";
+import { appendAudit, sha256Hex, stableStringify } from "./audit.js";
 import type { FrameCorrelator } from "./correlator.js";
 import type {
   QuestionSpec,
@@ -237,18 +237,22 @@ export async function presentQuestionsToHitl(
     ts,
   };
 
-  void audit({
+  audit({
     ts,
     instance_id: deps.instanceId,
     direction: "cc_to_phone",
     kind: "questions_batch",
     tool_name: null,
     approval: null,
-    prompt_hash: sha256Hex(JSON.stringify(v.questions)),
+    prompt_hash: sha256Hex(stableStringify(v.questions)),
     duration_ms: null,
     attachment_count: 0,
     attachment_bytes: 0,
-  });
+  }).catch((err) =>
+    process.stderr.write(
+      `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
+    )
+  );
 
   // SPEC-AW-311 — fire-and-forget dispatch (matches `present_choices_to_hitl`
   // in server.ts:383). The previous synchronous `correlator.register + await

@@ -11,6 +11,7 @@ export interface HitlMessage {
   sender_id?: string;
   agent_id?: string;
   attachments?: HitlAttachment[];
+  metadata?: Record<string, any>;
 }
 
 export interface ChannelMeta {
@@ -18,7 +19,7 @@ export interface ChannelMeta {
   ts: string;
   sender_id: string;
   agent_id?: string;
-  [key: string]: string | undefined;
+  [key: string]: any;
 }
 
 export interface ReplyPayload {
