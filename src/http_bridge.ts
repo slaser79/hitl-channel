@@ -366,6 +366,7 @@ export function startHttpBridge(mcp: Server) {
             const senderId = String(body.sender_id ?? "unknown");
             const agentId = body.agent_id ? String(body.agent_id) : undefined;
             const attachments = body.attachments;
+            const metadata = body.metadata;
 
             if (!message.trim() && (!attachments || attachments.length === 0)) {
               return new Response(
@@ -379,10 +380,51 @@ export function startHttpBridge(mcp: Server) {
               attachments
             );
 
+            // Forward metadata, mapping batch_id -> request_id for agent convenience
+            const extraMeta = { ...metadata };
+            if (extraMeta.batch_id && !extraMeta.request_id) {
+              extraMeta.request_id = extraMeta.batch_id;
+            }
+
             await sendChannelNotification(mcp, contentForNotification, {
               sender_id: senderId,
               ...(agentId ? { agent_id: agentId } : {}),
+              ...extraMeta,
             });
+
+            // SPEC-HC-004 AV3 — Closed-schema audit emission for the return path.
+            const { count: attachmentCount, bytes: attachmentBytes } =
+              summariseAttachments(attachments);
+
+            if (metadata?.type === "questions_batch_response") {
+              void appendAudit({
+                ts: new Date().toISOString(),
+                instance_id: process.env.HITL_INSTANCE_ID ?? "unknown",
+                direction: "phone_returns_to_cc",
+                kind: "questions_batch",
+                tool_name: null,
+                approval: null,
+                prompt_hash: sha256Hex(
+                  JSON.stringify(metadata.batch_answer?.answers ?? null)
+                ),
+                duration_ms: null,
+                attachment_count: attachmentCount,
+                attachment_bytes: attachmentBytes,
+              });
+            } else {
+              void appendAudit({
+                ts: new Date().toISOString(),
+                instance_id: process.env.HITL_INSTANCE_ID ?? "unknown",
+                direction: "phone_to_cc",
+                kind: "message",
+                tool_name: null,
+                approval: null,
+                prompt_hash: sha256Hex(message),
+                duration_ms: null,
+                attachment_count: attachmentCount,
+                attachment_bytes: attachmentBytes,
+              });
+            }
 
             return new Response(JSON.stringify({ status: "delivered" }), {
               status: 200,

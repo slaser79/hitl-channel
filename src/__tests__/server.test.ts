@@ -8,13 +8,16 @@ const TEST_API_KEY = "test-key";
 describe("hitl-channel HTTP Bridge", () => {
   let mcpMock: Server;
   let server: any;
+  let lastNotification: any = null;
 
   beforeAll(() => {
     process.env.HITL_CHANNEL_PORT = TEST_PORT.toString();
     process.env.HITL_CHANNEL_API_KEY = TEST_API_KEY;
 
     mcpMock = {
-      notification: async () => {},
+      notification: async (notif: any) => {
+        lastNotification = notif;
+      },
     } as any;
 
     server = startHttpBridge(mcpMock);
@@ -51,6 +54,36 @@ describe("hitl-channel HTTP Bridge", () => {
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body.status).toBe("delivered");
+  });
+
+  it("POST / should forward metadata to mcp.notification", async () => {
+    lastNotification = null;
+    const payload = {
+      message: "Submitted 3 answers",
+      metadata: {
+        type: "questions_batch_response",
+        batch_id: "req-123",
+        batch_answer: { answers: [{ header: "H1", selected: ["A"] }], cancelled: false }
+      }
+    };
+
+    const response = await fetch(`http://127.0.0.1:${TEST_PORT}/`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${TEST_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    expect(response.status).toBe(200);
+    expect(lastNotification).not.toBeNull();
+    expect(lastNotification.params.content).toBe("Submitted 3 answers");
+    expect(lastNotification.params.meta.type).toBe("questions_batch_response");
+    expect(lastNotification.params.meta.batch_id).toBe("req-123");
+    // Verify batch_id -> request_id mapping
+    expect(lastNotification.params.meta.request_id).toBe("req-123");
+    expect(JSON.parse(lastNotification.params.meta.batch_answer)).toEqual(payload.metadata.batch_answer);
   });
 
   it("POST / with empty message should return 400 Bad Request", async () => {
