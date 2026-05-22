@@ -71,6 +71,26 @@ export function sha256Hex(input: string): string {
 }
 
 /**
+ * Stable JSON stringification to ensure deterministic hashes for audit logs.
+ * Sorts object keys alphabetically.
+ */
+export function stableStringify(obj: any): string {
+  if (obj === null || typeof obj !== "object") {
+    return JSON.stringify(obj);
+  }
+
+  if (Array.isArray(obj)) {
+    return "[" + obj.map(stableStringify).join(",") + "]";
+  }
+
+  const sortedKeys = Object.keys(obj).sort();
+  const pairs = sortedKeys.map(
+    (key) => `${JSON.stringify(key)}:${stableStringify(obj[key])}`
+  );
+  return "{" + pairs.join(",") + "}";
+}
+
+/**
  * SPEC-HITL-CC-001 Phase 6 carry-forward (issue #12) — summarise an attachment
  * array for audit emission. Returns `{count, bytes}` where:
  *
