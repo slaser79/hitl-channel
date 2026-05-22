@@ -1,9 +1,18 @@
 /**
  * SPEC-HC-004 — `present_questions_to_hitl` MCP tool handler.
  *
- * Strict structural sibling of `call_phone_tool` (SPEC-HITL-CC-001 Phase 1):
- * generate UUID, register correlator waiter, broadcast one frame, await result,
- * emit closed-schema audit rows on dispatch + return path.
+ * Fire-and-forget dispatch sibling of `present_choices_to_hitl`
+ * (server.ts:383). Generate UUID, emit closed-schema dispatch audit row,
+ * broadcast one WS frame to the phone, return immediately. The user's
+ * submitted answers arrive on a later agent turn as a normal channel
+ * notification carrying the same `request_id` — callers can correlate
+ * by that id if they care.
+ *
+ * Previous design (SPEC-AW-311 v1) registered a correlator waiter and
+ * blocked the MCP call until the phone returned a `questions_batch_result`
+ * WS frame. That path doesn't work in practice: the phone-side response
+ * goes via HTTP POST to `/` (notification surface), never reaches the
+ * correlator, so the waiter sat blocked until `timeout_seconds` elapsed.
  *
  * Extracted from server.ts so the validation + dispatch logic is unit-testable
  * without booting the stdio MCP transport (server.ts has a top-level
@@ -14,7 +23,6 @@ import type { FrameCorrelator } from "./correlator.js";
 import type {
   QuestionSpec,
   QuestionsBatchRequestFrame,
-  QuestionsBatchResultFrame,
 } from "./types.js";
 
 const MAX_QUESTIONS = 4;
@@ -242,47 +250,44 @@ export async function presentQuestionsToHitl(
     attachment_bytes: 0,
   });
 
-  const waiter = deps.correlator.register<QuestionsBatchResultFrame>(
-    requestId,
-    v.timeoutSeconds * 1000,
-  );
+  // SPEC-AW-311 — fire-and-forget dispatch (matches `present_choices_to_hitl`
+  // in server.ts:383). The previous synchronous `correlator.register + await
+  // waiter` pattern blocked the agent's MCP call for the full
+  // `timeout_seconds` window (up to 15 min) because the phone-side response
+  // never reaches the correlator: `claudeCodeService.sendMessage` POSTs to
+  // `/` (notification path) and only inbound WS frames trigger
+  // `correlator.resolve`. Returning immediately matches how every other
+  // channel tool behaves; the user's submitted answers surface as a normal
+  // channel notification on the next agent turn (carries the same
+  // `request_id` so callers can correlate if they care).
   const delivered = deps.broadcastFrame(
     frame as unknown as Record<string, unknown>,
   );
   if (delivered === 0) {
-    deps.correlator.reject(
-      requestId,
-      new Error("no_phone_connected_post_check"),
-    );
-  }
-
-  try {
-    const result = await waiter;
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(
-            {
-              answers: result.answers ?? [],
-              cancelled: Boolean(result.cancelled),
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
     return {
       isError: true,
       content: [
         {
           type: "text" as const,
-          text: `present_questions_to_hitl failed: ${msg}`,
+          text: `present_questions_to_hitl failed: no_phone_connected_post_check (request_id=${requestId})`,
         },
       ],
     };
   }
+  // `v.timeoutSeconds` is preserved on the wire frame above for the phone
+  // renderer's optional UI gate; the channel no longer enforces it server-
+  // side because there's no waiter to time out.
+  void v.timeoutSeconds;
+
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text:
+          `Survey presented to user (${v.questions.length} question${v.questions.length === 1 ? "" : "s"}, ` +
+          `request_id=${requestId}). Answers will arrive as a separate ` +
+          `channel notification with the same request_id.`,
+      },
+    ],
+  };
 }

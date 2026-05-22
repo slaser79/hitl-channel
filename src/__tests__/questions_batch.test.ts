@@ -6,10 +6,7 @@ import {
   validateQuestionsArgs,
 } from "../questions_batch.js";
 import type { AuditEvent } from "../audit.js";
-import type {
-  QuestionsBatchRequestFrame,
-  QuestionsBatchResultFrame,
-} from "../types.js";
+import type { QuestionsBatchRequestFrame } from "../types.js";
 
 const validQuestion = () => ({
   header: "Mode",
@@ -128,40 +125,30 @@ describe("PRESENT_QUESTIONS_TOOL_DEFINITION", () => {
   });
 });
 
-describe("presentQuestionsToHitl handler (AV2/AV3/AV6/AV7)", () => {
-  it("happy-path: dispatches one frame, registers waiter, resolves on result", async () => {
+describe("presentQuestionsToHitl handler (SPEC-AW-311 fire-and-forget)", () => {
+  it("happy-path: dispatches one frame, returns immediately, registers no waiter", async () => {
     const { correlator, emittedFrames, auditRows, deps } = makeHandlerDeps();
-    const handlerPromise = presentQuestionsToHitl(
+
+    const result = await presentQuestionsToHitl(
       { questions: [validQuestion()] },
       deps,
     );
 
-    // Exactly one frame should have been emitted before we await.
-    await Promise.resolve(); // let the synchronous part of the handler run
+    // Fire-and-forget: handler returns before any phone reply.
     expect(emittedFrames.length).toBe(1);
     const frame = emittedFrames[0] as unknown as QuestionsBatchRequestFrame;
     expect(frame.type).toBe("questions_batch_request");
     expect(frame.request_id).toBe("req-fixed-uuid");
     expect(frame.questions.length).toBe(1);
-    expect(correlator.size).toBe(1);
-
-    // Simulate the phone replying.
-    const reply: QuestionsBatchResultFrame = {
-      type: "questions_batch_result",
-      request_id: frame.request_id,
-      answers: [{ header: "Mode", selected: ["A"] }],
-      cancelled: false,
-    };
-    correlator.resolve(frame.request_id, reply);
-
-    const result = await handlerPromise;
-    expect(result.isError).toBeUndefined();
-    const payload = JSON.parse(result.content[0]!.text);
-    expect(payload.cancelled).toBe(false);
-    expect(payload.answers).toEqual([{ header: "Mode", selected: ["A"] }]);
+    // No correlator waiter is registered — answers flow back as a normal
+    // channel notification rather than via a synchronous round-trip.
     expect(correlator.size).toBe(0);
 
-    // AV3 dispatch-side audit row exists with the right shape.
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]!.text).toMatch(/Survey presented/);
+    expect(result.content[0]!.text).toMatch(/req-fixed-uuid/);
+
+    // Dispatch-side audit row still emits with the closed-schema shape.
     expect(auditRows.length).toBe(1);
     expect(auditRows[0]!.direction).toBe("cc_to_phone");
     expect(auditRows[0]!.kind).toBe("questions_batch");
@@ -171,28 +158,21 @@ describe("presentQuestionsToHitl handler (AV2/AV3/AV6/AV7)", () => {
     expect(auditRows[0]!.prompt_hash.length).toBe(64);
   });
 
-  it("AV6: timeout rejects waiter and surfaces error to MCP caller", async () => {
-    const { correlator, deps } = makeHandlerDeps();
+  it("returns no_phone_connected error when broadcastFrame delivers to zero clients", async () => {
+    const { correlator, emittedFrames, deps } = makeHandlerDeps();
+    // Override broadcastFrame to simulate zero delivery (phone disconnected
+    // after the clientsSize() pre-check).
+    deps.broadcastFrame = (frame) => {
+      emittedFrames.push(frame);
+      return 0;
+    };
     const result = await presentQuestionsToHitl(
-      { questions: [validQuestion()], timeout_seconds: 0.01 },
-      deps,
-    );
-    expect(result.isError).toBe(true);
-    expect(result.content[0]!.text).toMatch(/timeout/);
-    expect(correlator.size).toBe(0);
-  });
-
-  it("AV7: connection drop (rejectAll) surfaces to MCP caller", async () => {
-    const { correlator, deps } = makeHandlerDeps();
-    const handlerPromise = presentQuestionsToHitl(
       { questions: [validQuestion()] },
       deps,
     );
-    await Promise.resolve();
-    correlator.rejectAll(new Error("phone_disconnected"));
-    const result = await handlerPromise;
     expect(result.isError).toBe(true);
-    expect(result.content[0]!.text).toMatch(/phone_disconnected/);
+    expect(result.content[0]!.text).toMatch(/no_phone_connected/);
+    expect(correlator.size).toBe(0);
   });
 
   it("returns an error and skips dispatch when no phone is connected", async () => {
