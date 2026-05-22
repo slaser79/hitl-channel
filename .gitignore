@@ -3,3 +3,5 @@ node_modules/
 *.log
 .claude/
 !.claude/empire_context.yaml
+.gemini/
+"~"/
