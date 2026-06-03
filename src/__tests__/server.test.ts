@@ -78,11 +78,48 @@ describe("hitl-channel HTTP Bridge", () => {
 
     expect(response.status).toBe(200);
     expect(lastNotification).not.toBeNull();
-    expect(lastNotification.params.content).toBe("Submitted 3 answers");
+    expect(lastNotification.params.content).toBe("Submitted 3 answers — H1: [A]");
     expect(lastNotification.params.meta.type).toBe("questions_batch_response");
     expect(lastNotification.params.meta.batch_id).toBe("req-123");
     // Verify batch_id -> request_id mapping
     expect(lastNotification.params.meta.request_id).toBe("req-123");
+    expect(JSON.parse(lastNotification.params.meta.batch_answer)).toEqual(payload.metadata.batch_answer);
+  });
+
+  it("POST / should handle multi-answer and cancelled rendering for questions_batch_response", async () => {
+    lastNotification = null;
+    const payload = {
+      message: "Submitted 2 answers",
+      metadata: {
+        type: "questions_batch_response",
+        batch_id: "req-456",
+        batch_answer: {
+          answers: [
+            { header: "Horizon", selected: ["Both"] },
+            { header: "Primary win", selected: ["Agents+Automations", "Required-vars"] }
+          ],
+          cancelled: true
+        }
+      }
+    };
+
+    const response = await fetch(`http://127.0.0.1:${TEST_PORT}/`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${TEST_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    expect(response.status).toBe(200);
+    expect(lastNotification).not.toBeNull();
+    expect(lastNotification.params.content).toBe(
+      "Submitted 2 answers (cancelled) — Horizon: [Both]; Primary win: [Agents+Automations, Required-vars]"
+    );
+    expect(lastNotification.params.meta.type).toBe("questions_batch_response");
+    expect(lastNotification.params.meta.batch_id).toBe("req-456");
+    expect(lastNotification.params.meta.request_id).toBe("req-456");
     expect(JSON.parse(lastNotification.params.meta.batch_answer)).toEqual(payload.metadata.batch_answer);
   });
 

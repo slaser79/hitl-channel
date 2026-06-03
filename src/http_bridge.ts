@@ -375,7 +375,7 @@ export function startHttpBridge(mcp: Server) {
               );
             }
 
-            const contentForNotification = await processAttachments(
+            let contentForNotification = await processAttachments(
               message,
               attachments
             );
@@ -384,6 +384,39 @@ export function startHttpBridge(mcp: Server) {
             const extraMeta = { ...metadata };
             if (extraMeta.batch_id && !extraMeta.request_id) {
               extraMeta.request_id = extraMeta.batch_id;
+            }
+
+            if (metadata?.type === "questions_batch_response") {
+              const batchAnswer = metadata.batch_answer;
+              const isCancelled = batchAnswer?.cancelled === true || metadata.cancelled === true;
+              const answers = batchAnswer?.answers;
+
+              let parts: string[] = [];
+              if (Array.isArray(answers) && answers.length > 0) {
+                const answersStr = answers
+                  .map((ans: any) => {
+                    const header = ans?.header ?? "";
+                    const selected = Array.isArray(ans?.selected)
+                      ? ans.selected.join(", ")
+                      : "";
+                    return `${header}: [${selected}]`;
+                  })
+                  .join("; ");
+                if (answersStr) {
+                  parts.push(answersStr);
+                }
+              }
+
+              let suffix = "";
+              if (isCancelled) {
+                suffix = " (cancelled)";
+              }
+
+              if (parts.length > 0) {
+                contentForNotification = `${contentForNotification}${suffix} — ${parts.join("; ")}`;
+              } else if (suffix) {
+                contentForNotification = `${contentForNotification}${suffix}`;
+              }
             }
 
             await sendChannelNotification(mcp, contentForNotification, {
