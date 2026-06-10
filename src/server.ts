@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-import { readFile, stat } from "node:fs/promises";
+import { readFile, stat, realpath } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { basename, extname, resolve as resolvePath } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -225,26 +226,42 @@ const MIME_BY_EXT: Record<string, string> = {
 // limit (SPEC-HITL-CC-001 AC#35) and bounds memory pressure if a caller
 // supplies an absurdly large file path. Bigger files are rejected at
 // stat time, before any base64 encoding.
-const kMaxFileReadBytes = 5 * 1024 * 1024;
+export const kMaxFileReadBytes = 5 * 1024 * 1024;
 
 // Allowlist of directory prefixes a `path` attachment may resolve under.
 // Defaults to the user's home directory + tmpdir; an operator can widen
 // or narrow via HITL_CHANNEL_ATTACHMENT_ROOTS (colon-separated absolute
 // paths). The check uses `path.resolve` to normalise away `..` segments
 // before the prefix match so a caller can't escape via `~/../etc/passwd`.
-function attachmentRoots(): string[] {
+export function attachmentRoots(): string[] {
   const env = process.env.HITL_CHANNEL_ATTACHMENT_ROOTS;
+  let rawRoots: string[];
   if (env && env.trim().length > 0) {
-    return env
+    rawRoots = env
       .split(":")
       .map((p) => p.trim())
       .filter((p) => p.length > 0)
       .map((p) => resolvePath(p));
+  } else {
+    rawRoots = [resolvePath(homedir()), resolvePath(tmpdir()), resolvePath("/tmp")];
   }
-  return [resolvePath(homedir()), resolvePath(tmpdir())];
+
+  const roots: string[] = [];
+  for (const r of rawRoots) {
+    roots.push(r);
+    try {
+      const resolved = realpathSync(r);
+      if (resolved !== r) {
+        roots.push(resolved);
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return roots;
 }
 
-function isPathAllowed(absolute: string, roots: string[]): boolean {
+export function isPathAllowed(absolute: string, roots: string[]): boolean {
   for (const root of roots) {
     if (absolute === root) return true;
     // Append a separator to the root so /home/foo doesn't match /home/foobar.
@@ -254,10 +271,14 @@ function isPathAllowed(absolute: string, roots: string[]): boolean {
   return false;
 }
 
-async function resolveAttachments(raw: unknown): Promise<HitlAttachment[]> {
-  if (!Array.isArray(raw)) return [];
+export async function resolveAttachments(raw: unknown): Promise<{
+  attachments: HitlAttachment[];
+  warnings: string[];
+}> {
+  if (!Array.isArray(raw)) return { attachments: [], warnings: [] };
   const roots = attachmentRoots();
   const out: HitlAttachment[] = [];
+  const warnings: string[] = [];
   for (const att of raw) {
     if (att == null || typeof att !== "object") continue;
     const a = att as {
@@ -274,10 +295,17 @@ async function resolveAttachments(raw: unknown): Promise<HitlAttachment[]> {
       typeof a.fileName === "string" ? a.fileName : undefined;
     if (typeof a.path === "string" && a.path.length > 0) {
       const absolute = resolvePath(a.path);
-      if (!isPathAllowed(absolute, roots)) {
+      let realAbsolute = absolute;
+      try {
+        realAbsolute = await realpath(absolute);
+      } catch {
+        // ignore
+      }
+      if (!isPathAllowed(absolute, roots) && !isPathAllowed(realAbsolute, roots)) {
         process.stderr.write(
           `[hitl-channel] reply_to_hitl: rejecting path outside allowlisted roots: ${absolute}\n`,
         );
+        warnings.push(`path outside allowlist: ${a.path}`);
         continue;
       }
       try {
@@ -286,12 +314,14 @@ async function resolveAttachments(raw: unknown): Promise<HitlAttachment[]> {
           process.stderr.write(
             `[hitl-channel] reply_to_hitl: path is not a regular file: ${absolute}\n`,
           );
+          warnings.push(`path is not a regular file: ${a.path}`);
           continue;
         }
         if (st.size > kMaxFileReadBytes) {
           process.stderr.write(
             `[hitl-channel] reply_to_hitl: attachment_too_large size=${st.size} max=${kMaxFileReadBytes} path=${absolute}\n`,
           );
+          warnings.push(`file size exceeds limit: ${a.path}`);
           continue;
         }
         const buf = await readFile(absolute);
@@ -302,11 +332,11 @@ async function resolveAttachments(raw: unknown): Promise<HitlAttachment[]> {
           mediaType = MIME_BY_EXT[ext] ?? "application/octet-stream";
         }
       } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
         process.stderr.write(
-          `[hitl-channel] reply_to_hitl: failed to read ${absolute}: ${
-            err instanceof Error ? err.message : String(err)
-          }\n`,
+          `[hitl-channel] reply_to_hitl: failed to read ${absolute}: ${errMsg}\n`,
         );
+        warnings.push(`failed to read: ${a.path}`);
         continue;
       }
     } else if (typeof a.data === "string" && a.data.length > 0) {
@@ -335,7 +365,7 @@ async function resolveAttachments(raw: unknown): Promise<HitlAttachment[]> {
     if (fileName) entry.fileName = fileName;
     out.push(entry);
   }
-  return out;
+  return { attachments: out, warnings };
 }
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -347,7 +377,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const messageId = args.message_id as string | undefined;
     const agentId = args.agent_id as string | undefined;
     const rawAttachments = args.attachments;
-    const attachments: HitlAttachment[] = await resolveAttachments(
+    const { attachments, warnings } = await resolveAttachments(
       rawAttachments,
     );
     const { count: attachmentCount, bytes: attachmentBytes } =
@@ -375,11 +405,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       )
     );
 
+    let responseText = `Sent to HITL app: ${text} (attachments: ${attachmentCount})`;
+    if (warnings.length > 0) {
+      const isPlural = warnings.length > 1;
+      responseText += ` (${warnings.length} attachment${isPlural ? "s" : ""} dropped: ${warnings.join(", ")})`;
+    }
+
     return {
       content: [
         {
           type: "text" as const,
-          text: `Sent to HITL app: ${text} (attachments: ${attachmentCount})`,
+          text: responseText,
         },
       ],
     };
@@ -707,41 +743,43 @@ function shutdown(reason: string): void {
   process.exit(0);
 }
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGHUP", () => shutdown("SIGHUP"));
-process.stdin.on("end", () => shutdown("stdin-EOF"));
-process.stdin.on("close", () => shutdown("stdin-close"));
+if (process.env.BUN_ENV !== "test" && process.env.NODE_ENV !== "test") {
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGHUP", () => shutdown("SIGHUP"));
+  process.stdin.on("end", () => shutdown("stdin-EOF"));
+  process.stdin.on("close", () => shutdown("stdin-close"));
 
-// Initialize instance identity and start services
-const identity = await getIdentity();
-// Propagate to env so http_bridge audit-on-message can stamp instance_id
-// without re-reading the identity file on every WS frame.
-process.env.HITL_INSTANCE_ID = identity.instanceId;
-process.stderr.write(
-  `[hitl-channel] HITL Channel server listening on http://0.0.0.0:${PORT}\n`
-);
-process.stderr.write(`[hitl-channel] Instance ID: ${identity.instanceId}\n`);
-process.stderr.write(`[hitl-channel] Display Name: ${identity.displayName}\n`);
+  // Initialize instance identity and start services
+  const identity = await getIdentity();
+  // Propagate to env so http_bridge audit-on-message can stamp instance_id
+  // without re-reading the identity file on every WS frame.
+  process.env.HITL_INSTANCE_ID = identity.instanceId;
+  process.stderr.write(
+    `[hitl-channel] HITL Channel server listening on http://0.0.0.0:${PORT}\n`
+  );
+  process.stderr.write(`[hitl-channel] Instance ID: ${identity.instanceId}\n`);
+  process.stderr.write(`[hitl-channel] Display Name: ${identity.displayName}\n`);
 
-// SPEC-HITL-CC-001 §4.2 — best-effort audit retention prune at startup.
-void pruneOldAuditFiles();
+  // SPEC-HITL-CC-001 §4.2 — best-effort audit retention prune at startup.
+  void pruneOldAuditFiles();
 
-// Start mDNS advertising
-startMDNS(PORT, identity.instanceId, identity.displayName);
+  // Start mDNS advertising
+  startMDNS(PORT, identity.instanceId, identity.displayName);
 
-// Start periodic cleanup of expired pairing codes (every minute)
-pairingCleanupInterval = setInterval(() => {
-  cleanupExpiredPairings();
-}, 60000);
+  // Start periodic cleanup of expired pairing codes (every minute)
+  pairingCleanupInterval = setInterval(() => {
+    cleanupExpiredPairings();
+  }, 60000);
 
-await mcp.connect(new StdioServerTransport());
+  await mcp.connect(new StdioServerTransport());
 
-httpServer = startHttpBridge(mcp);
+  httpServer = startHttpBridge(mcp);
 
-// Belt-and-braces: if stdin already reached end while we were awaiting the
-// transport / HTTP bridge, the `end` event has already fired and our late
-// listener will never see it. Check the readable state explicitly.
-if ((process.stdin as { readableEnded?: boolean }).readableEnded) {
-  shutdown("stdin-already-ended");
+  // Belt-and-braces: if stdin already reached end while we were awaiting the
+  // transport / HTTP bridge, the `end` event has already fired and our late
+  // listener will never see it. Check the readable state explicitly.
+  if ((process.stdin as { readableEnded?: boolean }).readableEnded) {
+    shutdown("stdin-already-ended");
+  }
 }
