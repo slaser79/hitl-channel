@@ -127,6 +127,45 @@ describe("push_file MCP Tool", () => {
     }
   });
 
+  it("should reject destination paths containing dot (.) or dot-dot (..)", async () => {
+    const callHandler = (mcp as any)._requestHandlers.get("tools/call");
+
+    const tempFile = "/tmp/hitl-dot-dest-test.txt";
+    writeFileSync(tempFile, "hello from push_file dot test", "utf8");
+
+    try {
+      // 1. dot-dot rejection
+      const resDotDot = await callHandler({
+        method: "tools/call",
+        params: {
+          name: "push_file",
+          arguments: {
+            local_path: tempFile,
+            dest: "documents/../foo.txt",
+          },
+        },
+      });
+      expect(resDotDot.isError).toBe(true);
+      expect(resDotDot.content[0].text).toContain("invalid destination path");
+
+      // 2. single-dot rejection
+      const resSingleDot = await callHandler({
+        method: "tools/call",
+        params: {
+          name: "push_file",
+          arguments: {
+            local_path: tempFile,
+            dest: "documents/./foo.txt",
+          },
+        },
+      });
+      expect(resSingleDot.isError).toBe(true);
+      expect(resSingleDot.content[0].text).toContain("invalid destination path");
+    } finally {
+      if (existsSync(tempFile)) unlinkSync(tempFile);
+    }
+  });
+
   it("should succeed with an os.tmpdir() based path and invoke write_file on client for general paths", async () => {
     const callHandler = (mcp as any)._requestHandlers.get("tools/call");
 
@@ -152,6 +191,7 @@ describe("push_file MCP Tool", () => {
             local_path: tempFile,
             dest: "documents/foo.txt",
             overwrite: true,
+            media_type: "text/javascript",
           },
         },
       });
@@ -166,6 +206,8 @@ describe("push_file MCP Tool", () => {
       expect(receivedFrame.arguments.path).toBe("documents/foo.txt");
       expect(receivedFrame.arguments.content).toBe("hello from push_file test");
       expect(receivedFrame.arguments.overwrite).toBe(true);
+      expect(receivedFrame.arguments.media_type).toBe("text/javascript");
+      expect(receivedFrame.arguments.contentType).toBe("text/javascript");
 
       // Resolve the waiter
       const activeId = receivedFrame.request_id;
@@ -213,6 +255,7 @@ describe("push_file MCP Tool", () => {
             local_path: tempFile,
             dest: "skills/my-awesome-skill/scripts/main.js",
             overwrite: false,
+            media_type: "application/javascript",
           },
         },
       });
@@ -225,8 +268,12 @@ describe("push_file MCP Tool", () => {
       // Arguments check
       expect(receivedFrame.arguments.skillName).toBe("my-awesome-skill");
       expect(receivedFrame.arguments.filePath).toBe("scripts/main.js");
+      expect(receivedFrame.arguments.file_path).toBe("scripts/main.js");
+      expect(receivedFrame.arguments.filepath).toBe("scripts/main.js");
       expect(receivedFrame.arguments.content).toBe("my skill script content");
       expect(receivedFrame.arguments.overwrite).toBe(false);
+      expect(receivedFrame.arguments.media_type).toBe("application/javascript");
+      expect(receivedFrame.arguments.contentType).toBe("application/javascript");
 
       // Resolve the waiter
       const activeId = receivedFrame.request_id;

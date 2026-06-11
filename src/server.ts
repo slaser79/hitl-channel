@@ -723,6 +723,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const localPath = args.local_path as string | undefined;
     const dest = args.dest as string | undefined;
     const overwrite = args.overwrite as boolean | undefined;
+    const mediaType = args.media_type as string | undefined;
 
     if (!localPath || typeof localPath !== "string") {
       return {
@@ -818,6 +819,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
 
+    // Destination validation
+    const normalizedDest = dest.replace(/\\/g, "/").replace(/^\/+/, "");
+    const destParts = normalizedDest.split("/");
+    if (destParts.includes("..") || destParts.includes(".") || normalizedDest === "") {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `push_file failed: invalid destination path (must be relative and cannot contain .. or .): ${dest}`,
+          },
+        ],
+      };
+    }
+
     if (clients.size === 0) {
       return {
         isError: true,
@@ -850,24 +866,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
 
-    // Destination validation
-    const normalizedDest = dest.replace(/\\/g, "/").replace(/^\/+/, "");
-    if (normalizedDest.split("/").includes("..") || normalizedDest === "") {
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text" as const,
-            text: `push_file failed: invalid destination path (must be relative and cannot contain ..): ${dest}`,
-          },
-        ],
-      };
-    }
-
     // Determine target phone tool and build arguments
     let phoneToolName = "write_file";
     let phoneToolArgs: Record<string, unknown> = {};
     const overwriteVal = overwrite !== false; // defaults to true
+
+    const mediaTypeArgs = mediaType
+      ? {
+          mediaType,
+          media_type: mediaType,
+          contentType: mediaType,
+          content_type: mediaType,
+        }
+      : {};
 
     const parts = normalizedDest.split("/");
     if (parts[0] === "skills" && parts.length >= 3) {
@@ -879,18 +890,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         skill_name: skillName,
         filePath,
         file_path: filePath,
+        filepath: filePath,
         path: filePath,
         content: fileContent,
         overwrite: overwriteVal,
+        ...mediaTypeArgs,
       };
     } else {
       phoneToolName = "write_file";
       phoneToolArgs = {
         path: normalizedDest,
-        filepath: normalizedDest,
         filePath: normalizedDest,
+        file_path: normalizedDest,
+        filepath: normalizedDest,
         content: fileContent,
         overwrite: overwriteVal,
+        ...mediaTypeArgs,
       };
     }
 
