@@ -866,19 +866,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
 
+    // Inference of media type if not provided
+    let finalMediaType = mediaType;
+    if (!finalMediaType) {
+      const ext = extname(absolute).slice(1).toLowerCase();
+      finalMediaType = MIME_BY_EXT[ext] ?? "text/plain";
+    }
+
+    const mediaTypeArgs = {
+      mediaType: finalMediaType,
+      media_type: finalMediaType,
+      contentType: finalMediaType,
+      content_type: finalMediaType,
+    };
+
     // Determine target phone tool and build arguments
     let phoneToolName = "write_file";
     let phoneToolArgs: Record<string, unknown> = {};
     const overwriteVal = overwrite !== false; // defaults to true
-
-    const mediaTypeArgs = mediaType
-      ? {
-          mediaType,
-          media_type: mediaType,
-          contentType: mediaType,
-          content_type: mediaType,
-        }
-      : {};
 
     const parts = normalizedDest.split("/");
     if (parts[0] === "skills" && parts.length >= 3) {
@@ -920,6 +925,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       cc_instance_id: identity.instanceId,
     };
     const startedAt = Date.now();
+    const inputHash = sha256Hex(stableStringify(phoneToolArgs));
 
     // Audit the outgoing call
     appendAudit({
@@ -929,7 +935,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       kind: "tool_call",
       tool_name: phoneToolName,
       approval: null,
-      prompt_hash: sha256Hex(stableStringify(phoneToolArgs)),
+      prompt_hash: inputHash,
       duration_ms: null,
       attachment_count: 0,
       attachment_bytes: 0,
@@ -963,7 +969,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         kind: "tool_result",
         tool_name: phoneToolName,
         approval: result.approval ?? null,
-        prompt_hash: sha256Hex(stableStringify(result.output ?? null)),
+        prompt_hash: inputHash, // Repeat original request's prompt_hash for correlation
         duration_ms: duration,
         attachment_count: attachmentCount,
         attachment_bytes: attachmentBytes,
@@ -1010,7 +1016,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         ],
       };
     } catch (err) {
+      const duration = Date.now() - startedAt;
       const msg = err instanceof Error ? err.message : String(err);
+
+      // Audit the failure path
+      appendAudit({
+        ts: new Date().toISOString(),
+        instance_id: identity.instanceId,
+        direction: "phone_returns_to_cc",
+        kind: "tool_result",
+        tool_name: phoneToolName,
+        approval: msg.includes("timeout") ? "timeout" : null,
+        prompt_hash: inputHash, // Repeat original request's prompt_hash for correlation
+        duration_ms: duration,
+        attachment_count: 0,
+        attachment_bytes: 0,
+      }).catch((auditErr) =>
+        process.stderr.write(
+          `[hitl-channel] audit failed: ${auditErr instanceof Error ? auditErr.message : auditErr}\n`,
+        )
+      );
+
       return {
         isError: true,
         content: [

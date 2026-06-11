@@ -294,4 +294,57 @@ describe("push_file MCP Tool", () => {
       if (existsSync(tempFile)) unlinkSync(tempFile);
     }
   });
+
+  it("should infer media_type from extension if omitted", async () => {
+    const callHandler = (mcp as any)._requestHandlers.get("tools/call");
+
+    const tempFile = "/tmp/hitl-infer-test.json";
+    writeFileSync(tempFile, '{"hello": "world"}', "utf8");
+
+    let receivedFrame: any = null;
+    const mockWs = {
+      readyState: 1,
+      send: (data: string) => {
+        receivedFrame = JSON.parse(data);
+        return true;
+      },
+    } as any;
+    clients.add(mockWs);
+
+    try {
+      const pushPromise = callHandler({
+        method: "tools/call",
+        params: {
+          name: "push_file",
+          arguments: {
+            local_path: tempFile,
+            dest: "documents/foo.json",
+          },
+        },
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(receivedFrame).not.toBeNull();
+      expect(receivedFrame.type).toBe("tool_call_request");
+      // Arguments check - should infer application/json
+      expect(receivedFrame.arguments.media_type).toBe("application/json");
+      expect(receivedFrame.arguments.contentType).toBe("application/json");
+
+      // Resolve the waiter
+      const activeId = receivedFrame.request_id;
+      correlator.resolve(activeId, {
+        type: "tool_call_result",
+        request_id: activeId,
+        success: true,
+        approval: "user_approved",
+        output: "Successfully wrote JSON file",
+      });
+
+      await pushPromise;
+    } finally {
+      clients.delete(mockWs);
+      if (existsSync(tempFile)) unlinkSync(tempFile);
+    }
+  });
 });
