@@ -43,7 +43,7 @@ const PORT = Number(process.env.HITL_CHANNEL_PORT ?? 8789);
 // triggering this module's top-level `await mcp.connect(...)`.
 import { MCP_INSTRUCTIONS } from "./mcp_instructions.js";
 
-const mcp = new Server(
+export const mcp = new Server(
   { name: "hitl-channel", version: "0.1.0" },
   {
     capabilities: {
@@ -197,6 +197,36 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ["name"],
+      },
+    },
+    {
+      name: "push_file",
+      description:
+        "Push a text file from the console filesystem to the phone's app storage. " +
+        "Gates the push on-device via a softConfirm approval sheet. Only text files are supported.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          local_path: {
+            type: "string",
+            description: "Absolute or relative path to the local file on the console.",
+          },
+          dest: {
+            type: "string",
+            description:
+              "Rooted relative path on the phone's storage (e.g. 'skills/my-skill/scripts/board.html', 'documents/notes.txt'). " +
+              "Must be relative/rooted (no arbitrary absolute paths).",
+          },
+          media_type: {
+            type: "string",
+            description: "Optional MIME type. If omitted, inferred from the file extension.",
+          },
+          overwrite: {
+            type: "boolean",
+            description: "Whether to overwrite the file on the phone if it already exists (default: true).",
+          },
+        },
+        required: ["local_path", "dest"],
       },
     },
     // ─── SPEC-HC-004 ─────────────────────────────────────────────────────
@@ -683,6 +713,295 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           {
             type: "text" as const,
             text: `call_phone_tool failed: ${msg}`,
+          },
+        ],
+      };
+    }
+  }
+
+  if (req.params.name === "push_file") {
+    const localPath = args.local_path as string | undefined;
+    const dest = args.dest as string | undefined;
+    const overwrite = args.overwrite as boolean | undefined;
+
+    if (!localPath || typeof localPath !== "string") {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: "push_file requires `local_path` (string).",
+          },
+        ],
+      };
+    }
+    if (!dest || typeof dest !== "string") {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: "push_file requires `dest` (string).",
+          },
+        ],
+      };
+    }
+
+    // Host-path validation
+    const absolute = resolvePath(localPath);
+    let realAbsolute = absolute;
+    try {
+      realAbsolute = await realpath(absolute);
+    } catch {
+      // ignore
+    }
+    const roots = attachmentRoots();
+    if (!isPathAllowed(absolute, roots) || !isPathAllowed(realAbsolute, roots)) {
+      process.stderr.write(
+        `[hitl-channel] push_file: rejecting path outside allowlisted roots: ${absolute}\n`,
+      );
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `push_file failed: path outside allowlist: ${localPath}`,
+          },
+        ],
+      };
+    }
+
+    // Verify it is a file and meets size constraints
+    try {
+      const st = await stat(absolute);
+      if (!st.isFile()) {
+        process.stderr.write(
+          `[hitl-channel] push_file: path is not a regular file: ${absolute}\n`,
+        );
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `push_file failed: path is not a regular file: ${localPath}`,
+            },
+          ],
+        };
+      }
+      if (st.size > kMaxFileReadBytes) {
+        process.stderr.write(
+          `[hitl-channel] push_file: file size exceeds limit: ${absolute}\n`,
+        );
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `push_file failed: file size exceeds limit: ${localPath}`,
+            },
+          ],
+        };
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `[hitl-channel] push_file: failed to read metadata for ${absolute}: ${errMsg}\n`,
+      );
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `push_file failed: failed to read: ${localPath}`,
+          },
+        ],
+      };
+    }
+
+    if (clients.size === 0) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: "No paired HITL phone is currently connected.",
+          },
+        ],
+      };
+    }
+
+    // Read the local file content as text
+    let fileContent: string;
+    try {
+      fileContent = await readFile(absolute, "utf8");
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `[hitl-channel] push_file: failed to read file ${absolute}: ${errMsg}\n`,
+      );
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `push_file failed: failed to read file contents: ${localPath}`,
+          },
+        ],
+      };
+    }
+
+    // Destination validation
+    const normalizedDest = dest.replace(/\\/g, "/").replace(/^\/+/, "");
+    if (normalizedDest.split("/").includes("..") || normalizedDest === "") {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `push_file failed: invalid destination path (must be relative and cannot contain ..): ${dest}`,
+          },
+        ],
+      };
+    }
+
+    // Determine target phone tool and build arguments
+    let phoneToolName = "write_file";
+    let phoneToolArgs: Record<string, unknown> = {};
+    const overwriteVal = overwrite !== false; // defaults to true
+
+    const parts = normalizedDest.split("/");
+    if (parts[0] === "skills" && parts.length >= 3) {
+      phoneToolName = "write_skill_file";
+      const skillName = parts[1];
+      const filePath = parts.slice(2).join("/");
+      phoneToolArgs = {
+        skillName,
+        skill_name: skillName,
+        filePath,
+        file_path: filePath,
+        path: filePath,
+        content: fileContent,
+        overwrite: overwriteVal,
+      };
+    } else {
+      phoneToolName = "write_file";
+      phoneToolArgs = {
+        path: normalizedDest,
+        filepath: normalizedDest,
+        filePath: normalizedDest,
+        content: fileContent,
+        overwrite: overwriteVal,
+      };
+    }
+
+    const timeoutSeconds = 60;
+    const requestId = generateRequestId();
+    const frame = {
+      type: "tool_call_request" as const,
+      request_id: requestId,
+      name: phoneToolName,
+      arguments: phoneToolArgs,
+      timeout_seconds: timeoutSeconds,
+      cc_instance_id: identity.instanceId,
+    };
+    const startedAt = Date.now();
+
+    // Audit the outgoing call
+    appendAudit({
+      ts: new Date(startedAt).toISOString(),
+      instance_id: identity.instanceId,
+      direction: "cc_calls_phone",
+      kind: "tool_call",
+      tool_name: phoneToolName,
+      approval: null,
+      prompt_hash: sha256Hex(stableStringify(phoneToolArgs)),
+      duration_ms: null,
+      attachment_count: 0,
+      attachment_bytes: 0,
+    }).catch((err) =>
+      process.stderr.write(
+        `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`,
+      )
+    );
+
+    const waiter = correlator.register<ToolCallResultFrame>(
+      requestId,
+      timeoutSeconds * 1000,
+    );
+    const delivered = broadcastFrame(frame);
+    if (delivered === 0) {
+      correlator.reject(requestId, new Error("no_phone_connected_post_check"));
+    }
+
+    try {
+      const result = await waiter;
+      const duration = Date.now() - startedAt;
+
+      // Audit the incoming result
+      const { count: attachmentCount, bytes: attachmentBytes } =
+        summariseAttachments((result as { attachments?: unknown }).attachments);
+
+      appendAudit({
+        ts: new Date().toISOString(),
+        instance_id: identity.instanceId,
+        direction: "phone_returns_to_cc",
+        kind: "tool_result",
+        tool_name: phoneToolName,
+        approval: result.approval ?? null,
+        prompt_hash: sha256Hex(stableStringify(result.output ?? null)),
+        duration_ms: duration,
+        attachment_count: attachmentCount,
+        attachment_bytes: attachmentBytes,
+      }).catch((err) =>
+        process.stderr.write(
+          `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`,
+        )
+      );
+
+      if (result.success === false) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  success: false,
+                  error: result.error ?? "unknown_error",
+                  approval: result.approval ?? null,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                success: true,
+                output: result.output ?? null,
+                approval: result.approval ?? null,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `push_file failed: ${msg}`,
           },
         ],
       };
