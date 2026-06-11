@@ -866,51 +866,31 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
 
-    // Inference of media type if not provided
-    let finalMediaType = mediaType;
-    if (!finalMediaType) {
-      const ext = extname(absolute).slice(1).toLowerCase();
-      finalMediaType = MIME_BY_EXT[ext] ?? "text/plain";
-    }
-
-    const mediaTypeArgs = {
-      mediaType: finalMediaType,
-      media_type: finalMediaType,
-      contentType: finalMediaType,
-      content_type: finalMediaType,
-    };
-
-    // Determine target phone tool and build arguments
+    // Determine target phone tool and build arguments.
+    // NOTE: argument keys must match the on-device InternalToolsService
+    // schemas EXACTLY (verified via list_phone_tools). write_skill_file is
+    // additionalProperties:false, so extra keys are rejected — do not add
+    // alias keys or media-type hints here.
     let phoneToolName = "write_file";
     let phoneToolArgs: Record<string, unknown> = {};
-    const overwriteVal = overwrite !== false; // defaults to true
 
     const parts = normalizedDest.split("/");
     if (parts[0] === "skills" && parts.length >= 3) {
+      // write_skill_file requires exactly: name, file_path, content
       phoneToolName = "write_skill_file";
       const skillName = parts[1];
       const filePath = parts.slice(2).join("/");
       phoneToolArgs = {
-        skillName,
-        skill_name: skillName,
-        filePath,
+        name: skillName,
         file_path: filePath,
-        filepath: filePath,
-        path: filePath,
         content: fileContent,
-        overwrite: overwriteVal,
-        ...mediaTypeArgs,
       };
     } else {
+      // write_file requires: filename, content
       phoneToolName = "write_file";
       phoneToolArgs = {
-        path: normalizedDest,
-        filePath: normalizedDest,
-        file_path: normalizedDest,
-        filepath: normalizedDest,
+        filename: normalizedDest,
         content: fileContent,
-        overwrite: overwriteVal,
-        ...mediaTypeArgs,
       };
     }
 

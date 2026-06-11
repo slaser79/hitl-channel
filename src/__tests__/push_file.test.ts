@@ -202,12 +202,14 @@ describe("push_file MCP Tool", () => {
       expect(receivedFrame).not.toBeNull();
       expect(receivedFrame.type).toBe("tool_call_request");
       expect(receivedFrame.name).toBe("write_file");
-      // Arguments check
-      expect(receivedFrame.arguments.path).toBe("documents/foo.txt");
+      // Arguments must match the on-device write_file schema EXACTLY:
+      // { filename, content } — required keys, no aliases, no extras.
+      expect(receivedFrame.arguments.filename).toBe("documents/foo.txt");
       expect(receivedFrame.arguments.content).toBe("hello from push_file test");
-      expect(receivedFrame.arguments.overwrite).toBe(true);
-      expect(receivedFrame.arguments.media_type).toBe("text/javascript");
-      expect(receivedFrame.arguments.contentType).toBe("text/javascript");
+      expect(Object.keys(receivedFrame.arguments).sort()).toEqual([
+        "content",
+        "filename",
+      ]);
 
       // Resolve the waiter
       const activeId = receivedFrame.request_id;
@@ -265,15 +267,16 @@ describe("push_file MCP Tool", () => {
       expect(receivedFrame).not.toBeNull();
       expect(receivedFrame.type).toBe("tool_call_request");
       expect(receivedFrame.name).toBe("write_skill_file");
-      // Arguments check
-      expect(receivedFrame.arguments.skillName).toBe("my-awesome-skill");
-      expect(receivedFrame.arguments.filePath).toBe("scripts/main.js");
+      // write_skill_file is additionalProperties:false on-device — args must be
+      // EXACTLY { name, file_path, content }. Any extra key is rejected.
+      expect(receivedFrame.arguments.name).toBe("my-awesome-skill");
       expect(receivedFrame.arguments.file_path).toBe("scripts/main.js");
-      expect(receivedFrame.arguments.filepath).toBe("scripts/main.js");
       expect(receivedFrame.arguments.content).toBe("my skill script content");
-      expect(receivedFrame.arguments.overwrite).toBe(false);
-      expect(receivedFrame.arguments.media_type).toBe("application/javascript");
-      expect(receivedFrame.arguments.contentType).toBe("application/javascript");
+      expect(Object.keys(receivedFrame.arguments).sort()).toEqual([
+        "content",
+        "file_path",
+        "name",
+      ]);
 
       // Resolve the waiter
       const activeId = receivedFrame.request_id;
@@ -295,7 +298,7 @@ describe("push_file MCP Tool", () => {
     }
   });
 
-  it("should infer media_type from extension if omitted", async () => {
+  it("must not leak media_type/overwrite or alias keys into the phone args", async () => {
     const callHandler = (mcp as any)._requestHandlers.get("tools/call");
 
     const tempFile = "/tmp/hitl-infer-test.json";
@@ -319,6 +322,10 @@ describe("push_file MCP Tool", () => {
           arguments: {
             local_path: tempFile,
             dest: "documents/foo.json",
+            // These are accepted at the MCP boundary but the on-device
+            // write_file schema has no such keys — they must NOT be forwarded.
+            media_type: "application/json",
+            overwrite: false,
           },
         },
       });
@@ -327,9 +334,12 @@ describe("push_file MCP Tool", () => {
 
       expect(receivedFrame).not.toBeNull();
       expect(receivedFrame.type).toBe("tool_call_request");
-      // Arguments check - should infer application/json
-      expect(receivedFrame.arguments.media_type).toBe("application/json");
-      expect(receivedFrame.arguments.contentType).toBe("application/json");
+      expect(receivedFrame.name).toBe("write_file");
+      // No media_type / overwrite / path aliases may reach the phone.
+      expect(Object.keys(receivedFrame.arguments).sort()).toEqual([
+        "content",
+        "filename",
+      ]);
 
       // Resolve the waiter
       const activeId = receivedFrame.request_id;
