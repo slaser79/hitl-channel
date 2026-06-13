@@ -97,7 +97,7 @@ describe("push_file MCP Tool", () => {
     });
 
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("path outside allowlist");
+    expect(result.content[0].text).toContain("failed to resolve path");
   });
 
   it("should reject symlink-escaping paths", async () => {

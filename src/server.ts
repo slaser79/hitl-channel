@@ -325,46 +325,53 @@ export async function resolveAttachments(raw: unknown): Promise<{
       typeof a.fileName === "string" ? a.fileName : undefined;
     if (typeof a.path === "string" && a.path.length > 0) {
       const absolute = resolvePath(a.path);
-      let realAbsolute = absolute;
+      let realAbsolute: string;
       try {
         realAbsolute = await realpath(absolute);
-      } catch {
-        // ignore
-      }
-      if (!isPathAllowed(absolute, roots) && !isPathAllowed(realAbsolute, roots)) {
+      } catch (err) {
         process.stderr.write(
-          `[hitl-channel] reply_to_hitl: rejecting path outside allowlisted roots: ${absolute}\n`,
+          `[hitl-channel] reply_to_hitl: failed to resolve realpath for ${absolute}: ${
+            err instanceof Error ? err.message : String(err)
+          }\n`,
+        );
+        warnings.push(`failed to resolve path: ${a.path}`);
+        continue;
+      }
+
+      if (!isPathAllowed(realAbsolute, roots)) {
+        process.stderr.write(
+          `[hitl-channel] reply_to_hitl: rejecting path outside allowlisted roots: ${realAbsolute}\n`,
         );
         warnings.push(`path outside allowlist: ${a.path}`);
         continue;
       }
       try {
-        const st = await stat(absolute);
+        const st = await stat(realAbsolute);
         if (!st.isFile()) {
           process.stderr.write(
-            `[hitl-channel] reply_to_hitl: path is not a regular file: ${absolute}\n`,
+            `[hitl-channel] reply_to_hitl: path is not a regular file: ${realAbsolute}\n`,
           );
           warnings.push(`path is not a regular file: ${a.path}`);
           continue;
         }
         if (st.size > kMaxFileReadBytes) {
           process.stderr.write(
-            `[hitl-channel] reply_to_hitl: attachment_too_large size=${st.size} max=${kMaxFileReadBytes} path=${absolute}\n`,
+            `[hitl-channel] reply_to_hitl: attachment_too_large size=${st.size} max=${kMaxFileReadBytes} path=${realAbsolute}\n`,
           );
           warnings.push(`file size exceeds limit: ${a.path}`);
           continue;
         }
-        const buf = await readFile(absolute);
+        const buf = await readFile(realAbsolute);
         data = buf.toString("base64");
-        if (!fileName) fileName = basename(absolute);
+        if (!fileName) fileName = basename(realAbsolute);
         if (!mediaType) {
-          const ext = extname(absolute).slice(1).toLowerCase();
+          const ext = extname(realAbsolute).slice(1).toLowerCase();
           mediaType = MIME_BY_EXT[ext] ?? "application/octet-stream";
         }
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         process.stderr.write(
-          `[hitl-channel] reply_to_hitl: failed to read ${absolute}: ${errMsg}\n`,
+          `[hitl-channel] reply_to_hitl: failed to read ${realAbsolute}: ${errMsg}\n`,
         );
         warnings.push(`failed to read: ${a.path}`);
         continue;
@@ -750,16 +757,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     // Host-path validation
     const absolute = resolvePath(localPath);
-    let realAbsolute = absolute;
+    let realAbsolute: string;
     try {
       realAbsolute = await realpath(absolute);
-    } catch {
-      // ignore
+    } catch (err) {
+      process.stderr.write(
+        `[hitl-channel] push_file: failed to resolve realpath for ${absolute}: ${
+          err instanceof Error ? err.message : String(err)
+        }\n`,
+      );
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `push_file failed: failed to resolve path: ${localPath}`,
+          },
+        ],
+      };
     }
     const roots = attachmentRoots();
-    if (!isPathAllowed(absolute, roots) || !isPathAllowed(realAbsolute, roots)) {
+    if (!isPathAllowed(realAbsolute, roots)) {
       process.stderr.write(
-        `[hitl-channel] push_file: rejecting path outside allowlisted roots: ${absolute}\n`,
+        `[hitl-channel] push_file: rejecting path outside allowlisted roots: ${realAbsolute}\n`,
       );
       return {
         isError: true,
@@ -774,10 +794,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     // Verify it is a file and meets size constraints
     try {
-      const st = await stat(absolute);
+      const st = await stat(realAbsolute);
       if (!st.isFile()) {
         process.stderr.write(
-          `[hitl-channel] push_file: path is not a regular file: ${absolute}\n`,
+          `[hitl-channel] push_file: path is not a regular file: ${realAbsolute}\n`,
         );
         return {
           isError: true,
@@ -791,7 +811,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       if (st.size > kMaxFileReadBytes) {
         process.stderr.write(
-          `[hitl-channel] push_file: file size exceeds limit: ${absolute}\n`,
+          `[hitl-channel] push_file: file size exceeds limit: ${realAbsolute}\n`,
         );
         return {
           isError: true,
@@ -806,7 +826,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       process.stderr.write(
-        `[hitl-channel] push_file: failed to read metadata for ${absolute}: ${errMsg}\n`,
+        `[hitl-channel] push_file: failed to read metadata for ${realAbsolute}: ${errMsg}\n`,
       );
       return {
         isError: true,
@@ -849,11 +869,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     // Read the local file content as text
     let fileContent: string;
     try {
-      fileContent = await readFile(absolute, "utf8");
+      fileContent = await readFile(realAbsolute, "utf8");
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       process.stderr.write(
-        `[hitl-channel] push_file: failed to read file ${absolute}: ${errMsg}\n`,
+        `[hitl-channel] push_file: failed to read file ${realAbsolute}: ${errMsg}\n`,
       );
       return {
         isError: true,
