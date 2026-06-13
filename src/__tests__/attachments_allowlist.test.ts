@@ -68,6 +68,32 @@ describe("Attachments Allowlist and Warnings", () => {
     }
   });
 
+  it("AV2.1: symlink inside allowlisted root pointing outside must be rejected (Security)", async () => {
+    const testWorkdir = join(tmpdir(), "hitl-security-test-" + Date.now());
+    if (existsSync(testWorkdir)) rmSync(testWorkdir, { recursive: true, force: true });
+    mkdirSync(testWorkdir);
+
+    const allowlistedDir = join(testWorkdir, "allowlisted");
+    mkdirSync(allowlistedDir);
+
+    const sensitiveFile = join(testWorkdir, "sensitive.txt");
+    writeFileSync(sensitiveFile, "SECRET_TOKEN=12345", "utf8");
+
+    const evilSymlink = join(allowlistedDir, "evil.txt");
+    symlinkSync(sensitiveFile, evilSymlink);
+
+    process.env.HITL_CHANNEL_ATTACHMENT_ROOTS = allowlistedDir;
+
+    try {
+      const { attachments, warnings } = await resolveAttachments([{ path: evilSymlink }]);
+      expect(attachments.length).toBe(0);
+      expect(warnings.length).toBe(1);
+      expect(warnings[0]).toContain("path outside allowlist");
+    } finally {
+      if (existsSync(testWorkdir)) rmSync(testWorkdir, { recursive: true, force: true });
+    }
+  });
+
   it("AV3: rejected path (outside allowlist / missing / oversized) produces warnings", async () => {
     // 1. Outside allowlist
     process.env.HITL_CHANNEL_ATTACHMENT_ROOTS = "/tmp/some-strict-dir";
@@ -90,7 +116,7 @@ describe("Attachments Allowlist and Warnings", () => {
     const res2 = await resolveAttachments([{ path: missingPath }]);
     expect(res2.attachments.length).toBe(0);
     expect(res2.warnings.length).toBe(1);
-    expect(res2.warnings[0]).toContain("failed to read");
+    expect(res2.warnings[0]).toContain("failed to resolve path");
 
     // 3. Oversized file (write 5MB + 1 byte file)
     const oversizedPath = "/tmp/hitl-oversized.txt";
