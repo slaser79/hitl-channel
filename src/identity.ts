@@ -7,8 +7,9 @@
  */
 
 import { $ } from "bun";
+import { homedir } from "node:os";
 
-const IDENTITY_DIR = "~/.hitl/channels";
+const IDENTITY_DIR = `${homedir()}/.hitl/channels`;
 const IDENTITY_FILE = `${IDENTITY_DIR}/identity.json`;
 
 export interface InstanceIdentity {
