@@ -7,8 +7,9 @@
  */
 
 import { $ } from "bun";
+import { homedir } from "node:os";
 
-const ALLOWLIST_DIR = "~/.hitl/channels";
+const ALLOWLIST_DIR = `${homedir()}/.hitl/channels`;
 const ALLOWLIST_FILE = `${ALLOWLIST_DIR}/allowlist.json`;
 
 export interface AllowlistEntry {

@@ -387,4 +387,38 @@ describe("ReplyBuffer — SPEC-HITL-CC-001 AC#26", () => {
       clients.delete(dropping);
     }
   });
+
+  // ─── Issue #30 regression: broadcastReply queues when no clients ───────
+  it("Issue #30: broadcastReply pushes to buffer when no clients are connected", async () => {
+    const { broadcastReply, clients, replyBuffer } = await import("../http_bridge.js");
+    replyBuffer.drain();
+    expect(clients.size).toBe(0);
+    
+    broadcastReply("no clients", "m-no", "agent-no");
+    const buffered = replyBuffer.drain();
+    expect(buffered.length).toBe(1);
+    expect(buffered[0]!.payload.text).toBe("no clients");
+    expect(buffered[0]!.payload.message_id).toBe("m-no");
+  });
+
+  // ─── Issue #30 regression: broadcastReply queues when clients not OPEN ─
+  it("Issue #30: broadcastReply pushes to buffer when clients are in CONNECTING state", async () => {
+    const { broadcastReply, clients, replyBuffer } = await import("../http_bridge.js");
+    replyBuffer.drain();
+    
+    const connecting: HitlWebSocket = {
+      readyState: 0, // CONNECTING
+      send: (_data: string) => 10,
+    };
+    clients.add(connecting);
+    try {
+      broadcastReply("connecting client", "m-conn", "agent-conn");
+      const buffered = replyBuffer.drain();
+      expect(buffered.length).toBe(1);
+      expect(buffered[0]!.payload.text).toBe("connecting client");
+    } finally {
+      clients.delete(connecting);
+    }
+  });
 });
+

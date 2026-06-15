@@ -486,6 +486,7 @@ export function startHttpBridge(mcp: Server) {
       return new Response("Not Found", { status: 404 });
     },
     websocket: {
+      idleTimeout: 15,
       open(ws) {
         const typedWs = ws as unknown as HitlWebSocket;
         clients.add(typedWs);
