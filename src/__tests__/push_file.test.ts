@@ -196,8 +196,10 @@ describe("push_file MCP Tool", () => {
         },
       });
 
-      // Wait a tiny bit for the request to register
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      // Wait for the request to register
+      for (let i = 0; i < 100 && !receivedFrame; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
 
       expect(receivedFrame).not.toBeNull();
       expect(receivedFrame.type).toBe("tool_call_request");
@@ -262,7 +264,10 @@ describe("push_file MCP Tool", () => {
         },
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      // Wait for the request to register
+      for (let i = 0; i < 100 && !receivedFrame; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
 
       expect(receivedFrame).not.toBeNull();
       expect(receivedFrame.type).toBe("tool_call_request");
@@ -330,7 +335,10 @@ describe("push_file MCP Tool", () => {
         },
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      // Wait for the request to register
+      for (let i = 0; i < 100 && !receivedFrame; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
 
       expect(receivedFrame).not.toBeNull();
       expect(receivedFrame.type).toBe("tool_call_request");

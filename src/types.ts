@@ -57,6 +57,7 @@ export interface ToolCallResultFrame {
   request_id: string;
   success: boolean;
   output?: unknown;
+  data?: unknown;
   error?: string | null;
   approval?: "auto" | "user_approved" | "user_denied" | "timeout";
 }
