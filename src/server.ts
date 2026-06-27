@@ -662,6 +662,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               text: JSON.stringify(
                 {
                   success: false,
+                  data: result.data ?? null,
                   error: result.error ?? "unknown_error",
                   approval: result.approval ?? null,
                 },
@@ -682,6 +683,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             {
               success: true,
               output: result.output ?? null,
+              data: result.data ?? null,
               approval: result.approval ?? null,
               attachment_count: attachmentCount,
               attachment_bytes: attachmentBytes,
