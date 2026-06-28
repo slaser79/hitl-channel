@@ -110,17 +110,15 @@ export function broadcastReply(
     ts: new Date().toISOString(),
     ...(attachments && attachments.length > 0 ? { attachments } : {}),
   };
+  
+  // Always push to buffer first to guarantee redundancy
+  replyBuffer.push(payload);
+
   const rawPayload = JSON.stringify(payload);
-  let sent = 0;
   for (const ws of clients) {
-    if (ws.readyState === 1 && wsSendAccepted(ws, rawPayload)) {
-      sent++;
+    if (ws.readyState === 1) {
+      wsSendAccepted(ws, rawPayload);
     }
-  }
-  // SPEC-HITL-CC-001 Phase 4 AC#26 — instead of silently dropping when no
-  // OPEN WS client received the frame, queue for replay on next WS reconnect.
-  if (sent === 0) {
-    replyBuffer.push(payload);
   }
 }
 
@@ -158,7 +156,6 @@ export function drainBufferToClientSync(
     // entry.raw is the JSON.stringify(payload) cached at push time —
     // re-using it avoids re-serializing on every reconnect.
     if (!wsSendAccepted(ws, entry.raw)) break;
-    buffer.commit(entry);
     sent++;
   }
   return { sent, oldestQueuedAt: sent > 0 ? oldestQueuedAt : null };
@@ -520,6 +517,18 @@ export function startHttpBridge(mcp: Server) {
           // request_id is logged at warn level and dropped (no waiter, no
           // audit double-count) per the idempotency contract.
           const frameType = typeof data.type === "string" ? data.type : undefined;
+          if (frameType === "ack") {
+            const id = typeof data.id === "string" ? data.id : undefined;
+            if (!id) {
+              process.stderr.write(`[hitl-channel] WARN ack missing id — dropped\n`);
+              return;
+            }
+            const removed = replyBuffer.commitById(id);
+            if (!removed) {
+              process.stderr.write(`[hitl-channel] WARN ack for unknown id ${id}\n`);
+            }
+            return;
+          }
           if (
             frameType === "tool_call_result" ||
             frameType === "list_tools_result" ||

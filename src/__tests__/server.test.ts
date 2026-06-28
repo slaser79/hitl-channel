@@ -135,7 +135,7 @@ describe("hitl-channel HTTP Bridge", () => {
     expect(response.status).toBe(400);
   });
 
-  it("WebSocket should connect and receive replies", async () => {
+  it("WebSocket should connect, receive replies, and commit them on ACK", async () => {
     return new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${TEST_PORT}/ws?api_key=${TEST_API_KEY}`);
       
@@ -152,8 +152,26 @@ describe("hitl-channel HTTP Bridge", () => {
           expect(data.text).toBe("test reply");
           expect(data.message_id).toBe("msg1");
           expect(data.agent_id).toBe("agent1");
-          ws.close();
-          resolve();
+          
+          import("../http_bridge.js").then(({ replyBuffer }) => {
+            // Verify it was pushed to the buffer
+            expect(replyBuffer.size()).toBe(1);
+            
+            // Send application-level ACK
+            ws.send(JSON.stringify({ type: "ack", id: data.id }));
+            
+            // Wait for server to process ACK and remove from buffer
+            setTimeout(() => {
+              try {
+                expect(replyBuffer.size()).toBe(0);
+                ws.close();
+                resolve();
+              } catch (err) {
+                ws.close();
+                reject(err);
+              }
+            }, 50);
+          }).catch(reject);
         } catch (err) {
           ws.close();
           reject(err);
