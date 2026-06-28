@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
+import { homedir } from "node:os";
 import {
   hashToken,
   addToAllowlist,
@@ -16,7 +17,7 @@ describe("allowlist.ts", () => {
     // Clear allowlist before each test
     const allowlist = await loadAllowlist();
     allowlist.entries = {};
-    const file = Bun.file("~/.hitl/channels/allowlist.json");
+    const file = Bun.file(`${homedir()}/.hitl/channels/allowlist.json`);
     await Bun.write(file, JSON.stringify(allowlist, null, 2));
   });
 

@@ -158,7 +158,11 @@ describe("ReplyBuffer — SPEC-HITL-CC-001 AC#26", () => {
   // The buffer used to call `drain()` (destructive clear) BEFORE confirming
   // ws.send succeeded. If the WS dropped mid-loop, remaining entries were
   // permanently lost. peek + commit now leaves un-sent entries in the buffer.
-  it("P0 regression: partial-send (ws dies mid-loop) leaves remaining entries in buffer", () => {
+  // ─── P0 regression: peek + per-entry commit ───────────────────────────
+  // Under the new ACK-based protocol, entries are NOT committed/deleted during
+  // drainBufferToClientSync. They stay in the buffer until an explicit ACK
+  // control frame is received.
+  it("P0 regression: partial-send (ws dies mid-loop) leaves remaining entries in buffer until ACKed", () => {
     const buf = new ReplyBuffer();
     buf.push(makeReply("a", "m1", "agentA", "1"));
     buf.push(makeReply("b", "m2", "agentA", "2"));
@@ -180,7 +184,12 @@ describe("ReplyBuffer — SPEC-HITL-CC-001 AC#26", () => {
     const { sent: sentCount } = drainBufferToClientSync(ws, buf);
     expect(sentCount).toBe(1);          // only the first entry was sent
     expect(sent.length).toBe(1);
-    expect(buf.size()).toBe(2);         // m2 + m3 still in buffer for next reconnect
+    expect(buf.size()).toBe(3);         // Still 3 because no ACKs have been received!
+
+    // Client ACKs the first message (id: 'r-1')
+    const firstPayload = JSON.parse(sent[0]) as ReplyPayload;
+    expect(buf.commitById(firstPayload.id)).toBe(true);
+    expect(buf.size()).toBe(2);         // Now 2
 
     // Second reconnect: a healthy WS drains the rest.
     const { ws: ws2, sent: sent2 } = makeFakeWs();
@@ -189,6 +198,13 @@ describe("ReplyBuffer — SPEC-HITL-CC-001 AC#26", () => {
     expect(sent2.length).toBe(2);
     const ids = sent2.map((s) => JSON.parse(s).message_id);
     expect(ids).toEqual(["m2", "m3"]);
+    expect(buf.size()).toBe(2);         // Still 2 because they are not ACKed yet!
+
+    // Client ACKs the remaining two messages
+    for (const s of sent2) {
+      const payload = JSON.parse(s) as ReplyPayload;
+      expect(buf.commitById(payload.id)).toBe(true);
+    }
     expect(buf.size()).toBe(0);
   });
 
@@ -220,15 +236,12 @@ describe("ReplyBuffer — SPEC-HITL-CC-001 AC#26", () => {
     expect(n).toBe(2);                       // 2 actually sent
     expect(auditCalls.length).toBe(1);
     expect(auditCalls[0]!.replies_drained).toBe(2); // not 3 (the peek snapshot length)
-    expect(buf.size()).toBe(1);              // m3 still buffered
+    expect(buf.size()).toBe(3);              // m3 and others still buffered
   });
 
   // ─── P1#2 regression: concurrent drains are safe ──────────────────────
-  // Removing the `clients.size === 1` guard relies on peek+commit being
-  // idempotent: a second drainer sees an empty buffer (the first drainer
-  // already committed every entry) and returns zero. No double-send, no
-  // audit double-emit.
-  it("P1#2 regression: a second sync drain on the same buffer returns zero and emits no double-send", () => {
+  // Since drain no longer commits, a reconnect redelivers until ACKed.
+  it("P1#2 regression: a second sync drain on the same buffer redelivers until ACKed", () => {
     const buf = new ReplyBuffer();
     buf.push(makeReply("a", "m1", "agentA", "1"));
     buf.push(makeReply("b", "m2", "agentA", "2"));
@@ -238,11 +251,23 @@ describe("ReplyBuffer — SPEC-HITL-CC-001 AC#26", () => {
     expect(r1.sent).toBe(2);
     expect(sent1.length).toBe(2);
 
+    // If we drain again without ACKing, it should redeliver
     const { ws: ws2, sent: sent2 } = makeFakeWs();
     const r2 = drainBufferToClientSync(ws2, buf);
-    expect(r2.sent).toBe(0);
-    expect(r2.oldestQueuedAt).toBeNull();
-    expect(sent2.length).toBe(0);
+    expect(r2.sent).toBe(2);
+    expect(sent2.length).toBe(2);
+
+    // Now ACK the messages
+    for (const s of sent1) {
+      const payload = JSON.parse(s) as ReplyPayload;
+      expect(buf.commitById(payload.id)).toBe(true);
+    }
+
+    // A third drain should return zero because they are now committed/ACKed
+    const { ws: ws3, sent: sent3 } = makeFakeWs();
+    const r3 = drainBufferToClientSync(ws3, buf);
+    expect(r3.sent).toBe(0);
+    expect(sent3.length).toBe(0);
   });
 
   // ─── P1 regression: ws.send return value gates commit ─────────────────
@@ -269,12 +294,25 @@ describe("ReplyBuffer — SPEC-HITL-CC-001 AC#26", () => {
     const r1 = drainBufferToClientSync(ws, buf);
     expect(r1.sent).toBe(1);
     expect(accepted.length).toBe(1);
+    expect(buf.size()).toBe(3); // Still 3
+
+    // ACK the first one
+    const firstPayload = JSON.parse(accepted[0]) as ReplyPayload;
+    expect(buf.commitById(firstPayload.id)).toBe(true);
     expect(buf.size()).toBe(2);
 
+    // Second reconnect drains the remaining 2
     const { ws: ws2, sent: sent2 } = makeFakeWs();
     const r2 = drainBufferToClientSync(ws2, buf);
     expect(r2.sent).toBe(2);
     expect(sent2.map((s) => JSON.parse(s).message_id)).toEqual(["m2", "m3"]);
+    expect(buf.size()).toBe(2); // Still 2 until ACKed
+
+    // ACK the rest
+    for (const s of sent2) {
+      const payload = JSON.parse(s) as ReplyPayload;
+      expect(buf.commitById(payload.id)).toBe(true);
+    }
     expect(buf.size()).toBe(0);
   });
 

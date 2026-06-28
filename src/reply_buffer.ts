@@ -110,6 +110,24 @@ export class ReplyBuffer {
   }
 
   /**
+   * Remove a reply from the buffer by its unique ID.
+   * Returns true if found and removed; false if already absent.
+   */
+  commitById(id: string): boolean {
+    for (const [key, bucket] of this.buckets.entries()) {
+      const idx = bucket.findIndex((e) => e.payload.id === id);
+      if (idx !== -1) {
+        bucket.splice(idx, 1);
+        if (bucket.length === 0) {
+          this.buckets.delete(key);
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Convenience: peek + commit-all in one call. Returns live entries in
    * arrival order and removes them from the buffer. Expired entries are
    * dropped silently.
