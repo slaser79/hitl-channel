@@ -1,3 +1,4 @@
+import { basename, join, resolve } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { sendChannelNotification } from "./notification.js";
 import { HitlAttachment, HitlMessage, HitlWebSocket, ReplyPayload } from "./types.js";
@@ -187,35 +188,113 @@ export async function drainBufferToClient(
 }
 
 /**
- * Save image attachments to the inbox directory and return updated content
- * with file paths appended.
+ * Sanitize a phone-supplied attachment filename so it cannot escape the
+ * inbox directory via path traversal (inbound sibling of #25 outbound
+ * allowlist hardening). Basename-only; strip leading dots / null bytes.
+ * Falls back to `fallback` when the result is empty after sanitization.
  */
-async function processAttachments(
+export function sanitizeAttachmentFileName(
+  fileName: string | undefined,
+  fallback: string,
+): string {
+  if (!fileName || typeof fileName !== "string") return fallback;
+  // Normalize Windows separators then take basename (handles absolute + ../).
+  const base = basename(fileName.replace(/\\/g, "/"));
+  const cleaned = base.replace(/^\.+/, "").replace(/\0/g, "");
+  if (!cleaned) return fallback;
+  return cleaned;
+}
+
+function extensionFromMediaType(
+  mediaType: string | undefined,
+  isImage: boolean,
+): string {
+  const raw = mediaType?.includes("/")
+    ? (mediaType.split("/")[1]?.split(";")[0] ?? "")
+    : "";
+  const ext = raw.replace(/[^a-zA-Z0-9]/g, "");
+  if (ext) return ext;
+  return isImage ? "jpg" : "bin";
+}
+
+/**
+ * Save attachments (images + files) to the inbox directory and return
+ * updated content with file paths appended as `[Image: …]` / `[File: …]`.
+ *
+ * Every attachment with non-empty `data` is persisted — not just `type=image`.
+ * Phone codec (SPEC-HITL-CC-001 Phase 6 AC#31) stamps `type: "file"` for
+ * non-image mimes; silent fall-through was the #36 bug.
+ */
+export async function processAttachments(
   message: string,
-  attachments?: HitlAttachment[]
+  attachments?: HitlAttachment[],
 ): Promise<string> {
   if (!attachments || attachments.length === 0) return message;
 
-  const inboxDir = `${process.env.HOME}/.claude/channels/hitl-channel/inbox`;
+  const inboxDir = join(
+    process.env.HOME ?? "",
+    ".claude",
+    "channels",
+    "hitl-channel",
+    "inbox",
+  );
   await Bun.$`mkdir -p ${inboxDir}`.quiet();
+  const resolvedInbox = resolve(inboxDir);
 
   let contentForNotification = message;
 
   for (const attachment of attachments) {
-    if (attachment.type === "image" && attachment.data) {
-      const ext = attachment.media_type?.split("/")[1] || "jpg";
-      const fileName =
-        attachment.fileName || `img_${Date.now()}.${ext}`;
-      const filePath = `${inboxDir}/${fileName}`;
-
-      const buffer = Buffer.from(attachment.data, "base64");
-      await Bun.write(filePath, buffer);
-
-      contentForNotification += `\n\n[Image: ${filePath}]`;
+    if (!attachment || typeof attachment !== "object") {
       process.stderr.write(
-        `[hitl-channel] Saved image: ${filePath} (${buffer.length} bytes)\n`
+        `[hitl-channel] Skipping attachment (invalid entry)\n`,
       );
+      continue;
     }
+
+    if (!attachment.data || typeof attachment.data !== "string") {
+      process.stderr.write(
+        `[hitl-channel] Skipping attachment (missing data): type=${attachment.type ?? "unknown"} fileName=${attachment.fileName ?? "(none)"}\n`,
+      );
+      continue;
+    }
+
+    const isImage = attachment.type === "image";
+    const ext = extensionFromMediaType(attachment.media_type, isImage);
+    const fallback = isImage
+      ? `img_${Date.now()}.${ext}`
+      : `file_${Date.now()}.${ext}`;
+    const fileName = sanitizeAttachmentFileName(attachment.fileName, fallback);
+    const filePath = join(inboxDir, fileName);
+    const resolvedPath = resolve(filePath);
+
+    // Defense in depth: refuse any path that escapes the inbox after join.
+    if (
+      resolvedPath !== resolvedInbox &&
+      !resolvedPath.startsWith(resolvedInbox + "/")
+    ) {
+      process.stderr.write(
+        `[hitl-channel] Skipping attachment (path escapes inbox): fileName=${fileName}\n`,
+      );
+      continue;
+    }
+
+    let buffer: Buffer;
+    try {
+      buffer = Buffer.from(attachment.data, "base64");
+    } catch (err) {
+      process.stderr.write(
+        `[hitl-channel] Skipping attachment (base64 decode failed): fileName=${fileName} ${err instanceof Error ? err.message : err}\n`,
+      );
+      continue;
+    }
+
+    await Bun.write(filePath, buffer);
+
+    const marker = isImage ? "Image" : "File";
+    contentForNotification += `\n\n[${marker}: ${filePath}]`;
+    process.stderr.write(
+      `[hitl-channel] Saved ${isImage ? "image" : "file"}: ${filePath} (${buffer.length} bytes)\n`,
+    );
   }
 
   return contentForNotification;
@@ -641,6 +720,10 @@ export function startHttpBridge(mcp: Server) {
 
           const message = data.message?.trim() || data.content?.trim();
           if (message || (data.attachments && data.attachments.length > 0)) {
+            // Parity with POST /: real attachment_count/bytes via summariseAttachments
+            // (was hardcoded 0/0 — audit overstated delivery of dropped files, #36 AV5).
+            const { count: chatAttachmentCount, bytes: chatAttachmentBytes } =
+              summariseAttachments(data.attachments);
             processAttachments(message ?? "", data.attachments)
               .then((content) =>
                 sendChannelNotification(mcp, content, {
@@ -662,8 +745,8 @@ export function startHttpBridge(mcp: Server) {
               approval: null,
               prompt_hash: sha256Hex(message ?? ""),
               duration_ms: null,
-              attachment_count: 0,
-              attachment_bytes: 0,
+              attachment_count: chatAttachmentCount,
+              attachment_bytes: chatAttachmentBytes,
             }).catch((err) =>
               process.stderr.write(
                 `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
