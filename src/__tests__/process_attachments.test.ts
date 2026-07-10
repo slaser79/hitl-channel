@@ -49,6 +49,13 @@ describe("sanitizeAttachmentFileName", () => {
     expect(sanitizeAttachmentFileName(".", "fb.bin")).toBe("fb.bin");
     expect(sanitizeAttachmentFileName("...hidden", "fb.bin")).toBe("hidden");
   });
+
+  it("rejects separator-only names that would collapse join() to the inbox dir", () => {
+    expect(sanitizeAttachmentFileName("/", "fb.bin")).toBe("fb.bin");
+    expect(sanitizeAttachmentFileName("//", "fb.bin")).toBe("fb.bin");
+    expect(sanitizeAttachmentFileName("\\", "fb.bin")).toBe("fb.bin");
+    expect(sanitizeAttachmentFileName("\\\\", "fb.bin")).toBe("fb.bin");
+  });
 });
 
 describe("processAttachments (unit — AV1–AV4)", () => {
@@ -181,6 +188,28 @@ describe("processAttachments (unit — AV1–AV4)", () => {
     } finally {
       process.stderr.write = origWrite;
     }
+  });
+
+  it("separator-only fileName falls back to timestamp name (strict inbox child)", async () => {
+    const body = "not a directory write";
+    const content = await processAttachments("sep", [
+      {
+        type: "file",
+        media_type: "text/plain",
+        data: b64(body),
+        fileName: "/",
+      },
+    ]);
+    const match = content.match(/\[File: ([^\]]+)\]/);
+    expect(match).not.toBeNull();
+    const writtenPath = match![1]!;
+    expect(writtenPath.startsWith(inboxDir + "/")).toBe(true);
+    expect(writtenPath).not.toBe(inboxDir);
+    // Must be a file under inbox, not the directory itself.
+    const base = writtenPath.slice(inboxDir.length + 1);
+    expect(base.length).toBeGreaterThan(0);
+    expect(base.includes("/")).toBe(false);
+    expect(await readFile(writtenPath, "utf8")).toBe(body);
   });
 
   it("persists non-image types other than file (e.g. application/pdf as type:document)", async () => {

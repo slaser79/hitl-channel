@@ -190,8 +190,9 @@ export async function drainBufferToClient(
 /**
  * Sanitize a phone-supplied attachment filename so it cannot escape the
  * inbox directory via path traversal (inbound sibling of #25 outbound
- * allowlist hardening). Basename-only; strip leading dots / null bytes.
- * Falls back to `fallback` when the result is empty after sanitization.
+ * allowlist hardening). Basename-only; strip leading dots / null bytes /
+ * residual path separators. Falls back to `fallback` when the result is
+ * empty or not a safe single path segment.
  */
 export function sanitizeAttachmentFileName(
   fileName: string | undefined,
@@ -199,9 +200,14 @@ export function sanitizeAttachmentFileName(
 ): string {
   if (!fileName || typeof fileName !== "string") return fallback;
   // Normalize Windows separators then take basename (handles absolute + ../).
+  // Note: on some platforms basename("/") is "/" (not ""); strip separators
+  // explicitly so join(inbox, name) can never collapse to the inbox dir.
   const base = basename(fileName.replace(/\\/g, "/"));
-  const cleaned = base.replace(/^\.+/, "").replace(/\0/g, "");
-  if (!cleaned) return fallback;
+  const cleaned = base
+    .replace(/^\.+/, "")
+    .replace(/\0/g, "")
+    .replace(/[/\\]/g, "");
+  if (!cleaned || cleaned === "." || cleaned === "..") return fallback;
   return cleaned;
 }
 
@@ -264,16 +270,25 @@ export async function processAttachments(
       ? `img_${Date.now()}.${ext}`
       : `file_${Date.now()}.${ext}`;
     const fileName = sanitizeAttachmentFileName(attachment.fileName, fallback);
+    // Reject residual separator / empty segments even if sanitize regresses.
+    if (!fileName || fileName.includes("/") || fileName.includes("\\")) {
+      process.stderr.write(
+        `[hitl-channel] Skipping attachment (unsafe fileName after sanitize): fileName=${fileName}\n`,
+      );
+      continue;
+    }
     const filePath = join(inboxDir, fileName);
     const resolvedPath = resolve(filePath);
 
-    // Defense in depth: refuse any path that escapes the inbox after join.
-    if (
-      resolvedPath !== resolvedInbox &&
-      !resolvedPath.startsWith(resolvedInbox + "/")
-    ) {
+    // Only allow strict child files of the inbox — not the inbox dir itself
+    // (e.g. join(inbox, "/") / join(inbox, "") collapsing to inboxDir) and
+    // not anything outside it.
+    const isStrictChild =
+      resolvedPath.startsWith(resolvedInbox + "/") &&
+      resolvedPath.length > resolvedInbox.length + 1;
+    if (!isStrictChild) {
       process.stderr.write(
-        `[hitl-channel] Skipping attachment (path escapes inbox): fileName=${fileName}\n`,
+        `[hitl-channel] Skipping attachment (path not a strict inbox child): fileName=${fileName}\n`,
       );
       continue;
     }
