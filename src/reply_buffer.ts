@@ -111,6 +111,9 @@ export class ReplyBuffer {
 
   /**
    * Remove a reply from the buffer by its unique ID.
+   * This is invoked when the client successfully receives and acknowledges
+   * a message via an "ack" control frame, implementing the application-level
+   * ACK protocol to prevent message drops on reconnect.
    * Returns true if found and removed; false if already absent.
    */
   commitById(id: string): boolean {
