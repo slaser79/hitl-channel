@@ -56,8 +56,13 @@ this first?" and express the secondary links through typed relationships instead
 copying the same explanation into multiple files.
 
 The curatorial model is two-class: tracked canonical pages live in the domain
-trees above, while overflow journal entries live in the gitignored
-`.specs/brain/_journal/` append-only buffer and never become canon.
+trees above, while overflow journal entries live in the versioned
+`.specs/brain/_journal/` directory. To prevent unbounded repository growth,
+maintenance automatically rotates and consolidates monthly journal files
+(`*-YYYY-MM.md`) into quarterly files (`*-YYYY-Qn.md`) after the quarter ends,
+deletes the original monthly files, and rewrites pointers in all markdown files to
+prevent dangling references.
+
 
 ## 3. The Librarian's Playbook
 
