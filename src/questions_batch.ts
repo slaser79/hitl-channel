@@ -242,6 +242,11 @@ export async function presentQuestionsToHitl(
     ts,
   };
 
+  const delivered = deps.broadcastFrame(
+    frame as unknown as Record<string, unknown>,
+    targetDevice,
+  );
+
   audit({
     ts,
     instance_id: deps.instanceId,
@@ -258,20 +263,6 @@ export async function presentQuestionsToHitl(
     process.stderr.write(
       `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
     )
-  );
-
-  // SPEC-AW-311 — fire-and-forget dispatch (matches `present_choices_to_hitl`
-  // in server.ts:383). The previous synchronous `correlator.register + await
-  // waiter` pattern blocked the agent's MCP call for the full
-  // `timeout_seconds` window (up to 15 min) because the phone-side response
-  // never reaches the correlator: `claudeCodeService.sendMessage` POSTs to
-  // `/` (notification path) and only inbound WS frames trigger
-  // `correlator.resolve`. Returning immediately matches how every other
-  // channel tool behaves; the user's submitted answers surface as a normal
-  // channel notification on the next agent turn (carries the same
-  // `request_id` so callers can correlate if they care).
-  const delivered = deps.broadcastFrame(
-    frame as unknown as Record<string, unknown>,
   );
   if (delivered === 0) {
     return {

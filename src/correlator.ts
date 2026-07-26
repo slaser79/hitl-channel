@@ -46,6 +46,13 @@ export class FrameCorrelator {
   }
 
   /**
+   * Get the registered target device ID for a pending request, if any.
+   */
+  getTargetDevice(reqId: string): string | undefined {
+    return this.pending.get(reqId)?.targetDevice;
+  }
+
+  /**
    * Resolve a pending request. Returns `true` if a waiter was resolved,
    * `false` if the reqId was unknown, already settled, or sent by a non-target device.
    */

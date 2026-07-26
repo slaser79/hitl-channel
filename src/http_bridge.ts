@@ -728,6 +728,36 @@ export function startHttpBridge(mcp: Server) {
                 return;
               }
             }
+            const targetDevice = correlator.getTargetDevice(reqId);
+            if (
+              targetDevice &&
+              senderDeviceId &&
+              targetDevice !== senderDeviceId &&
+              !senderDeviceId.startsWith(targetDevice)
+            ) {
+              process.stderr.write(
+                `[hitl-channel] WARN ${frameType} for request_id ${reqId} received from non-target device ${senderDeviceId} (expected ${targetDevice}) — dropped\n`
+              );
+              appendAudit({
+                ts: new Date().toISOString(),
+                instance_id: process.env.HITL_INSTANCE_ID ?? "unknown",
+                direction: "phone_returns_to_cc",
+                kind: frameType === "questions_batch_result" ? "questions_batch" : "tool_result",
+                tool_name: frameType === "tool_call_result" ? (typeof data.tool_name === "string" ? data.tool_name : null) : null,
+                approval: frameType === "tool_call_result" ? (((data.approval as unknown) as "auto" | "user_approved" | "user_denied" | "timeout" | null) ?? null) : null,
+                prompt_hash: sha256Hex(stableStringify(data)),
+                duration_ms: null,
+                attachment_count: 0,
+                attachment_bytes: 0,
+                device_id: senderDeviceId,
+              }).catch((err) =>
+                process.stderr.write(
+                  `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
+                )
+              );
+              return;
+            }
+
             const resolved = correlator.resolve(reqId, data, senderDeviceId);
             if (!resolved) {
               process.stderr.write(
