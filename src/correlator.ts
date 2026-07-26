@@ -25,14 +25,15 @@ export class FrameCorrelator {
    * Throws synchronously if `reqId` is already registered — callers must
    * generate fresh UUIDs per request.
    */
-  register<T = unknown>(reqId: string, timeoutMs: number): Promise<T> {
+  register<T = unknown>(reqId: string, timeoutMs: number, targetDevice?: string): Promise<T> {
     if (this.pending.has(reqId)) {
       throw new Error(`correlator: duplicate request_id ${reqId}`);
     }
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(reqId);
-        reject(new Error(`timeout after ${timeoutMs}ms (request_id=${reqId})`));
+        const devMsg = targetDevice ? ` on device ${targetDevice}` : "";
+        reject(new Error(`timeout after ${timeoutMs}ms${devMsg} (request_id=${reqId})`));
       }, timeoutMs);
       this.pending.set(reqId, {
         resolve: (payload) => resolve(payload as T),

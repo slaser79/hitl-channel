@@ -33,7 +33,15 @@ export interface ReplyPayload {
   attachments?: HitlAttachment[];
 }
 
+export interface HitlWebSocketData {
+  tokenHash?: string;
+  connectedAt?: string;
+  lastSeen?: string;
+  [key: string]: unknown;
+}
+
 export interface HitlWebSocket {
+  data?: HitlWebSocketData;
   readyState: number;
   send: (data: string) => number | void;
 }

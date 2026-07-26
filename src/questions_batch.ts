@@ -70,6 +70,10 @@ export const PRESENT_QUESTIONS_TOOL_DEFINITION = {
         type: "number",
         description: `Round-trip timeout. Default ${DEFAULT_TIMEOUT_S}, hard cap ${HARD_CAP_TIMEOUT_S}.`,
       },
+      device: {
+        type: "string",
+        description: "Optional device token hash or device ID to target a specific connected phone.",
+      },
     },
     required: ["questions"],
   },
@@ -185,7 +189,7 @@ export function validateQuestionsArgs(
 
 export interface PresentQuestionsDeps {
   correlator: FrameCorrelator;
-  broadcastFrame: (frame: Record<string, unknown>) => number;
+  broadcastFrame: (frame: Record<string, unknown>, targetDevice?: string) => number;
   clientsSize: () => number;
   instanceId: string;
   generateRequestId: () => string;
@@ -228,6 +232,7 @@ export async function presentQuestionsToHitl(
     };
   }
 
+  const targetDevice = typeof args.device === "string" ? args.device : undefined;
   const requestId = deps.generateRequestId();
   const ts = now().toISOString();
   const frame: QuestionsBatchRequestFrame = {
@@ -248,6 +253,7 @@ export async function presentQuestionsToHitl(
     duration_ms: null,
     attachment_count: 0,
     attachment_bytes: 0,
+    device_id: targetDevice ?? null,
   }).catch((err) =>
     process.stderr.write(
       `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`

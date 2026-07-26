@@ -13,6 +13,8 @@ import {
   startHttpBridge,
   broadcastReply,
   broadcastFrame,
+  unicastFrame,
+  getMostRecentlyActiveClient,
   correlator,
   clients,
 } from "./http_bridge.js";
@@ -129,6 +131,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "list_devices",
+      description: "List currently connected HITL mobile devices and their status.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
+    {
       name: "present_choices_to_hitl",
       description:
         "Present choices to the HITL mobile app user for selection. " +
@@ -149,6 +159,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "boolean",
             description: "Allow multiple selections (default: false)",
           },
+          device: {
+            type: "string",
+            description: "Optional device token hash or device ID to target a specific connected phone.",
+          },
         },
         required: ["prompt", "choices"],
       },
@@ -167,6 +181,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           filter: {
             type: "string",
             description: "Optional substring filter on tool name.",
+          },
+          device: {
+            type: "string",
+            description: "Optional device token hash or device ID to target a specific connected phone.",
           },
         },
       },
@@ -194,6 +212,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           timeout_seconds: {
             type: "number",
             description: "Round-trip timeout. Default 60, hard cap 300.",
+          },
+          device: {
+            type: "string",
+            description: "Optional device token hash or device ID to target a specific connected phone.",
           },
         },
         required: ["name"],
@@ -224,6 +246,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           overwrite: {
             type: "boolean",
             description: "Whether to overwrite the file on the phone if it already exists (default: true).",
+          },
+          device: {
+            type: "string",
+            description: "Optional device token hash or device ID to target a specific connected phone.",
           },
         },
         required: ["local_path", "dest"],
@@ -458,27 +484,61 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
 
+  if (req.params.name === "list_devices") {
+    const openClients = Array.from(clients).filter((ws) => ws.readyState === 1);
+    const mostActive = getMostRecentlyActiveClient();
+    const deviceList = openClients.map((ws) => {
+      const tokenHash = ws.data?.tokenHash ?? "unknown";
+      return {
+        token_hash: tokenHash,
+        device_id: tokenHash,
+        connected_at: ws.data?.connectedAt ?? null,
+        last_seen: ws.data?.lastSeen ?? null,
+        is_active: ws === mostActive,
+      };
+    });
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ devices: deviceList }, null, 2),
+        },
+      ],
+    };
+  }
+
   if (req.params.name === "present_choices_to_hitl") {
     const prompt = args.prompt as string;
     const choices = args.choices as string[];
     const multiSelect = args.multi_select as boolean | undefined;
+    const targetDevice = args.device as string | undefined;
 
     process.stderr.write(
       `[hitl-channel] Choices: ${prompt} [${choices.join(", ")}] (multi: ${multiSelect ?? false})\n`
     );
 
-    const payload = JSON.stringify({
+    const frame = {
       type: "choices",
       content: prompt,
       choices: choices,
       multiSelect: multiSelect ?? false,
       id: `c${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       ts: new Date().toISOString(),
-    });
+    };
 
-    for (const ws of clients) {
-      if (ws.readyState === 1) ws.send(payload);
+    const unicastResult = unicastFrame(frame, targetDevice);
+    if (!unicastResult.delivered) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `present_choices_to_hitl failed: ${unicastResult.error ?? "no_phone_connected"}`,
+          },
+        ],
+      };
     }
+
     appendAudit({
       ts: new Date().toISOString(),
       instance_id: identity.instanceId,
@@ -488,9 +548,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       approval: null,
       prompt_hash: sha256Hex(prompt ?? ""),
       duration_ms: null,
-      // No attachments on choices frames today (issue #12 closed-schema default).
       attachment_count: 0,
       attachment_bytes: 0,
+      device_id: unicastResult.targetDevice ?? null,
     }).catch((err) =>
       process.stderr.write(
         `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
@@ -521,17 +581,30 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
     const filter = (args.filter as string | undefined) ?? undefined;
+    const targetDevice = args.device as string | undefined;
     const requestId = generateRequestId();
     const frame = {
       type: "list_tools_request" as const,
       request_id: requestId,
       ...(filter ? { filter } : {}),
     };
-    const waiter = correlator.register<ListToolsResultFrame>(requestId, 30_000);
-    const delivered = broadcastFrame(frame);
-    if (delivered === 0) {
-      correlator.reject(requestId, new Error("no_phone_connected_post_check"));
+    const unicastResult = unicastFrame(frame, targetDevice);
+    if (!unicastResult.delivered) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `list_phone_tools failed: ${unicastResult.error ?? "no_phone_connected"}`,
+          },
+        ],
+      };
     }
+    const waiter = correlator.register<ListToolsResultFrame>(
+      requestId,
+      30_000,
+      unicastResult.targetDevice,
+    );
     try {
       const result = await waiter;
       return {
@@ -589,6 +662,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       300,
       Math.max(1, Number.isFinite(rawTimeout) ? rawTimeout : 60),
     );
+    const targetDevice = args.device as string | undefined;
     const requestId = generateRequestId();
     const frame = {
       type: "tool_call_request" as const,
@@ -599,6 +673,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       cc_instance_id: identity.instanceId,
     };
     const startedAt = Date.now();
+
+    const unicastResult = unicastFrame(frame, targetDevice);
+    if (!unicastResult.delivered) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `call_phone_tool failed: ${unicastResult.error ?? "no_phone_connected"}`,
+          },
+        ],
+      };
+    }
+
     appendAudit({
       ts: new Date(startedAt).toISOString(),
       instance_id: identity.instanceId,
@@ -608,11 +696,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       approval: null,
       prompt_hash: sha256Hex(stableStringify(toolArgs)),
       duration_ms: null,
-      // Issue #12 AC4 boundary — `cc_calls_phone` audit emission for
-      // CC-supplied attachments-as-input is out-of-scope (no phone tool today
-      // consumes a CC-supplied attachment). File a follow-up if that changes.
       attachment_count: 0,
       attachment_bytes: 0,
+      device_id: unicastResult.targetDevice ?? null,
     }).catch((err) =>
       process.stderr.write(
         `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
@@ -621,20 +707,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const waiter = correlator.register<ToolCallResultFrame>(
       requestId,
       timeoutSeconds * 1000,
+      unicastResult.targetDevice,
     );
-    const delivered = broadcastFrame(frame);
-    if (delivered === 0) {
-      correlator.reject(requestId, new Error("no_phone_connected_post_check"));
-    }
+
     try {
       const result = await waiter;
       const duration = Date.now() - startedAt;
-      // Issue #12 — `result` is the resolved `tool_call_result` frame; the
-      // top-level `attachments` array (typed as unknown here because
-      // ToolCallResultFrame doesn't enumerate it — see HitlAttachment in
-      // types.ts) is summarised the same way as in http_bridge.ts's WS
-      // handler so both audit emissions for this event carry consistent
-      // attachment metadata.
       const { count: attachmentCount, bytes: attachmentBytes } =
         summariseAttachments((result as { attachments?: unknown }).attachments);
       appendAudit({
@@ -648,6 +726,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         duration_ms: duration,
         attachment_count: attachmentCount,
         attachment_bytes: attachmentBytes,
+        device_id: unicastResult.targetDevice ?? null,
       }).catch((err) =>
         process.stderr.write(
           `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
@@ -715,7 +794,28 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       return { content };
     } catch (err) {
+      const duration = Date.now() - startedAt;
       const msg = err instanceof Error ? err.message : String(err);
+      const isTimeout = msg.includes("timeout");
+
+      appendAudit({
+        ts: new Date().toISOString(),
+        instance_id: identity.instanceId,
+        direction: "phone_returns_to_cc",
+        kind: "tool_result",
+        tool_name: name,
+        approval: isTimeout ? "timeout" : null,
+        prompt_hash: sha256Hex(stableStringify(toolArgs)),
+        duration_ms: duration,
+        attachment_count: 0,
+        attachment_bytes: 0,
+        device_id: unicastResult.targetDevice ?? null,
+      }).catch((auditErr) =>
+        process.stderr.write(
+          `[hitl-channel] audit failed: ${auditErr instanceof Error ? auditErr.message : auditErr}\n`
+        )
+      );
+
       return {
         isError: true,
         content: [
@@ -916,6 +1016,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
 
+    const targetDevice = args.device as string | undefined;
     const timeoutSeconds = 60;
     const requestId = generateRequestId();
     const frame = {
@@ -929,6 +1030,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const startedAt = Date.now();
     const inputHash = sha256Hex(stableStringify(phoneToolArgs));
 
+    const unicastResult = unicastFrame(frame, targetDevice);
+    if (!unicastResult.delivered) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `push_file failed: ${unicastResult.error ?? "no_phone_connected"}`,
+          },
+        ],
+      };
+    }
+
     // Audit the outgoing call
     appendAudit({
       ts: new Date(startedAt).toISOString(),
@@ -941,6 +1055,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       duration_ms: null,
       attachment_count: 0,
       attachment_bytes: 0,
+      device_id: unicastResult.targetDevice ?? null,
     }).catch((err) =>
       process.stderr.write(
         `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`,
@@ -950,11 +1065,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const waiter = correlator.register<ToolCallResultFrame>(
       requestId,
       timeoutSeconds * 1000,
+      unicastResult.targetDevice,
     );
-    const delivered = broadcastFrame(frame);
-    if (delivered === 0) {
-      correlator.reject(requestId, new Error("no_phone_connected_post_check"));
-    }
 
     try {
       const result = await waiter;
@@ -975,6 +1087,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         duration_ms: duration,
         attachment_count: attachmentCount,
         attachment_bytes: attachmentBytes,
+        device_id: unicastResult.targetDevice ?? null,
       }).catch((err) =>
         process.stderr.write(
           `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`,
@@ -1033,6 +1146,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         duration_ms: duration,
         attachment_count: 0,
         attachment_bytes: 0,
+        device_id: unicastResult.targetDevice ?? null,
       }).catch((auditErr) =>
         process.stderr.write(
           `[hitl-channel] audit failed: ${auditErr instanceof Error ? auditErr.message : auditErr}\n`,
