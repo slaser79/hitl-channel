@@ -20,6 +20,7 @@
  */
 import { appendAudit, sha256Hex, stableStringify } from "./audit.js";
 import type { FrameCorrelator } from "./correlator.js";
+import type { UnicastResult } from "./http_bridge.js";
 import type {
   QuestionSpec,
   QuestionsBatchRequestFrame,
@@ -189,7 +190,7 @@ export function validateQuestionsArgs(
 
 export interface PresentQuestionsDeps {
   correlator: FrameCorrelator;
-  broadcastFrame: (frame: Record<string, unknown>, targetDevice?: string) => number;
+  unicastFrame: (frame: Record<string, unknown>, targetDevice?: string) => UnicastResult;
   clientsSize: () => number;
   instanceId: string;
   generateRequestId: () => string;
@@ -242,7 +243,7 @@ export async function presentQuestionsToHitl(
     ts,
   };
 
-  const delivered = deps.broadcastFrame(
+  const unicastResult = deps.unicastFrame(
     frame as unknown as Record<string, unknown>,
     targetDevice,
   );
@@ -258,13 +259,13 @@ export async function presentQuestionsToHitl(
     duration_ms: null,
     attachment_count: 0,
     attachment_bytes: 0,
-    device_id: targetDevice ?? null,
+    device_id: unicastResult.targetDevice ?? null,
   }).catch((err) =>
     process.stderr.write(
       `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
     )
   );
-  if (delivered === 0) {
+  if (!unicastResult.delivered) {
     return {
       isError: true,
       content: [

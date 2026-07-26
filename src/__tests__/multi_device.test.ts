@@ -7,7 +7,8 @@ import {
   clients,
   correlator,
   broadcastReply,
-  broadcastFrame,
+  unicastFrame,
+  unicastCorrelatedFrame,
 } from "../http_bridge.js";
 import { mcp } from "../server.js";
 import { presentQuestionsToHitl } from "../questions_batch.js";
@@ -186,7 +187,7 @@ describe("Multi-device routing and arbitration (Issue #40)", () => {
       },
       {
         correlator,
-        broadcastFrame,
+        unicastFrame,
         clientsSize: () => clients.size,
         instanceId: "test-instance",
         generateRequestId: () => "req-q1",
@@ -288,6 +289,36 @@ describe("Multi-device routing and arbitration (Issue #40)", () => {
     expect(resA).toBe(true);
     const result = await waiter;
     expect(result).toEqual({ success: true });
+  });
+
+  it("registers the selected device before sending on that same socket", async () => {
+    const requestId = "req-sync-response";
+    const clientA = createMockSocket("hash-device-A", Date.now());
+    const clientB = createMockSocket("hash-device-B", Date.now() - 5000);
+    clientA.send = (data: string) => {
+      clientA.sent.push(data);
+      // Simulate another device becoming most-active and the target replying
+      // synchronously during send.
+      clientB.data!.lastSeen = new Date(Date.now() + 1000).toISOString();
+      expect(correlator.getTargetDevice(requestId)).toBe("hash-device-A");
+      correlator.resolve(requestId, { success: true }, "hash-device-A");
+      return 1;
+    };
+    clients.add(clientA);
+    clients.add(clientB);
+
+    const dispatch = unicastCorrelatedFrame<{ success: boolean }>(
+      { type: "tool_call_request", request_id: requestId },
+      requestId,
+      1000,
+    );
+
+    expect(dispatch.delivered).toBe(true);
+    if (!dispatch.delivered) throw new Error(dispatch.error);
+    expect(dispatch.targetDevice).toBe("hash-device-A");
+    expect(await dispatch.waiter).toEqual({ success: true });
+    expect(clientA.sent.length).toBe(1);
+    expect(clientB.sent.length).toBe(0);
   });
 
   it("AV8: Read-after-write coherence — write then read resolve to the same active device", async () => {

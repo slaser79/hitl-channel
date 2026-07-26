@@ -35,6 +35,18 @@ export interface UnicastResult {
   error?: string;
 }
 
+export type CorrelatedUnicastResult<T> =
+  | {
+      delivered: true;
+      targetDevice?: string;
+      waiter: Promise<T>;
+    }
+  | {
+      delivered: false;
+      targetDevice?: string;
+      error: string;
+    };
+
 /**
  * Find the most-recently-active connected client, or target a specific device by tokenHash.
  */
@@ -71,24 +83,14 @@ export function getMostRecentlyActiveClient(targetDevice?: string): HitlWebSocke
  * If `targetDevice` is omitted, targets the most-recently-active connected client.
  */
 export function unicastFrame(frame: Record<string, unknown>, targetDevice?: string): UnicastResult {
-  if (targetDevice) {
-    const client = getMostRecentlyActiveClient(targetDevice);
-    if (!client) {
-      return { delivered: false, error: `device '${targetDevice}' not found or not connected` };
-    }
-    const raw = JSON.stringify(frame);
-    const ok = wsSendAccepted(client, raw);
-    const deviceId = client.data?.tokenHash ?? "unknown";
-    return {
-      delivered: ok,
-      targetDevice: deviceId,
-      ...(ok ? {} : { error: `failed to send frame to device ${deviceId}` }),
-    };
-  }
-
-  const client = getMostRecentlyActiveClient();
+  const client = getMostRecentlyActiveClient(targetDevice);
   if (!client) {
-    return { delivered: false, error: "no_phone_connected" };
+    return {
+      delivered: false,
+      error: targetDevice
+        ? `device '${targetDevice}' not found or not connected`
+        : "no_phone_connected",
+    };
   }
   const raw = JSON.stringify(frame);
   const ok = wsSendAccepted(client, raw);
@@ -97,6 +99,50 @@ export function unicastFrame(frame: Record<string, unknown>, targetDevice?: stri
     delivered: ok,
     targetDevice: deviceId,
     ...(ok ? {} : { error: `failed to send frame to device ${deviceId}` }),
+  };
+}
+
+/**
+ * Select one client, register its full device ID with the correlator, then send
+ * on that same socket. Keeping these operations together prevents both a
+ * second-selection race and a fast response arriving before registration.
+ */
+export function unicastCorrelatedFrame<T>(
+  frame: Record<string, unknown>,
+  requestId: string,
+  timeoutMs: number,
+  targetDevice?: string,
+): CorrelatedUnicastResult<T> {
+  const client = getMostRecentlyActiveClient(targetDevice);
+  if (!client) {
+    return {
+      delivered: false,
+      error: targetDevice
+        ? `device '${targetDevice}' not found or not connected`
+        : "no_phone_connected",
+    };
+  }
+
+  const deviceId = client.data?.tokenHash;
+  const waiter = correlator.register<T>(requestId, timeoutMs, deviceId);
+  // A failed synchronous send rejects below before the caller can await.
+  waiter.catch(() => {});
+
+  const ok = wsSendAccepted(client, JSON.stringify(frame));
+  if (!ok) {
+    const error = `failed to send frame to device ${deviceId ?? "unknown"}`;
+    correlator.reject(requestId, new Error(error));
+    return {
+      delivered: false,
+      targetDevice: deviceId,
+      error,
+    };
+  }
+
+  return {
+    delivered: true,
+    targetDevice: deviceId,
+    waiter,
   };
 }
 

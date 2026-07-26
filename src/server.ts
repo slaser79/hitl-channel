@@ -12,8 +12,8 @@ import {
 import {
   startHttpBridge,
   broadcastReply,
-  broadcastFrame,
   unicastFrame,
+  unicastCorrelatedFrame,
   getMostRecentlyActiveClient,
   correlator,
   clients,
@@ -582,34 +582,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     const filter = (args.filter as string | undefined) ?? undefined;
     const targetDevice = args.device as string | undefined;
-    const targetClient = getMostRecentlyActiveClient(targetDevice);
-    if (!targetClient) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text" as const,
-            text: `list_phone_tools failed: ${targetDevice ? `device '${targetDevice}' not found or not connected` : "no_phone_connected"}`,
-          },
-        ],
-      };
-    }
-    const targetDeviceId = targetClient.data?.tokenHash;
     const requestId = generateRequestId();
     const frame = {
       type: "list_tools_request" as const,
       request_id: requestId,
       ...(filter ? { filter } : {}),
     };
-    const waiter = correlator.register<ListToolsResultFrame>(
+    const unicastResult = unicastCorrelatedFrame<ListToolsResultFrame>(
+      frame,
       requestId,
       30_000,
-      targetDeviceId,
+      targetDevice,
     );
-    waiter.catch(() => {});
-    const unicastResult = unicastFrame(frame, targetDevice ?? targetDeviceId);
     if (!unicastResult.delivered) {
-      correlator.reject(requestId, new Error(unicastResult.error ?? "no_phone_connected"));
       return {
         isError: true,
         content: [
@@ -620,6 +605,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         ],
       };
     }
+    const waiter = unicastResult.waiter;
     try {
       const result = await waiter;
       return {
@@ -678,19 +664,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       Math.max(1, Number.isFinite(rawTimeout) ? rawTimeout : 60),
     );
     const targetDevice = args.device as string | undefined;
-    const targetClient = getMostRecentlyActiveClient(targetDevice);
-    if (!targetClient) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text" as const,
-            text: `call_phone_tool failed: ${targetDevice ? `device '${targetDevice}' not found or not connected` : "no_phone_connected"}`,
-          },
-        ],
-      };
-    }
-    const targetDeviceId = targetClient.data?.tokenHash;
     const requestId = generateRequestId();
     const frame = {
       type: "tool_call_request" as const,
@@ -702,16 +675,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
     const startedAt = Date.now();
 
-    const waiter = correlator.register<ToolCallResultFrame>(
+    const unicastResult = unicastCorrelatedFrame<ToolCallResultFrame>(
+      frame,
       requestId,
       timeoutSeconds * 1000,
-      targetDeviceId,
+      targetDevice,
     );
-    waiter.catch(() => {});
-
-    const unicastResult = unicastFrame(frame, targetDevice ?? targetDeviceId);
     if (!unicastResult.delivered) {
-      correlator.reject(requestId, new Error(unicastResult.error ?? "no_phone_connected"));
       return {
         isError: true,
         content: [
@@ -722,6 +692,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         ],
       };
     }
+    const waiter = unicastResult.waiter;
 
     appendAudit({
       ts: new Date(startedAt).toISOString(),
@@ -1048,19 +1019,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     const targetDevice = args.device as string | undefined;
-    const targetClient = getMostRecentlyActiveClient(targetDevice);
-    if (!targetClient) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text" as const,
-            text: `push_file failed: ${targetDevice ? `device '${targetDevice}' not found or not connected` : "no_phone_connected"}`,
-          },
-        ],
-      };
-    }
-    const targetDeviceId = targetClient.data?.tokenHash;
     const timeoutSeconds = 60;
     const requestId = generateRequestId();
     const frame = {
@@ -1074,16 +1032,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const startedAt = Date.now();
     const inputHash = sha256Hex(stableStringify(phoneToolArgs));
 
-    const waiter = correlator.register<ToolCallResultFrame>(
+    const unicastResult = unicastCorrelatedFrame<ToolCallResultFrame>(
+      frame,
       requestId,
       timeoutSeconds * 1000,
-      targetDeviceId,
+      targetDevice,
     );
-    waiter.catch(() => {});
-
-    const unicastResult = unicastFrame(frame, targetDevice ?? targetDeviceId);
     if (!unicastResult.delivered) {
-      correlator.reject(requestId, new Error(unicastResult.error ?? "no_phone_connected"));
       return {
         isError: true,
         content: [
@@ -1094,6 +1049,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         ],
       };
     }
+    const waiter = unicastResult.waiter;
 
     // Audit the outgoing call
     appendAudit({
@@ -1214,7 +1170,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (req.params.name === "present_questions_to_hitl") {
     return presentQuestionsToHitl(args, {
       correlator,
-      broadcastFrame,
+      unicastFrame,
       clientsSize: () => clients.size,
       instanceId: identity.instanceId,
       generateRequestId,
