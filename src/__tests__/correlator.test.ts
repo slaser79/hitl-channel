@@ -52,4 +52,14 @@ describe("FrameCorrelator", () => {
     void c.register("dup", 5_000).catch(() => undefined);
     expect(() => c.register("dup", 5_000)).toThrow(/duplicate/);
   });
+
+  it("targetDevice filtering rejects non-matching senderDeviceId", async () => {
+    const c = new FrameCorrelator();
+    const promise = c.register("req-td", 5_000, "device-A");
+    expect(c.resolve("req-td", { result: "ok" }, "device-B")).toBe(false);
+    expect(c.size).toBe(1);
+    expect(c.resolve("req-td", { result: "ok" }, "device-A")).toBe(true);
+    expect(c.size).toBe(0);
+    await expect(promise).resolves.toEqual({ result: "ok" });
+  });
 });
