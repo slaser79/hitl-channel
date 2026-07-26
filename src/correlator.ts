@@ -59,8 +59,14 @@ export class FrameCorrelator {
   resolve(reqId: string, payload: unknown, senderDeviceId?: string): boolean {
     const entry = this.pending.get(reqId);
     if (!entry) return false;
-    if (entry.targetDevice && senderDeviceId && entry.targetDevice !== senderDeviceId) {
-      return false;
+    if (entry.targetDevice) {
+      if (!senderDeviceId) return false;
+      const target = entry.targetDevice;
+      const matches =
+        senderDeviceId === target ||
+        senderDeviceId.startsWith(target) ||
+        target.startsWith(senderDeviceId);
+      if (!matches) return false;
     }
     clearTimeout(entry.timer);
     this.pending.delete(reqId);

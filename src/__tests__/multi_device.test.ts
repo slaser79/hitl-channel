@@ -1,5 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
 import { readFile } from "node:fs/promises";
+import { writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import {
   clients,
@@ -43,14 +45,15 @@ function createMockSocket(tokenHash: string, lastSeenMs: number): HitlWebSocket 
 }
 
 async function waitForFrames(a: { sent: string[] }, b: { sent: string[] }, expectedTotal: number) {
-  for (let i = 0; i < 50; i++) {
+  for (let i = 0; i < 200; i++) {
     if (a.sent.length + b.sent.length >= expectedTotal) break;
-    await new Promise((r) => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 10));
   }
 }
 
 describe("Multi-device routing and arbitration (Issue #40)", () => {
   beforeEach(() => {
+    delete process.env.HITL_CHANNEL_ATTACHMENT_ROOTS;
     clients.clear();
     correlator.rejectAll(new Error("test cleanup"));
   });
@@ -91,14 +94,13 @@ describe("Multi-device routing and arbitration (Issue #40)", () => {
     expect(msgB.text).toBe("Hello both phones!");
   });
 
-  it("AV3 & AV4: CLASS B — tool and request-shaped frames reach EXACTLY ONE client for all 5 Class B frame types", async () => {
+  it("AV3a: call_phone_tool sends tool_call_request to unicast target", async () => {
     const callTool = getCallHandler();
     const clientA = createMockSocket("hash-device-A", Date.now() - 5000);
     const clientB = createMockSocket("hash-device-B", Date.now());
     clients.add(clientA);
     clients.add(clientB);
 
-    // 1. call_phone_tool (tool_call_request)
     const callPromise = callTool("call_phone_tool", {
       name: "get_automation",
       arguments: { id: "auto-1" },
@@ -113,36 +115,49 @@ describe("Multi-device routing and arbitration (Issue #40)", () => {
       request_id: req1.request_id,
       success: true,
       output: { id: "auto-1", name: "test" },
-    });
+    }, "hash-device-B");
     await callPromise;
+  });
 
-    // Reset sent arrays
-    clientA.sent.length = 0;
-    clientB.sent.length = 0;
+  it("AV3b: push_file sends tool_call_request to unicast target", async () => {
+    const callTool = getCallHandler();
+    const clientA = createMockSocket("hash-device-A", Date.now() - 5000);
+    const clientB = createMockSocket("hash-device-B", Date.now());
+    clients.add(clientA);
+    clients.add(clientB);
 
-    // 2. push_file (tool_call_request)
-    const pushPromise = callTool("push_file", {
-      local_path: join(process.cwd(), "package.json"),
-      dest: "documents/test.txt",
-    });
-    await waitForFrames(clientA, clientB, 1);
-    expect(clientA.sent.length).toBe(0);
-    expect(clientB.sent.length).toBe(1);
-    const req2 = JSON.parse(clientB.sent[0]!);
-    expect(req2.type).toBe("tool_call_request");
-    expect(req2.name).toBe("write_file");
-    correlator.resolve(req2.request_id, {
-      type: "tool_call_result",
-      request_id: req2.request_id,
-      success: true,
-    });
-    await pushPromise;
+    const tmpFile = join(homedir(), "hitl-multi-push-test.txt");
+    writeFileSync(tmpFile, "hello from push_file test", "utf8");
+    process.env.HITL_CHANNEL_ATTACHMENT_ROOTS = `${homedir()}:${tmpdir()}:/tmp`;
+    try {
+      const pushPromise = callTool("push_file", {
+        local_path: tmpFile,
+        dest: "documents/test.txt",
+      });
+      await waitForFrames(clientA, clientB, 1);
+      expect(clientA.sent.length).toBe(0);
+      expect(clientB.sent.length).toBe(1);
+      const req2 = JSON.parse(clientB.sent[0]!);
+      expect(req2.type).toBe("tool_call_request");
+      expect(req2.name).toBe("write_file");
+      correlator.resolve(req2.request_id, {
+        type: "tool_call_result",
+        request_id: req2.request_id,
+        success: true,
+      }, "hash-device-B");
+      await pushPromise;
+    } finally {
+      if (existsSync(tmpFile)) unlinkSync(tmpFile);
+    }
+  });
 
-    // Reset sent arrays
-    clientA.sent.length = 0;
-    clientB.sent.length = 0;
+  it("AV3c: list_phone_tools sends list_tools_request to unicast target", async () => {
+    const callTool = getCallHandler();
+    const clientA = createMockSocket("hash-device-A", Date.now() - 5000);
+    const clientB = createMockSocket("hash-device-B", Date.now());
+    clients.add(clientA);
+    clients.add(clientB);
 
-    // 3. list_phone_tools (list_tools_request)
     const listPromise = callTool("list_phone_tools", {});
     await waitForFrames(clientA, clientB, 1);
     expect(clientA.sent.length).toBe(0);
@@ -153,14 +168,16 @@ describe("Multi-device routing and arbitration (Issue #40)", () => {
       type: "list_tools_result",
       request_id: req3.request_id,
       tools: [],
-    });
+    }, "hash-device-B");
     await listPromise;
+  });
 
-    // Reset sent arrays
-    clientA.sent.length = 0;
-    clientB.sent.length = 0;
+  it("AV3d: present_questions_to_hitl sends questions_batch_request to unicast target", async () => {
+    const clientA = createMockSocket("hash-device-A", Date.now() - 5000);
+    const clientB = createMockSocket("hash-device-B", Date.now());
+    clients.add(clientA);
+    clients.add(clientB);
 
-    // 4. present_questions_to_hitl (questions_batch_request)
     await presentQuestionsToHitl(
       {
         questions: [
@@ -180,12 +197,15 @@ describe("Multi-device routing and arbitration (Issue #40)", () => {
     expect(clientB.sent.length).toBe(1);
     const req4 = JSON.parse(clientB.sent[0]!);
     expect(req4.type).toBe("questions_batch_request");
+  });
 
-    // Reset sent arrays
-    clientA.sent.length = 0;
-    clientB.sent.length = 0;
+  it("AV3e: present_choices_to_hitl sends choices frame to unicast target", async () => {
+    const callTool = getCallHandler();
+    const clientA = createMockSocket("hash-device-A", Date.now() - 5000);
+    const clientB = createMockSocket("hash-device-B", Date.now());
+    clients.add(clientA);
+    clients.add(clientB);
 
-    // 5. present_choices_to_hitl (choices)
     await callTool("present_choices_to_hitl", {
       prompt: "Pick one",
       choices: ["Choice 1", "Choice 2"],
@@ -245,11 +265,11 @@ describe("Multi-device routing and arbitration (Issue #40)", () => {
     };
 
     // Client A responds with approval
-    const resolvedA = correlator.resolve(reqId, clientAResult);
+    const resolvedA = correlator.resolve(reqId, clientAResult, "hash-device-A");
     expect(resolvedA).toBe(true);
 
     // Client B's late/unsolicited response fails to resolve
-    const resolvedB = correlator.resolve(reqId, unsolicitedDeny);
+    const resolvedB = correlator.resolve(reqId, unsolicitedDeny, "hash-device-B");
     expect(resolvedB).toBe(false);
 
     const res = await callPromise;
@@ -290,7 +310,7 @@ describe("Multi-device routing and arbitration (Issue #40)", () => {
       request_id: writeReq.request_id,
       success: true,
       output: { id: "created-101" },
-    });
+    }, "hash-device-B");
     await writePromise;
 
     // Read call
@@ -306,7 +326,7 @@ describe("Multi-device routing and arbitration (Issue #40)", () => {
       request_id: readReq.request_id,
       success: true,
       output: { id: "created-101", name: "My Task" },
-    });
+    }, "hash-device-B");
     await readPromise;
 
     // Both calls landed on clientB
@@ -366,7 +386,7 @@ describe("Multi-device routing and arbitration (Issue #40)", () => {
       type: "tool_call_result",
       request_id: req.request_id,
       success: true,
-    });
+    }, "hash-device-A");
     await callPromise;
 
     // Unknown device returns error

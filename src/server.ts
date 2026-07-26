@@ -837,7 +837,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
   }
 
-  if (req.params.name === "push_file") {
+    if (req.params.name === "push_file") {
     const localPath = args.local_path as string | undefined;
     const dest = args.dest as string | undefined;
     const overwrite = args.overwrite as boolean | undefined;

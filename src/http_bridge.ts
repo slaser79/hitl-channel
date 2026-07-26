@@ -43,11 +43,18 @@ export function getMostRecentlyActiveClient(targetDevice?: string): HitlWebSocke
   if (openClients.length === 0) return undefined;
 
   if (targetDevice) {
-    const matched = openClients.find((ws) => {
+    const exact = openClients.find((ws) => ws.data?.tokenHash === targetDevice);
+    if (exact) return exact;
+
+    const prefixMatches = openClients.filter((ws) => {
       const hash = ws.data?.tokenHash;
-      return hash && (hash === targetDevice || hash.startsWith(targetDevice));
+      return hash && hash.startsWith(targetDevice);
     });
-    return matched;
+
+    if (prefixMatches.length === 1) {
+      return prefixMatches[0];
+    }
+    return undefined;
   }
 
   // Sort by lastSeen descending
