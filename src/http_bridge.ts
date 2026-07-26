@@ -1,7 +1,7 @@
 import { basename, join, resolve } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { sendChannelNotification } from "./notification.js";
-import { HitlAttachment, HitlMessage, HitlWebSocket, ReplyPayload } from "./types.js";
+import { HitlAttachment, HitlMessage, HitlWebSocket, HitlWebSocketData, ReplyPayload } from "./types.js";
 import { createPairingRequest, consumePairingCode, validatePairingCode } from "./pairing.js";
 import { addToAllowlist, isTokenAllowed, hashToken } from "./allowlist.js";
 import { getIdentity } from "./identity.js";
@@ -29,20 +29,130 @@ function wsSendAccepted(ws: HitlWebSocket, data: string): boolean {
   }
 }
 
-/**
- * Broadcast a JSON frame to every connected phone WS. Used by `call_phone_tool`
- * / `list_phone_tools` to push a request frame. Returns the number of clients
- * the frame was actually delivered to.
- */
-export function broadcastFrame(frame: Record<string, unknown>): number {
-  const raw = JSON.stringify(frame);
-  let count = 0;
-  for (const ws of clients) {
-    if (ws.readyState === 1 && wsSendAccepted(ws, raw)) {
-      count++;
+export interface UnicastResult {
+  delivered: boolean;
+  targetDevice?: string;
+  error?: string;
+}
+
+export type CorrelatedUnicastResult<T> =
+  | {
+      delivered: true;
+      targetDevice?: string;
+      waiter: Promise<T>;
     }
+  | {
+      delivered: false;
+      targetDevice?: string;
+      error: string;
+    };
+
+/**
+ * Find the most-recently-active connected client, or target a specific device by tokenHash.
+ */
+export function getMostRecentlyActiveClient(targetDevice?: string): HitlWebSocket | undefined {
+  const openClients = Array.from(clients).filter((ws) => ws.readyState === 1);
+  if (openClients.length === 0) return undefined;
+
+  if (targetDevice) {
+    const exact = openClients.find((ws) => ws.data?.tokenHash === targetDevice);
+    if (exact) return exact;
+
+    const prefixMatches = openClients.filter((ws) => {
+      const hash = ws.data?.tokenHash;
+      return hash && hash.startsWith(targetDevice);
+    });
+
+    if (prefixMatches.length === 1) {
+      return prefixMatches[0];
+    }
+    return undefined;
   }
-  return count;
+
+  // Sort by lastSeen descending
+  openClients.sort((a, b) => {
+    const tA = a.data?.lastSeen ? new Date(a.data.lastSeen).getTime() : 0;
+    const tB = b.data?.lastSeen ? new Date(b.data.lastSeen).getTime() : 0;
+    return tB - tA;
+  });
+  return openClients[0];
+}
+
+/**
+ * Unicast a JSON request-shaped (Class B) frame to a single targeted client.
+ * If `targetDevice` is omitted, targets the most-recently-active connected client.
+ */
+export function unicastFrame(frame: Record<string, unknown>, targetDevice?: string): UnicastResult {
+  const client = getMostRecentlyActiveClient(targetDevice);
+  if (!client) {
+    return {
+      delivered: false,
+      error: targetDevice
+        ? `device '${targetDevice}' not found or not connected`
+        : "no_phone_connected",
+    };
+  }
+  const raw = JSON.stringify(frame);
+  const ok = wsSendAccepted(client, raw);
+  const deviceId = client.data?.tokenHash ?? "unknown";
+  return {
+    delivered: ok,
+    targetDevice: deviceId,
+    ...(ok ? {} : { error: `failed to send frame to device ${deviceId}` }),
+  };
+}
+
+/**
+ * Select one client, register its full device ID with the correlator, then send
+ * on that same socket. Keeping these operations together prevents both a
+ * second-selection race and a fast response arriving before registration.
+ */
+export function unicastCorrelatedFrame<T>(
+  frame: Record<string, unknown>,
+  requestId: string,
+  timeoutMs: number,
+  targetDevice?: string,
+): CorrelatedUnicastResult<T> {
+  const client = getMostRecentlyActiveClient(targetDevice);
+  if (!client) {
+    return {
+      delivered: false,
+      error: targetDevice
+        ? `device '${targetDevice}' not found or not connected`
+        : "no_phone_connected",
+    };
+  }
+
+  const deviceId = client.data?.tokenHash;
+  const waiter = correlator.register<T>(requestId, timeoutMs, deviceId);
+  // A failed synchronous send rejects below before the caller can await.
+  waiter.catch(() => {});
+
+  const ok = wsSendAccepted(client, JSON.stringify(frame));
+  if (!ok) {
+    const error = `failed to send frame to device ${deviceId ?? "unknown"}`;
+    correlator.reject(requestId, new Error(error));
+    return {
+      delivered: false,
+      targetDevice: deviceId,
+      error,
+    };
+  }
+
+  return {
+    delivered: true,
+    targetDevice: deviceId,
+    waiter,
+  };
+}
+
+/**
+ * Class B request frame delivery — unicasts to exactly one client.
+ * Wrapper around `unicastFrame` for compatibility with callers.
+ */
+export function broadcastFrame(frame: Record<string, unknown>, targetDevice?: string): number {
+  const result = unicastFrame(frame, targetDevice);
+  return result.delivered ? 1 : 0;
 }
 
 /**
@@ -320,7 +430,7 @@ export function startHttpBridge(mcp: Server) {
   const port = Number(process.env.HITL_CHANNEL_PORT ?? 8789);
 
   process.stderr.write(`[hitl-channel] Starting HTTP bridge on http://0.0.0.0:${port}\n`);
-  return Bun.serve({
+  return Bun.serve<HitlWebSocketData>({
     port: port,
     hostname: "0.0.0.0",
     async fetch(req, server) {
@@ -438,7 +548,17 @@ export function startHttpBridge(mcp: Server) {
 
       // WebSocket upgrade
       if (url.pathname === "/ws") {
-        if (server.upgrade(req)) return undefined;
+        const authHeader = req.headers.get("authorization");
+        const urlToken = url.searchParams.get("token");
+        let rawToken: string | undefined;
+        if (authHeader?.startsWith("Bearer ")) {
+          rawToken = authHeader.slice(7);
+        } else if (urlToken) {
+          rawToken = urlToken;
+        }
+        const tokenHash = rawToken ? hashToken(rawToken) : undefined;
+        const nowIso = new Date().toISOString();
+        if (server.upgrade(req, { data: { tokenHash, connectedAt: nowIso, lastSeen: nowIso } })) return undefined;
         return new Response("WebSocket upgrade failed", { status: 400 });
       }
 
@@ -593,8 +713,12 @@ export function startHttpBridge(mcp: Server) {
       idleTimeout: 15,
       open(ws) {
         const typedWs = ws as unknown as HitlWebSocket;
+        if (!typedWs.data) typedWs.data = {};
+        const nowIso = new Date().toISOString();
+        if (!typedWs.data.connectedAt) typedWs.data.connectedAt = nowIso;
+        typedWs.data.lastSeen = nowIso;
         clients.add(typedWs);
-        process.stderr.write(`[hitl-channel] Client connected (${clients.size} total)\n`);
+        process.stderr.write(`[hitl-channel] Client connected (${clients.size} total, device: ${typedWs.data.tokenHash ?? "unknown"})\n`);
         // SPEC-HITL-CC-001 Phase 4 AC#26 — replay queued replies to this
         // client. drainBufferToClient invokes drainBufferToClientSync first
         // (no awaits before the ws.send loop), so all sends complete before
@@ -615,8 +739,13 @@ export function startHttpBridge(mcp: Server) {
         clients.delete(ws as unknown as HitlWebSocket);
         process.stderr.write(`[hitl-channel] Client disconnected (${clients.size} total)\n`);
       },
-      message(_ws, raw) {
+      message(ws, raw) {
         try {
+          const typedWs = ws as unknown as HitlWebSocket;
+          if (!typedWs.data) typedWs.data = {};
+          typedWs.data.lastSeen = new Date().toISOString();
+          const senderDeviceId = typedWs.data.tokenHash ?? "unknown";
+
           const data = JSON.parse(String(raw)) as Record<string, unknown> & HitlMessage;
           // SPEC-HITL-CC-001 §4.2 — `type`-first routing: control frames must
           // never fall through to the chat-notification path. A
@@ -665,10 +794,58 @@ export function startHttpBridge(mcp: Server) {
                 return;
               }
             }
-            const resolved = correlator.resolve(reqId, data);
+            const targetDevice = correlator.getTargetDevice(reqId);
+            if (
+              targetDevice &&
+              senderDeviceId &&
+              targetDevice !== senderDeviceId &&
+              !senderDeviceId.startsWith(targetDevice)
+            ) {
+              process.stderr.write(
+                `[hitl-channel] WARN ${frameType} for request_id ${reqId} received from non-target device ${senderDeviceId} (expected ${targetDevice}) — dropped\n`
+              );
+              appendAudit({
+                ts: new Date().toISOString(),
+                instance_id: process.env.HITL_INSTANCE_ID ?? "unknown",
+                direction: "phone_returns_to_cc",
+                kind: frameType === "questions_batch_result" ? "questions_batch" : "tool_result",
+                tool_name: frameType === "tool_call_result" ? (typeof data.tool_name === "string" ? data.tool_name : null) : null,
+                approval: frameType === "tool_call_result" ? (((data.approval as unknown) as "auto" | "user_approved" | "user_denied" | "timeout" | null) ?? null) : null,
+                prompt_hash: sha256Hex(stableStringify(data)),
+                duration_ms: null,
+                attachment_count: 0,
+                attachment_bytes: 0,
+                device_id: senderDeviceId,
+              }).catch((err) =>
+                process.stderr.write(
+                  `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
+                )
+              );
+              return;
+            }
+
+            const resolved = correlator.resolve(reqId, data, senderDeviceId);
             if (!resolved) {
               process.stderr.write(
-                `[hitl-channel] WARN ${frameType} for unknown request_id ${reqId} — dropped\n`
+                `[hitl-channel] WARN ${frameType} for unknown request_id ${reqId} from device ${senderDeviceId} — dropped\n`
+              );
+              // Audit dropped duplicate/unsolicited frame with sender device id
+              appendAudit({
+                ts: new Date().toISOString(),
+                instance_id: process.env.HITL_INSTANCE_ID ?? "unknown",
+                direction: "phone_returns_to_cc",
+                kind: frameType === "questions_batch_result" ? "questions_batch" : "tool_result",
+                tool_name: frameType === "tool_call_result" ? (typeof data.tool_name === "string" ? data.tool_name : null) : null,
+                approval: frameType === "tool_call_result" ? (((data.approval as unknown) as "auto" | "user_approved" | "user_denied" | "timeout" | null) ?? null) : null,
+                prompt_hash: sha256Hex(stableStringify(data)),
+                duration_ms: null,
+                attachment_count: 0,
+                attachment_bytes: 0,
+                device_id: senderDeviceId,
+              }).catch((err) =>
+                process.stderr.write(
+                  `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
+                )
               );
               return;
             }
@@ -690,6 +867,7 @@ export function startHttpBridge(mcp: Server) {
                 duration_ms: null,
                 attachment_count: 0,
                 attachment_bytes: 0,
+                device_id: senderDeviceId,
               }).catch((err) =>
                 process.stderr.write(
                   `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
@@ -701,21 +879,10 @@ export function startHttpBridge(mcp: Server) {
             // attachment count/bytes from the `tool_call_result` frame BEFORE
             // emitting the audit line. summariseAttachments handles missing
             // / non-array / non-base64 `data` defensively (returns 0/0).
-            // The raw attachments array is NOT included in the audit payload —
-            // the closed-schema appendAudit call below only spreads named
-            // fields, so even if `data.attachments` carried 5 MB of base64
-            // the audit line stays bounded (AC#36 + AC3 of issue #12).
             const { count: attachmentCount, bytes: attachmentBytes } =
               frameType === "tool_call_result"
                 ? summariseAttachments((data as { attachments?: unknown }).attachments)
                 : { count: 0, bytes: 0 };
-            // Hash only `output` for tool_call_result (matches the CC-side
-            // emit in server.ts → consistent prompt_hash across both audit
-            // rows for the same logical event). Hashing the whole frame
-            // would pull large base64 attachments into the sha256 input and
-            // risk an event-loop stall / memory spike on multi-MB images.
-            // list_tools_result has no `output` field, so for that branch
-            // we hash the (small) frame itself.
             const hashSource =
               frameType === "tool_call_result"
                 ? stableStringify((data as { output?: unknown }).output ?? null)
@@ -738,6 +905,7 @@ export function startHttpBridge(mcp: Server) {
               duration_ms: null,
               attachment_count: attachmentCount,
               attachment_bytes: attachmentBytes,
+              device_id: senderDeviceId,
             }).catch((err) =>
               process.stderr.write(
                 `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
@@ -749,7 +917,6 @@ export function startHttpBridge(mcp: Server) {
           const message = data.message?.trim() || data.content?.trim();
           if (message || (data.attachments && data.attachments.length > 0)) {
             // Parity with POST /: real attachment_count/bytes via summariseAttachments
-            // (was hardcoded 0/0 — audit overstated delivery of dropped files, #36 AV5).
             const { count: chatAttachmentCount, bytes: chatAttachmentBytes } =
               summariseAttachments(data.attachments);
             processAttachments(message ?? "", data.attachments)
@@ -775,6 +942,7 @@ export function startHttpBridge(mcp: Server) {
               duration_ms: null,
               attachment_count: chatAttachmentCount,
               attachment_bytes: chatAttachmentBytes,
+              device_id: senderDeviceId,
             }).catch((err) =>
               process.stderr.write(
                 `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`

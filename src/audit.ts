@@ -55,6 +55,7 @@ export interface AuditEvent {
   // be 0. If/when that changes, extract the same way for symmetry.
   attachment_count: number;      // count of attachments on the source frame
   attachment_bytes: number;      // sum of DECODED bytes across attachments
+  device_id?: string | null;     // optional token hash / device identifier
 }
 
 function utcDateStamp(date = new Date()): string {

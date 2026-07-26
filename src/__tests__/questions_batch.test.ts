@@ -6,6 +6,7 @@ import {
   validateQuestionsArgs,
 } from "../questions_batch.js";
 import type { AuditEvent } from "../audit.js";
+import type { UnicastResult } from "../http_bridge.js";
 import type { QuestionsBatchRequestFrame } from "../types.js";
 
 const validQuestion = () => ({
@@ -21,9 +22,12 @@ function makeHandlerDeps() {
   let nextRequestId = "req-fixed-uuid";
   const deps = {
     correlator,
-    broadcastFrame: (frame: Record<string, unknown>) => {
+    unicastFrame: (
+      frame: Record<string, unknown>,
+      _targetDevice?: string,
+    ): UnicastResult => {
       emittedFrames.push(frame);
-      return 1;
+      return { delivered: true, targetDevice: "hash-device-full" };
     },
     clientsSize: () => 1,
     instanceId: "instance-test",
@@ -156,15 +160,33 @@ describe("presentQuestionsToHitl handler (SPEC-AW-311 fire-and-forget)", () => {
     expect(auditRows[0]!.attachment_count).toBe(0);
     expect(auditRows[0]!.attachment_bytes).toBe(0);
     expect(auditRows[0]!.prompt_hash.length).toBe(64);
+    expect(auditRows[0]!.device_id).toBe("hash-device-full");
   });
 
-  it("returns no_phone_connected error when broadcastFrame delivers to zero clients", async () => {
+  it("audits the resolved full device ID instead of the caller's prefix", async () => {
+    const { auditRows, deps } = makeHandlerDeps();
+    let receivedSelector: string | undefined;
+    deps.unicastFrame = (_frame, targetDevice) => {
+      receivedSelector = targetDevice;
+      return { delivered: true, targetDevice: "hash-device-full" };
+    };
+
+    await presentQuestionsToHitl(
+      { questions: [validQuestion()], device: "hash-dev" },
+      deps,
+    );
+
+    expect(receivedSelector).toBe("hash-dev");
+    expect(auditRows[0]!.device_id).toBe("hash-device-full");
+  });
+
+  it("returns no_phone_connected error when unicastFrame delivers to zero clients", async () => {
     const { correlator, emittedFrames, deps } = makeHandlerDeps();
-    // Override broadcastFrame to simulate zero delivery (phone disconnected
+    // Override unicastFrame to simulate zero delivery (phone disconnected
     // after the clientsSize() pre-check).
-    deps.broadcastFrame = (frame) => {
+    deps.unicastFrame = (frame) => {
       emittedFrames.push(frame);
-      return 0;
+      return { delivered: false, error: "no_phone_connected" };
     };
     const result = await presentQuestionsToHitl(
       { questions: [validQuestion()] },

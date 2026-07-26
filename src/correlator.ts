@@ -15,6 +15,7 @@ export class FrameCorrelator {
       resolve: (payload: unknown) => void;
       reject: (err: Error) => void;
       timer: ReturnType<typeof setTimeout>;
+      targetDevice?: string;
     }
   >();
 
@@ -25,30 +26,48 @@ export class FrameCorrelator {
    * Throws synchronously if `reqId` is already registered — callers must
    * generate fresh UUIDs per request.
    */
-  register<T = unknown>(reqId: string, timeoutMs: number): Promise<T> {
+  register<T = unknown>(reqId: string, timeoutMs: number, targetDevice?: string): Promise<T> {
     if (this.pending.has(reqId)) {
       throw new Error(`correlator: duplicate request_id ${reqId}`);
     }
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(reqId);
-        reject(new Error(`timeout after ${timeoutMs}ms (request_id=${reqId})`));
+        const devMsg = targetDevice ? ` on device ${targetDevice}` : "";
+        reject(new Error(`timeout after ${timeoutMs}ms${devMsg} (request_id=${reqId})`));
       }, timeoutMs);
       this.pending.set(reqId, {
         resolve: (payload) => resolve(payload as T),
         reject,
         timer,
+        targetDevice,
       });
     });
   }
 
   /**
-   * Resolve a pending request. Returns `true` if a waiter was resolved,
-   * `false` if the reqId was unknown or already settled.
+   * Get the registered target device ID for a pending request, if any.
    */
-  resolve(reqId: string, payload: unknown): boolean {
+  getTargetDevice(reqId: string): string | undefined {
+    return this.pending.get(reqId)?.targetDevice;
+  }
+
+  /**
+   * Resolve a pending request. Returns `true` if a waiter was resolved,
+   * `false` if the reqId was unknown, already settled, or sent by a non-target device.
+   */
+  resolve(reqId: string, payload: unknown, senderDeviceId?: string): boolean {
     const entry = this.pending.get(reqId);
     if (!entry) return false;
+    if (entry.targetDevice) {
+      if (!senderDeviceId) return false;
+      const target = entry.targetDevice;
+      const matches =
+        senderDeviceId === target ||
+        senderDeviceId.startsWith(target) ||
+        target.startsWith(senderDeviceId);
+      if (!matches) return false;
+    }
     clearTimeout(entry.timer);
     this.pending.delete(reqId);
     entry.resolve(payload);

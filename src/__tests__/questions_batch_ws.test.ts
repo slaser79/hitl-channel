@@ -140,7 +140,7 @@ describe("hitl-channel WS routing for SPEC-HC-004", () => {
       { questions: [{ header: "Mode", question: "Q", choices: ["A", "B"] }] },
       {
         correlator: new FrameCorrelator(),
-        broadcastFrame: () => 0,
+        unicastFrame: () => ({ delivered: false, error: "no_phone_connected" }),
         clientsSize: () => 0,
         instanceId: "test",
         generateRequestId: () => "id",

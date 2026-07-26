@@ -20,6 +20,7 @@
  */
 import { appendAudit, sha256Hex, stableStringify } from "./audit.js";
 import type { FrameCorrelator } from "./correlator.js";
+import type { UnicastResult } from "./http_bridge.js";
 import type {
   QuestionSpec,
   QuestionsBatchRequestFrame,
@@ -69,6 +70,10 @@ export const PRESENT_QUESTIONS_TOOL_DEFINITION = {
       timeout_seconds: {
         type: "number",
         description: `Round-trip timeout. Default ${DEFAULT_TIMEOUT_S}, hard cap ${HARD_CAP_TIMEOUT_S}.`,
+      },
+      device: {
+        type: "string",
+        description: "Optional device token hash or device ID to target a specific connected phone.",
       },
     },
     required: ["questions"],
@@ -185,7 +190,7 @@ export function validateQuestionsArgs(
 
 export interface PresentQuestionsDeps {
   correlator: FrameCorrelator;
-  broadcastFrame: (frame: Record<string, unknown>) => number;
+  unicastFrame: (frame: Record<string, unknown>, targetDevice?: string) => UnicastResult;
   clientsSize: () => number;
   instanceId: string;
   generateRequestId: () => string;
@@ -228,6 +233,7 @@ export async function presentQuestionsToHitl(
     };
   }
 
+  const targetDevice = typeof args.device === "string" ? args.device : undefined;
   const requestId = deps.generateRequestId();
   const ts = now().toISOString();
   const frame: QuestionsBatchRequestFrame = {
@@ -236,6 +242,11 @@ export async function presentQuestionsToHitl(
     questions: v.questions,
     ts,
   };
+
+  const unicastResult = deps.unicastFrame(
+    frame as unknown as Record<string, unknown>,
+    targetDevice,
+  );
 
   audit({
     ts,
@@ -248,26 +259,13 @@ export async function presentQuestionsToHitl(
     duration_ms: null,
     attachment_count: 0,
     attachment_bytes: 0,
+    device_id: unicastResult.targetDevice ?? null,
   }).catch((err) =>
     process.stderr.write(
       `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
     )
   );
-
-  // SPEC-AW-311 — fire-and-forget dispatch (matches `present_choices_to_hitl`
-  // in server.ts:383). The previous synchronous `correlator.register + await
-  // waiter` pattern blocked the agent's MCP call for the full
-  // `timeout_seconds` window (up to 15 min) because the phone-side response
-  // never reaches the correlator: `claudeCodeService.sendMessage` POSTs to
-  // `/` (notification path) and only inbound WS frames trigger
-  // `correlator.resolve`. Returning immediately matches how every other
-  // channel tool behaves; the user's submitted answers surface as a normal
-  // channel notification on the next agent turn (carries the same
-  // `request_id` so callers can correlate if they care).
-  const delivered = deps.broadcastFrame(
-    frame as unknown as Record<string, unknown>,
-  );
-  if (delivered === 0) {
+  if (!unicastResult.delivered) {
     return {
       isError: true,
       content: [
