@@ -457,7 +457,20 @@ export function startHttpBridge(mcp: Server) {
             const senderId = String(body.sender_id ?? "unknown");
             const agentId = body.agent_id ? String(body.agent_id) : undefined;
             const attachments = body.attachments;
-            const metadata = body.metadata;
+            // The phone client flattens response metadata into the top-level
+            // POST envelope. Keep accepting the legacy nested shape while
+            // normalising the real wire shape for downstream formatting,
+            // notification metadata, and audit classification.
+            const metadata = body.metadata ?? (
+              typeof body.type === "string" && body.type !== "user_message"
+                ? {
+                    type: body.type,
+                    batch_id: body.batch_id,
+                    batch_answer: body.batch_answer,
+                    cancelled: body.cancelled,
+                  }
+                : undefined
+            );
 
             if (!message.trim() && (!attachments || attachments.length === 0)) {
               return new Response(

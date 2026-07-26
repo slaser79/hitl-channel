@@ -12,6 +12,10 @@ export interface HitlMessage {
   agent_id?: string;
   attachments?: HitlAttachment[];
   metadata?: Record<string, any>;
+  type?: string;
+  batch_id?: string;
+  batch_answer?: Record<string, any>;
+  cancelled?: boolean;
 }
 
 export interface ChannelMeta {
