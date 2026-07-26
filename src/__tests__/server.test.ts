@@ -123,6 +123,45 @@ describe("hitl-channel HTTP Bridge", () => {
     expect(JSON.parse(lastNotification.params.meta.batch_answer)).toEqual(payload.metadata.batch_answer);
   });
 
+  it("POST / should format the phone client's flat questions_batch_response envelope", async () => {
+    lastNotification = null;
+    const payload = {
+      type: "questions_batch_response",
+      content: "Submitted 2 answers",
+      batch_id: "req-flat-820cdda6",
+      batch_answer: {
+        answers: [
+          { header: "Horizon", selected: ["Both"] },
+          { header: "Primary win", selected: ["Agents+Automations", "Required-vars"] },
+        ],
+        cancelled: false,
+      },
+      id: "phone-message-123",
+      timestamp: "2026-07-10T12:00:00.000Z",
+    };
+
+    const response = await fetch(`http://127.0.0.1:${TEST_PORT}/`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${TEST_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    expect(response.status).toBe(200);
+    expect(lastNotification).not.toBeNull();
+    expect(lastNotification.params.content).toBe(
+      "Submitted 2 answers — Horizon: [Both]; Primary win: [Agents+Automations, Required-vars]"
+    );
+    expect(lastNotification.params.meta.type).toBe("questions_batch_response");
+    expect(lastNotification.params.meta.batch_id).toBe("req-flat-820cdda6");
+    expect(lastNotification.params.meta.request_id).toBe("req-flat-820cdda6");
+    expect(JSON.parse(lastNotification.params.meta.batch_answer)).toEqual(
+      payload.batch_answer
+    );
+  });
+
   it("POST / with empty message should return 400 Bad Request", async () => {
     const response = await fetch(`http://127.0.0.1:${TEST_PORT}/`, {
       method: "POST",
