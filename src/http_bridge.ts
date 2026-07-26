@@ -728,7 +728,7 @@ export function startHttpBridge(mcp: Server) {
                 return;
               }
             }
-            const resolved = correlator.resolve(reqId, data);
+            const resolved = correlator.resolve(reqId, data, senderDeviceId);
             if (!resolved) {
               process.stderr.write(
                 `[hitl-channel] WARN ${frameType} for unknown request_id ${reqId} from device ${senderDeviceId} — dropped\n`

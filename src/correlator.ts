@@ -15,6 +15,7 @@ export class FrameCorrelator {
       resolve: (payload: unknown) => void;
       reject: (err: Error) => void;
       timer: ReturnType<typeof setTimeout>;
+      targetDevice?: string;
     }
   >();
 
@@ -39,17 +40,21 @@ export class FrameCorrelator {
         resolve: (payload) => resolve(payload as T),
         reject,
         timer,
+        targetDevice,
       });
     });
   }
 
   /**
    * Resolve a pending request. Returns `true` if a waiter was resolved,
-   * `false` if the reqId was unknown or already settled.
+   * `false` if the reqId was unknown, already settled, or sent by a non-target device.
    */
-  resolve(reqId: string, payload: unknown): boolean {
+  resolve(reqId: string, payload: unknown, senderDeviceId?: string): boolean {
     const entry = this.pending.get(reqId);
     if (!entry) return false;
+    if (entry.targetDevice && senderDeviceId && entry.targetDevice !== senderDeviceId) {
+      return false;
+    }
     clearTimeout(entry.timer);
     this.pending.delete(reqId);
     entry.resolve(payload);

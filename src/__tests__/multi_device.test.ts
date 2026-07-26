@@ -257,6 +257,19 @@ describe("Multi-device routing and arbitration (Issue #40)", () => {
     expect(JSON.stringify(res.content)).toContain("user_approved");
   });
 
+  it("Target device verification: non-target senderDeviceId cannot resolve correlator waiter", async () => {
+    const waiter = correlator.register("req-123", 1000, "hash-device-A");
+    // Client B tries to resolve
+    const resB = correlator.resolve("req-123", { success: true }, "hash-device-B");
+    expect(resB).toBe(false);
+
+    // Client A resolves
+    const resA = correlator.resolve("req-123", { success: true }, "hash-device-A");
+    expect(resA).toBe(true);
+    const result = await waiter;
+    expect(result).toEqual({ success: true });
+  });
+
   it("AV8: Read-after-write coherence — write then read resolve to the same active device", async () => {
     const callTool = getCallHandler();
     const clientA = createMockSocket("hash-device-A", Date.now() - 10000);

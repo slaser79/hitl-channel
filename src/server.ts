@@ -582,14 +582,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     const filter = (args.filter as string | undefined) ?? undefined;
     const targetDevice = args.device as string | undefined;
+    const targetClient = getMostRecentlyActiveClient(targetDevice);
+    const targetDeviceId = targetClient?.data?.tokenHash;
     const requestId = generateRequestId();
     const frame = {
       type: "list_tools_request" as const,
       request_id: requestId,
       ...(filter ? { filter } : {}),
     };
+    const waiter = correlator.register<ListToolsResultFrame>(
+      requestId,
+      30_000,
+      targetDeviceId,
+    );
+    waiter.catch(() => {});
     const unicastResult = unicastFrame(frame, targetDevice);
     if (!unicastResult.delivered) {
+      correlator.reject(requestId, new Error(unicastResult.error ?? "no_phone_connected"));
       return {
         isError: true,
         content: [
@@ -600,11 +609,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         ],
       };
     }
-    const waiter = correlator.register<ListToolsResultFrame>(
-      requestId,
-      30_000,
-      unicastResult.targetDevice,
-    );
     try {
       const result = await waiter;
       return {
@@ -663,6 +667,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       Math.max(1, Number.isFinite(rawTimeout) ? rawTimeout : 60),
     );
     const targetDevice = args.device as string | undefined;
+    const targetClient = getMostRecentlyActiveClient(targetDevice);
+    const targetDeviceId = targetClient?.data?.tokenHash;
     const requestId = generateRequestId();
     const frame = {
       type: "tool_call_request" as const,
@@ -674,8 +680,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
     const startedAt = Date.now();
 
+    const waiter = correlator.register<ToolCallResultFrame>(
+      requestId,
+      timeoutSeconds * 1000,
+      targetDeviceId,
+    );
+    waiter.catch(() => {});
+
     const unicastResult = unicastFrame(frame, targetDevice);
     if (!unicastResult.delivered) {
+      correlator.reject(requestId, new Error(unicastResult.error ?? "no_phone_connected"));
       return {
         isError: true,
         content: [
@@ -703,11 +717,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       process.stderr.write(
         `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
       )
-    );
-    const waiter = correlator.register<ToolCallResultFrame>(
-      requestId,
-      timeoutSeconds * 1000,
-      unicastResult.targetDevice,
     );
 
     try {
@@ -1017,6 +1026,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     const targetDevice = args.device as string | undefined;
+    const targetClient = getMostRecentlyActiveClient(targetDevice);
+    const targetDeviceId = targetClient?.data?.tokenHash;
     const timeoutSeconds = 60;
     const requestId = generateRequestId();
     const frame = {
@@ -1030,8 +1041,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const startedAt = Date.now();
     const inputHash = sha256Hex(stableStringify(phoneToolArgs));
 
+    const waiter = correlator.register<ToolCallResultFrame>(
+      requestId,
+      timeoutSeconds * 1000,
+      targetDeviceId,
+    );
+    waiter.catch(() => {});
+
     const unicastResult = unicastFrame(frame, targetDevice);
     if (!unicastResult.delivered) {
+      correlator.reject(requestId, new Error(unicastResult.error ?? "no_phone_connected"));
       return {
         isError: true,
         content: [
@@ -1060,12 +1079,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       process.stderr.write(
         `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`,
       )
-    );
-
-    const waiter = correlator.register<ToolCallResultFrame>(
-      requestId,
-      timeoutSeconds * 1000,
-      unicastResult.targetDevice,
     );
 
     try {
