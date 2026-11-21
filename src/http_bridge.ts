@@ -610,6 +610,9 @@ export function startHttpBridge(
   target: Server | InboundHandlers,
   opts?: HttpBridgeOptions,
 ) {
+  // Start each bridge with a clean in-memory reply buffer so prior test files or
+  // torn-down bridges in the same process cannot leak un-ACKed replies on WS open.
+  replyBuffer.drain();
   const port =
     opts?.port !== undefined
       ? opts.port

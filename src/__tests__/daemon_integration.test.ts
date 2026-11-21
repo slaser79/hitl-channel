@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { spawnAcpTransport } from "../acp_client.js";
 import { auditDir, sha256Hex, type AuditEvent } from "../audit.js";
 import { parseDaemonArgs, startDaemon, type DaemonHandle } from "../daemon.js";
-import { replyBuffer } from "../http_bridge.js";
+import { broadcastReply, replyBuffer, startHttpBridge } from "../http_bridge.js";
 import { loadIdentity } from "../identity.js";
 import { removeFromAllowlist } from "../allowlist.js";
 
@@ -569,5 +569,36 @@ process.stdout.write("READY\\n");
       }
     }
     expect(alive).toBe(false);
+  });
+
+  it("startHttpBridge drains stale replyBuffer entries on startup", async () => {
+    setupIsolatedEnv();
+    const apiKey = process.env.HITL_CHANNEL_API_KEY = "test-bridge-reset-key";
+    broadcastReply("stale leak from earlier bridge or test");
+    expect(replyBuffer.size()).toBeGreaterThan(0);
+
+    const bridge = startHttpBridge(
+      {
+        async onInbound() {},
+        async onPairingCode() {},
+      },
+      { port: 0 },
+    );
+    cleanups.push(() => bridge.stop(true));
+    expect(replyBuffer.size()).toBe(0);
+
+    const received: Array<Record<string, unknown>> = [];
+    const ws = new WebSocket(`ws://127.0.0.1:${bridge.port}/ws?api_key=${apiKey}`);
+    cleanups.push(() => ws.close());
+    ws.onmessage = (ev) => {
+      received.push(JSON.parse(String(ev.data)) as Record<string, unknown>);
+    };
+    await new Promise<void>((resolve, reject) => {
+      ws.onopen = () => resolve();
+      ws.onerror = (e) => reject(e);
+    });
+    broadcastReply("fresh reply");
+    await waitFor(() => received.some((r) => r.text === "fresh reply"));
+    expect(received.some((r) => r.text === "stale leak from earlier bridge or test")).toBe(false);
   });
 });

@@ -201,17 +201,51 @@ class MinimalWsClient:
             pass
 
 
-def list_child_pids(parent_pid: int) -> list[int]:
-    out = subprocess.check_output(["ps", "-axo", "pid=,ppid="], text=True)
-    children: list[int] = []
+def list_descendants_and_child_pgids(root_pid: int) -> tuple[list[int], set[int]]:
+    """Return all recursive descendant PIDs of root_pid and detached child PGIDs."""
+    out = subprocess.check_output(["ps", "-axo", "pid=,ppid=,pgid="], text=True)
+    children_by_ppid: dict[int, list[int]] = {}
+    pgid_by_pid: dict[int, int] = {}
+    for line in out.splitlines():
+        parts = line.strip().split()
+        if len(parts) != 3:
+            continue
+        pid, ppid, pgid = int(parts[0]), int(parts[1]), int(parts[2])
+        children_by_ppid.setdefault(ppid, []).append(pid)
+        pgid_by_pid[pid] = pgid
+
+    root_pgid = pgid_by_pid.get(root_pid)
+    descendants: list[int] = []
+    child_pgids: set[int] = set()
+    stack = list(children_by_ppid.get(root_pid, []))
+    seen: set[int] = set()
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        descendants.append(cur)
+        cpgid = pgid_by_pid.get(cur)
+        if cpgid is not None and cpgid != root_pgid:
+            child_pgids.add(cpgid)
+        stack.extend(children_by_ppid.get(cur, []))
+    return descendants, child_pgids
+
+
+def find_live_pids_in_pgids(pgids: set[int]) -> list[int]:
+    """Return any live PIDs still belonging to one of pgids."""
+    if not pgids:
+        return []
+    out = subprocess.check_output(["ps", "-axo", "pid=,pgid="], text=True)
+    live: list[int] = []
     for line in out.splitlines():
         parts = line.strip().split()
         if len(parts) != 2:
             continue
-        pid, ppid = int(parts[0]), int(parts[1])
-        if ppid == parent_pid:
-            children.append(pid)
-    return children
+        pid, pgid = int(parts[0]), int(parts[1])
+        if pgid in pgids:
+            live.append(pid)
+    return live
 
 
 def wait_for_reply(
@@ -490,18 +524,21 @@ def main() -> int:
 
         # ── Check 5: SIGTERM clean shutdown + pgid cleanup <= 5s ─────────────────────
         print("[smoke] Step 5: SIGTERM clean shutdown")
-        child_pids_before = list_child_pids(daemon_proc.pid)
+        descendant_pids_before, child_pgids_before = list_descendants_and_child_pgids(daemon_proc.pid)
         daemon_proc.send_signal(signal.SIGTERM)
         exit_code = daemon_proc.wait(timeout=5.0)
         if exit_code != 0:
             raise RuntimeError(f"Daemon exited with non-zero code on SIGTERM: {exit_code}")
-        for cpid in child_pids_before:
+        for dpid in descendant_pids_before:
             try:
-                os.kill(cpid, 0)
-                raise RuntimeError(f"Child pid {cpid} still alive after SIGTERM")
+                os.kill(dpid, 0)
+                raise RuntimeError(f"Descendant pid {dpid} still alive after SIGTERM")
             except ProcessLookupError:
                 pass
-        print("[smoke]   PASS: Daemon and child process group terminated cleanly")
+        surviving_pgid_pids = find_live_pids_in_pgids(child_pgids_before)
+        if surviving_pgid_pids:
+            raise RuntimeError(f"Detached child process group still alive after SIGTERM: {surviving_pgid_pids}")
+        print("[smoke]   PASS: Daemon and all descendant/process-group children terminated cleanly")
         print("CV6_ACP_SMOKE_PASS")
         return 0
     finally:
