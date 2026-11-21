@@ -142,18 +142,18 @@ function evaluateOwnHitlCandidate(
     };
   }
   if (title.length > 0) {
-    if (autoAllowPrefixes.some((prefix) => title.startsWith(`Run ${prefix}`))) {
-      return { decided: true, allowed: true };
-    }
-    if (
+    const matchesRunPrefix = autoAllowPrefixes.some((prefix) =>
+      title.startsWith(`Run ${prefix}`),
+    );
+    const matchesBarePrefix =
       matchBareTitlePrefix &&
-      autoAllowPrefixes.some((prefix) => title.startsWith(prefix)) &&
-      !hasCommandField(candidate.rawInput) &&
-      !hasCommandField(extraRawInput)
-    ) {
-      return { decided: true, allowed: true };
-    }
-    return { decided: true, allowed: false };
+      autoAllowPrefixes.some((prefix) => title.startsWith(prefix));
+    const isShellCommand =
+      hasCommandField(candidate.rawInput) || hasCommandField(extraRawInput);
+    return {
+      decided: true,
+      allowed: (matchesRunPrefix || matchesBarePrefix) && !isShellCommand,
+    };
   }
   return { decided: false, allowed: false };
 }

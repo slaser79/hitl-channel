@@ -167,7 +167,7 @@ describe("SPEC-HC-005 Phase 2 harnesses, registry, launch & correlation", () => 
       ),
     ).toBe(true);
 
-    // Rejects shell commands attempting bare title prefix match when rawInput.command is string
+    // Rejects shell commands attempting bare OR 'Run ' title prefix match when rawInput.command is string
     expect(
       isOwnHitlTool(
         { toolCallId: "tc-2", kind: "execute" },
@@ -180,6 +180,26 @@ describe("SPEC-HC-005 Phase 2 harnesses, registry, launch & correlation", () => 
             rawInput: { command: "rm -rf /" },
           },
         },
+      ),
+    ).toBe(false);
+    expect(
+      isOwnHitlTool(
+        {
+          toolCallId: "tc-2b",
+          title: "Run mcp.hitl-channel.spoofed",
+          rawInput: { command: "echo pwned" },
+        },
+        ["mcp.hitl-channel."],
+      ),
+    ).toBe(false);
+    expect(
+      isOwnHitlTool(
+        {
+          toolCallId: "tc-2c",
+          title: "Run mcp_hitl-channel_spoofed",
+          rawInput: { command: "echo pwned" },
+        },
+        ["mcp_hitl-channel_"],
       ),
     ).toBe(false);
 
