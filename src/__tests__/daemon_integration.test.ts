@@ -490,9 +490,16 @@ describe("Daemon Mode Integration (AV2, AV3, AV5, AV6, AV7, AV9, AV10, AV11, AV1
     await Bun.write(
       runnerScript,
       `
-import { startDaemon } from "${join(import.meta.dir, "..", "daemon.js")}";
+import { startDaemon, type DaemonHandle } from "${join(import.meta.dir, "..", "daemon.js")}";
 import { spawnAcpTransport } from "${join(import.meta.dir, "..", "acp_client.js")}";
-const d = await startDaemon({
+let d: DaemonHandle | undefined;
+let stopping = false;
+process.on("SIGTERM", () => {
+  if (stopping) return;
+  stopping = true;
+  if (d) void d.shutdown().finally(() => process.exit(0));
+});
+d = await startDaemon({
   harness: "agy",
   port: ${port},
   cwd: ${JSON.stringify(dir)},
@@ -506,7 +513,11 @@ const d = await startDaemon({
       env: { FAKE_ACP_LOG_FILE: ${JSON.stringify(logFile)}, FAKE_ACP_SPAWN_GRANDCHILD: "1" },
     }),
 });
-process.on("SIGTERM", () => void d.shutdown().finally(() => process.exit(0)));
+if (stopping) {
+  await d.shutdown();
+  process.exit(0);
+}
+process.stdout.write("READY\\n");
 `,
     );
 
@@ -521,9 +532,15 @@ process.on("SIGTERM", () => void d.shutdown().finally(() => process.exit(0)));
       }
     });
 
-    await waitFor(() =>
-      readFakeAgentLog(logFile).some((e) => e.event === "startup"),
-    );
+    await waitFor(async () => {
+      if (!readFakeAgentLog(logFile).some((e) => e.event === "startup")) return false;
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/health`);
+        return res.status === 200;
+      } catch {
+        return false;
+      }
+    });
     const startup = readFakeAgentLog(logFile).find(
       (e) => e.event === "startup",
     )!;

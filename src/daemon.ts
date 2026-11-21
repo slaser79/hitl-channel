@@ -393,23 +393,34 @@ export async function runDaemonCli(argv: string[]): Promise<void> {
     return;
   }
 
-  const daemon = await startDaemon({
+  let daemon: DaemonHandle | undefined;
+  let exiting = false;
+  let exitRequestedDuringBoot = false;
+  const onSignal = (sig: string) => {
+    if (exiting) return;
+    exiting = true;
+    process.stderr.write(`[hitl-channel] Daemon shutting down on ${sig}\n`);
+    if (!daemon) {
+      exitRequestedDuringBoot = true;
+      return;
+    }
+    void daemon.shutdown().finally(() => process.exit(0));
+  };
+
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
+  process.on("SIGINT", () => onSignal("SIGINT"));
+
+  daemon = await startDaemon({
     harness: parsed.harness,
     port: parsed.port,
     name: parsed.name,
     cwd: parsed.cwd,
   });
 
-  let exiting = false;
-  const onSignal = (sig: string) => {
-    if (exiting) return;
-    exiting = true;
-    process.stderr.write(`[hitl-channel] Daemon shutting down on ${sig}\n`);
-    void daemon.shutdown().finally(() => process.exit(0));
-  };
-
-  process.on("SIGTERM", () => onSignal("SIGTERM"));
-  process.on("SIGINT", () => onSignal("SIGINT"));
+  if (exitRequestedDuringBoot) {
+    await daemon.shutdown();
+    process.exit(0);
+  }
 }
 
 if (import.meta.main) {
