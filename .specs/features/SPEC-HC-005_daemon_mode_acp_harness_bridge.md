@@ -11,7 +11,7 @@ depends_on: ["SPEC-HC-001", "SPEC-HC-002", "SPEC-HC-003", "SPEC-HC-004", "SPEC-H
 
 # Daemon mode — hitl-channel as an ACP client so the phone can drive any harness (agy first)
 
-> **Provenance.** Brainstormed with the CEO via HITL MCP on 2026-11-21. The brief, committed alongside this spec, is `.specs/_pending/BRAINSTORM-hitl-channel-daemon-acp.md`. An `agy acp` spike the same day passed every protocol check this spec relies on (§4.1 "Verified protocol facts"). Revision 2 folds in two independent empire-spec-reviews from the same day (Gemini 4 Neon and Gemini 4 Carbon).
+> **Provenance.** Brainstormed with the CEO via HITL MCP on 2026-11-21. The brief, committed alongside this spec, is `.specs/_pending/BRAINSTORM-hitl-channel-daemon-acp.md`. An `agy acp` spike the same day passed every protocol check this spec relies on (§4.1 "Verified protocol facts"). Revisions 2–3 fold in three rounds of independent empire-spec-review from the same day (Gemini 4 Neon and Gemini 4 Carbon). Both reviewers returned READY FOR CEO in round 3.
 >
 > **Sibling positioning.**
 > - **SPEC-HC-001 / 002 / 003** (pairing, mDNS, channel messaging): *extended*. The phone-facing side is reused. One seam changes (§4.2 item 1).
@@ -28,7 +28,7 @@ Today the phone can only push into, and receive from, a **Claude Code** session.
 - [ ] **From the phone, the CEO can start a brand-new Antigravity session in a chosen folder on a chosen machine and talk to it, without touching the keyboard.** This closes today's gap, where only Claude Code is reachable and only after a terminal session already exists. *(Verified by CV1, CV2.)*
 - [ ] **A remote Antigravity agent controls the phone the same way a Claude Code agent can.** It can list and call phone tools, push files, send images, and present choices. That unlocks desktop agents building local agents on the phone, troubleshooting the app, and running the dev loop. *(Verified by AV6, AV7, CV3.)*
 - [ ] **The CEO approves or denies an agent's risky actions with one tap on the phone**, instead of the session stalling silently on a desktop prompt nobody is watching. *(Verified by AV8, CV4.)*
-- [ ] **Messages never pass through a cloud intermediary.** Phone ↔ machine traffic stays on LAN, Tailscale or the user's own VPN, as with CC channels today, and daemon sessions don't wake the relay-based HITL stop hook. *(Verified by AV11, AV12, CV5.)*
+- [ ] **Messages never pass through a cloud intermediary.** Phone ↔ machine traffic stays on LAN, Tailscale or the user's own VPN, as with CC channels today, and daemon sessions don't wake the relay-based HITL stop hook. *(Verified by AV11, AV12, CV5, CV6.)*
 - [ ] **Existing Claude Code channel users see zero change.** The current `.mcp.json` setup, pairing and chat keep working exactly as before. *(Verified by AV1, AV13.)*
 
 ## 3. User Stories
@@ -157,7 +157,7 @@ Extension-sites checklist results. Each item says why an existing component can 
        onClientOpen?(send: (frame: Record<string, unknown>) => boolean): void,
      }
      ```
-   - **`onInbound`** receives the **raw** attachments before `processAttachments` runs, so daemon mode can build ACP image blocks from the original base64 + MIME. It returns the ACP session id the message was routed to. On both the POST `/` and WS chat paths, the bridge **awaits** `onInbound` before writing its existing inbound audit line, and copies `acpSessionId` into it. This keeps one audit line per inbound message, with the session id attached.
+   - **`onInbound`** receives the **raw** attachments before `processAttachments` runs, so daemon mode can build ACP image blocks from the original base64 + MIME. It returns the ACP session id the message was routed to, **as soon as the message has been dispatched or queued**. It never waits for the agent's turn to finish, so `POST /` stays fast. On both the POST `/` and WS chat paths, the bridge **awaits** `onInbound` before writing its existing inbound audit line, and copies `acpSessionId` into it. This keeps one audit line per inbound message, with the session id attached.
    - **`onClientOpen`** is invoked synchronously inside the WS `open` handler, right after the reply-buffer drain, with a sender bound to that socket. It sends through the bridge's existing accepted-send path. The session manager uses it to re-send pending permission cards (§4.1).
    - **Shared normaliser.** POST `/`'s metadata normalisation (the flat/nested shape and `questions_batch_response` formatting) is extracted into a function that the WS chat path also uses. The phone's `body.id` is carried as `meta.client_message_id`.
    - **Port.** `opts.port` overrides the `HITL_CHANNEL_PORT ?? 8789` default.
@@ -341,7 +341,7 @@ $ grep -n "backgroundGracePeriod" packages/hitl_agents/lib/src/services/claude_c
 - [ ] **AV3** With the fake ACP agent, a plain `POST /` message and a WS chat frame each produce exactly one `session/prompt` to the active session. The text equals what channel mode would deliver, including `questions_batch_response` formatting, which the WS path now shares.
 - [ ] **AV4** An image attachment produces an ACP `{type:"image", data, mimeType}` block built from the original base64 + `media_type`, and is **not** written to the inbox. A non-image file goes through the existing `processAttachments` path, and its saved path appears in the prompt text.
 - [ ] **AV5** Turn and out-of-turn replies:
-  - **In-turn.** Chunks "a", "b", "c" followed by `stopReason: end_turn` produce exactly one `reply` frame with text "abc", routed through the reply buffer/ACK (reconnect-drain replay verified). A turn with no text produces the "(no text output — stopReason: …)" reply.
+  - **In-turn.** Chunks "a", "b", "c" followed by `stopReason: end_turn` produce exactly one `reply` frame with text "abc", routed through the reply buffer/ACK (reconnect-drain replay verified). A turn with no text produces the "(no text output — stopReason: …)" reply, except for an `end_turn` non-delegation turn in which the agent called `reply_to_hitl`; that turn produces no extra reply.
   - **Out-of-turn.** Chunks emitted after the turn ended arrive as a separate standalone reply and are **not** included in the next prompt's reply.
 - [ ] **AV6** Loopback MCP across sessions:
   - **Tool round-trip.** Across **two sequential ACP sessions**, a `call_phone_tool` call reaching the loopback MCP endpoint (preceded by a pre-initialize `server/discover`, which gets a JSON-RPC response) produces a `tool_call_request` WS frame. The matching `tool_call_result` resolves the MCP call with the phone's output.
