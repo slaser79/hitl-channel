@@ -1,7 +1,7 @@
 ---
 id: SPEC-HC-005
 title: "Daemon mode — hitl-channel as an ACP client so the phone can drive any harness (agy first)"
-status: "Draft"
+status: "Approved"
 owner: "hitl-channel"
 created_by: "cos"
 last_updated: 2026-11-21
