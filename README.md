@@ -17,8 +17,9 @@ hitl-channel is a TypeScript MCP server that enables bidirectional communication
 
 ### Prerequisites
 
-- [Bun](https://bun.sh) (recommended) or Node.js 20+
-- Claude Code v2.1.80+ (channels require research preview)
+- [Bun](https://bun.sh) (recommended; required for `daemon` mode) or Node.js 20+ (Claude Code channel mode)
+- **Channel mode:** Claude Code v2.1.80+ (channels require research preview)
+- **Daemon mode (`--harness agy`):** Antigravity CLI (`agy` supporting `agy acp`) on `PATH`, plus `hitl-cli` hooks updated for `HITL_DAEMON_SESSION=1` if Antigravity Stop hooks are enabled
 
 ### Install
 
@@ -86,7 +87,9 @@ Claude Code (your terminal)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HITL_CHANNEL_PORT` | `8789` | HTTP/WebSocket bridge port |
+| `HITL_CHANNEL_PORT` | `8789` (`8790` in daemon mode) | HTTP/WebSocket bridge port |
+| `HITL_CHANNEL_NAME` | `<harness>@<hostname>` (daemon mode) | Override instance display name |
+| `HITL_CHANNEL_IDENTITY_FILE` | `~/.hitl/channels/identity.json` (daemon: `identity-daemon-<harness>.json`) | Override identity file path |
 | `HITL_CHANNEL_API_KEY` | (none) | Legacy API key auth (optional) |
 
 ## Data Storage
@@ -128,6 +131,13 @@ bun run src/cli.ts daemon --harness agy
 bun run src/daemon.ts --harness agy --port 8790 --cwd ~/lab/hitl
 ```
 
+### Pairing from the HITL App
+
+1. Confirm `agy` is installed and on `PATH` (`which agy`).
+2. Start the daemon (for example: `bun run src/cli.ts daemon --harness agy --cwd ~/lab/hitl`).
+3. Open the HITL app on your phone, add/discover your host on port `8790` (display name defaults to `agy@<hostname>`), and tap **Pair**.
+4. Enter the 6-digit pairing code shown on daemon `stdout` (`PAIRING CODE: ...`) or in your desktop notification (`osascript` on macOS, `notify-send` on Linux).
+
 ### CLI Options
 
 | Flag | Default | Description |
@@ -146,15 +156,15 @@ bun run src/daemon.ts --harness agy --port 8790 --cwd ~/lab/hitl
 - `/cancel` — cancel any pending approval cards and stop the active turn
 - `/status` — show harness, active session, running state, queue depth, and pending approvals
 
-### Daemon Identity & Storage
+### Daemon Identity & Hook Isolation
 
-- Identity is stored separately from channel mode at `~/.hitl/channels/identity-daemon-<harness>.json` (override with `HITL_CHANNEL_IDENTITY_FILE`), so a daemon and a Claude Code channel session on the same host advertise distinct `instanceId`s.
-- Paired device tokens are shared in `~/.hitl/channels/allowlist.json` (SHA-256 hashed).
-- Pairing codes are printed to `stdout` and surfaced via a local desktop notification (`osascript` on macOS, `notify-send` on Linux).
+- **Separate identity:** Stored at `~/.hitl/channels/identity-daemon-<harness>.json` (override with `HITL_CHANNEL_IDENTITY_FILE`), so a daemon and a Claude Code channel session on the same host advertise distinct `instanceId`s.
+- **Shared allowlist:** Paired device tokens are stored in `~/.hitl/channels/allowlist.json` (SHA-256 hashed).
+- **Stop-hook isolation (`HITL_DAEMON_SESSION=1`):** The daemon sets `HITL_DAEMON_SESSION=1` in spawned `agy acp` subprocess environments. Updated `hitl-cli` Stop hooks (`hitl-hook-review-and-continue`, `review_and_continue_antigravity.py`, and `review_and_continue_wrapper.sh`) check `HITL_DAEMON_SESSION=1` and exit immediately without pinging the cloud relay or blocking turns. Set `HITL_HOOK_DEBUG=1` to log `daemon_session_skip` diagnostic markers.
 
 ### Running at Login on macOS (`launchd`)
 
-Save a plist such as `~/Library/LaunchAgents/com.hitl-channel.daemon.agy.plist`:
+Save a plist such as `~/Library/LaunchAgents/com.hitl-channel.daemon.agy.plist` (replace `/path/to/bun` and `PATH` directories with the locations of `bun` and `agy` on your machine):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -175,6 +185,11 @@ Save a plist such as `~/Library/LaunchAgents/com.hitl-channel.daemon.agy.plist`:
     <string>--cwd</string>
     <string>/Users/you/workspace</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
