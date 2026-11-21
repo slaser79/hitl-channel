@@ -16,6 +16,9 @@ export interface HitlMessage {
   batch_id?: string;
   batch_answer?: Record<string, any>;
   cancelled?: boolean;
+  id?: string;
+  selections?: string[];
+  timestamp?: string;
 }
 
 export interface ChannelMeta {

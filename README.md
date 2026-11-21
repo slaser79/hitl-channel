@@ -117,6 +117,84 @@ bun test
 bun src/server.ts
 ```
 
+## Daemon mode
+
+Run `hitl-channel` as a long-lived daemon to drive non-Claude ACP harnesses (Antigravity `agy` in Phase 1) directly from the HITL phone over LAN or Tailscale, without a cloud intermediary:
+
+```bash
+# Default port 8790, display name agy@<hostname>
+bun run src/cli.ts daemon --harness agy
+# or directly:
+bun run src/daemon.ts --harness agy --port 8790 --cwd ~/lab/hitl
+```
+
+### CLI Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--harness <name>` | `agy` | ACP harness to spawn (`agy` in Phase 1) |
+| `--port <port>` | `8790` (or `HITL_CHANNEL_PORT`) | HTTP/WS bridge listen port |
+| `--name <displayName>` | `<harness>@<hostname>` | Override instance display name |
+| `--cwd <dir>` | current working directory | Default directory for auto-created / `/new` sessions |
+
+### Phone Chat Slash Commands
+
+- `/help` — show supported daemon commands
+- `/new [harness] [cwd]` — create and switch to a new session (default cwd if omitted; Phase 1 harness: `agy`)
+- `/sessions` — list the 10 most recent sessions with title, folder, and relative time
+- `/resume <n|id>` — resume a session from `/sessions` (or by session ID)
+- `/cancel` — cancel any pending approval cards and stop the active turn
+- `/status` — show harness, active session, running state, queue depth, and pending approvals
+
+### Daemon Identity & Storage
+
+- Identity is stored separately from channel mode at `~/.hitl/channels/identity-daemon-<harness>.json` (override with `HITL_CHANNEL_IDENTITY_FILE`), so a daemon and a Claude Code channel session on the same host advertise distinct `instanceId`s.
+- Paired device tokens are shared in `~/.hitl/channels/allowlist.json` (SHA-256 hashed).
+- Pairing codes are printed to `stdout` and surfaced via a local desktop notification (`osascript` on macOS, `notify-send` on Linux).
+
+### Running at Login on macOS (`launchd`)
+
+Save a plist such as `~/Library/LaunchAgents/com.hitl-channel.daemon.agy.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hitl-channel.daemon.agy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/bun</string>
+    <string>run</string>
+    <string>/path/to/hitl-channel/src/daemon.ts</string>
+    <string>--harness</string>
+    <string>agy</string>
+    <string>--port</string>
+    <string>8790</string>
+    <string>--cwd</string>
+    <string>/Users/you/workspace</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/hitl-channel-daemon-agy.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/hitl-channel-daemon-agy.err.log</string>
+</dict>
+</plist>
+```
+
+Load it with `launchctl load ~/Library/LaunchAgents/com.hitl-channel.daemon.agy.plist`.
+
+### Wire Smoke (`agy acp`)
+
+```bash
+python3 scripts/acp_smoke.py
+```
+
 ## Related Projects
 
 - [hitl-cli](https://github.com/slaser79/hitl-cli) — Python CLI/SDK for relay-based HITL (via hitlrelay.app)
