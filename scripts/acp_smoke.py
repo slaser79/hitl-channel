@@ -573,17 +573,34 @@ def main() -> int:
         # ── Check 5: SIGTERM clean shutdown + pgid cleanup <= 5s ─────────────────────
         print("[smoke] Step 5: SIGTERM clean shutdown")
         descendant_pids_before, child_pgids_before = list_descendants_and_child_pgids(daemon_proc.pid)
+        shutdown_deadline = time.time() + 5.0
         daemon_proc.send_signal(signal.SIGTERM)
         exit_code = daemon_proc.wait(timeout=5.0)
         if exit_code != 0:
             raise RuntimeError(f"Daemon exited with non-zero code on SIGTERM: {exit_code}")
-        for dpid in descendant_pids_before:
-            try:
-                os.kill(dpid, 0)
-                raise RuntimeError(f"Descendant pid {dpid} still alive after SIGTERM")
-            except ProcessLookupError:
-                pass
-        surviving_pgid_pids = find_live_pids_in_pgids(child_pgids_before)
+
+        # Detached grandchild stdio children (e.g. mcp-shim or harness MCP children) may
+        # tear down via stdin EOF a few milliseconds after the main daemon exits. Poll up
+        # to the 5s shutdown budget before reporting leaked PIDs/PGIDs.
+        surviving_descendants: list[int] = []
+        surviving_pgid_pids: list[int] = []
+        while True:
+            surviving_descendants = []
+            for dpid in descendant_pids_before:
+                try:
+                    os.kill(dpid, 0)
+                    surviving_descendants.append(dpid)
+                except ProcessLookupError:
+                    pass
+            surviving_pgid_pids = find_live_pids_in_pgids(child_pgids_before)
+            if not surviving_descendants and not surviving_pgid_pids:
+                break
+            if time.time() >= shutdown_deadline:
+                break
+            time.sleep(0.05)
+
+        if surviving_descendants:
+            raise RuntimeError(f"Descendant pids still alive after SIGTERM: {surviving_descendants}")
         if surviving_pgid_pids:
             raise RuntimeError(f"Detached child process group still alive after SIGTERM: {surviving_pgid_pids}")
         print("[smoke]   PASS: Daemon and all descendant/process-group children terminated cleanly")
