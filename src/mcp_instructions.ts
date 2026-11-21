@@ -10,16 +10,36 @@
 // EADDRINUSE inside a test that just wants to inspect the strings.
 
 // Phase 1 — production tool bridge standing orders (PR slaser79/hitl-channel#8).
-// Appended to the existing chat-relay instructions so CC defaults to the
-// new path without a paste-in bootstrap prompt.
-export const STANDING_ORDERS = [
+// Split per SPEC-HC-005 §4.2 item 5 into the shared phone-tool core and the
+// mode-specific reply instructions, while keeping STANDING_ORDERS and
+// MCP_INSTRUCTIONS byte-identical for channel mode.
+export const PHONE_TOOL_STANDING_ORDERS = [
   "Treat inbound channel notifications as user queries from the paired HITL phone.",
   "For phone-relevant questions or actions (calendar, contacts, agents, navigation, send/compose, file ops, …),",
   "default to `call_phone_tool(name, arguments)` — see `list_phone_tools()` for the live catalog.",
   "Trust-tier confirms are gated on the phone UI; you do not need to ask the user for yes/no in chat —",
   "the user will tap Approve or Deny on a system sheet and the call returns with `approval:` populated.",
+].join(" ");
+
+export const STANDING_ORDERS = [
+  PHONE_TOOL_STANDING_ORDERS,
   "When you do speak back to the user, use `reply_to_hitl` with the inbound `message_id`.",
   "Requires Claude Code v2.1.80+ for `--dangerously-load-development-channels`.",
+].join(" ");
+
+// SPEC-HC-005 §4.2 item 5 — daemon-mode standing orders appended to the
+// ACP harness system prompt. Your turn's final text is delivered to the phone
+// automatically, and human-in-the-loop relay tools must not be called here.
+export const DAEMON_REPLY_ORDERS = [
+  "Your turn's final text output is delivered to the HITL phone automatically, so do not repeat it through `reply_to_hitl`.",
+  "Use `reply_to_hitl` only for interim progress updates or to send inline image/file attachments.",
+  "When you receive a `<workflow_delegation message_id=X>…</workflow_delegation>` envelope, finish all work FIRST, then end your turn with the final answer.",
+  "Do not use `human-in-the-loop` or cloud relay tools to talk to this user, because this chat is already the channel.",
+].join(" ");
+
+export const DAEMON_INSTRUCTIONS = [
+  PHONE_TOOL_STANDING_ORDERS,
+  DAEMON_REPLY_ORDERS,
 ].join(" ");
 
 // Phase 3 (issue slaser79/hitl-app#4010) — final-reply ceremony for

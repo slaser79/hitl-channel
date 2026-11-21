@@ -194,6 +194,8 @@ export interface PresentQuestionsDeps {
   clientsSize: () => number;
   instanceId: string;
   generateRequestId: () => string;
+  /** Daemon-mode ACP session attribution (omitted in channel mode). */
+  acpSessionId?: string | null;
   /** Test seam — overridden in unit tests to avoid touching the audit file. */
   audit?: typeof appendAudit;
   /** Test seam — overridden in unit tests to control `ts` deterministically. */
@@ -260,6 +262,9 @@ export async function presentQuestionsToHitl(
     attachment_count: 0,
     attachment_bytes: 0,
     device_id: unicastResult.targetDevice ?? null,
+    ...(deps.acpSessionId !== undefined
+      ? { acp_session_id: deps.acpSessionId }
+      : {}),
   }).catch((err) =>
     process.stderr.write(
       `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`

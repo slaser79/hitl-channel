@@ -19,7 +19,8 @@ export type AuditDirection =
   | "phone_to_cc"
   | "cc_to_phone"
   | "cc_calls_phone"
-  | "phone_returns_to_cc";
+  | "phone_returns_to_cc"
+  | "harness_to_phone";
 
 export type AuditKind =
   | "message"
@@ -29,13 +30,15 @@ export type AuditKind =
   | "choices"
   | "tool_call"
   | "tool_result"
-  | "questions_batch";
+  | "questions_batch"
+  | "permission";
 
 export type AuditApproval =
   | "auto"
   | "user_approved"
   | "user_denied"
   | "timeout"
+  | "cancelled"
   | null;
 
 export interface AuditEvent {
@@ -43,8 +46,8 @@ export interface AuditEvent {
   instance_id: string;
   direction: AuditDirection;
   kind: AuditKind;
-  tool_name: string | null;      // null unless kind ∈ {tool_call, tool_result}
-  approval: AuditApproval;       // null unless kind === 'tool_result'
+  tool_name: string | null;      // null unless kind ∈ {tool_call, tool_result, permission}
+  approval: AuditApproval;       // null unless kind ∈ {tool_result, permission}
   prompt_hash: string;           // SHA-256 hex of content / JSON.stringify(arguments)
   duration_ms: number | null;    // null unless this is an outbound result
   // SPEC-HITL-CC-001 Phase 6 carry-forward (issue #12) — attachment metadata
@@ -56,6 +59,7 @@ export interface AuditEvent {
   attachment_count: number;      // count of attachments on the source frame
   attachment_bytes: number;      // sum of DECODED bytes across attachments
   device_id?: string | null;     // optional token hash / device identifier
+  acp_session_id?: string | null; // SPEC-HC-005: daemon-mode ACP session attribution
 }
 
 function utcDateStamp(date = new Date()): string {

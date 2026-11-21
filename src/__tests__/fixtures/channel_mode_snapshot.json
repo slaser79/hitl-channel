@@ -1,0 +1,234 @@
+{
+  "tools": [
+    {
+      "name": "reply_to_hitl",
+      "description": "Send a reply message back to the HITL mobile app user. Pass the message_id from the inbound channel tag for threading. Optionally include image/file attachments — they render inline on the phone CC chat (images = thumbnail + tap-to-zoom; other mime types = filename chip).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The reply text to send back to the HITL app"
+          },
+          "message_id": {
+            "type": "string",
+            "description": "Optional message ID for reply threading"
+          },
+          "agent_id": {
+            "type": "string",
+            "description": "Optional agent identity for multi-instance routing"
+          },
+          "attachments": {
+            "type": "array",
+            "description": "Optional attachments to render in the phone chat bubble. Prefer `path` (absolute filesystem path on the channel host) — the server reads the file and encodes it. Use `data` (base64) only for in-memory bytes you've already encoded. Per-attachment cap 5 MB; per-frame cap 20 MB (decoded). Oversize attachments are dropped phone-side with a warning.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute filesystem path. Channel reads + base64-encodes. If omitted, `data` is required."
+                },
+                "type": {
+                  "type": "string",
+                  "description": "'image' or 'file'. If omitted, inferred from media_type. Image attachments render inline; files render as a filename chip with mime icon."
+                },
+                "media_type": {
+                  "type": "string",
+                  "description": "MIME type (e.g. 'image/png', 'application/pdf'). If omitted with `path`, inferred from file extension."
+                },
+                "data": {
+                  "type": "string",
+                  "description": "Base64-encoded attachment bytes. Ignored if `path` is set."
+                },
+                "fileName": {
+                  "type": "string",
+                  "description": "Optional filename for chip rendering. If omitted with `path`, derived from the path's basename."
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "text"
+        ]
+      }
+    },
+    {
+      "name": "list_devices",
+      "description": "List currently connected HITL mobile devices and their status.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "present_choices_to_hitl",
+      "description": "Present choices to the HITL mobile app user for selection. The user's selection will arrive as an inbound channel message.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "description": "The question or prompt to show the user"
+          },
+          "choices": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "List of choice labels"
+          },
+          "multi_select": {
+            "type": "boolean",
+            "description": "Allow multiple selections (default: false)"
+          },
+          "device": {
+            "type": "string",
+            "description": "Optional device token hash or device ID to target a specific connected phone."
+          }
+        },
+        "required": [
+          "prompt",
+          "choices"
+        ]
+      }
+    },
+    {
+      "name": "list_phone_tools",
+      "description": "List the on-device tools available on the paired HITL phone. Returns the catalog of InternalToolsService tools (~60) with name, description, inputSchema, and trust tier (free | softConfirm | hardConfirm). Excludes UI-flow primitives tagged inAppOnly.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "string",
+            "description": "Optional substring filter on tool name."
+          },
+          "device": {
+            "type": "string",
+            "description": "Optional device token hash or device ID to target a specific connected phone."
+          }
+        }
+      }
+    },
+    {
+      "name": "call_phone_tool",
+      "description": "Invoke an on-device tool on the paired HITL phone (e.g. list_events, compose_email, navigate_to_agent, create_local_agent). Soft/hard-confirm tools surface the existing trust-tier sheet on the phone; the call returns with approval = 'auto' | 'user_approved' | 'user_denied' | 'timeout'. Free-tier tools run silently. Use list_phone_tools() for the live catalog.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Tool name (from list_phone_tools)."
+          },
+          "arguments": {
+            "type": "object",
+            "description": "Tool arguments matching the tool's inputSchema."
+          },
+          "timeout_seconds": {
+            "type": "number",
+            "description": "Round-trip timeout. Default 60, hard cap 300."
+          },
+          "device": {
+            "type": "string",
+            "description": "Optional device token hash or device ID to target a specific connected phone."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "push_file",
+      "description": "Push a text file from the console filesystem to the phone's app storage. Gates the push on-device via a softConfirm approval sheet. Only text files are supported.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "local_path": {
+            "type": "string",
+            "description": "Absolute or relative path to the local file on the console."
+          },
+          "dest": {
+            "type": "string",
+            "description": "Rooted relative path on the phone's storage (e.g. 'skills/my-skill/scripts/board.html', 'documents/notes.txt'). Must be relative/rooted (no arbitrary absolute paths)."
+          },
+          "media_type": {
+            "type": "string",
+            "description": "Optional MIME type. If omitted, inferred from the file extension."
+          },
+          "overwrite": {
+            "type": "boolean",
+            "description": "Whether to overwrite the file on the phone if it already exists (default: true)."
+          },
+          "device": {
+            "type": "string",
+            "description": "Optional device token hash or device ID to target a specific connected phone."
+          }
+        },
+        "required": [
+          "local_path",
+          "dest"
+        ]
+      }
+    },
+    {
+      "name": "present_questions_to_hitl",
+      "description": "Pose 1–4 related questions to the paired HITL phone user in a single round-trip. Returns one structured `{answers, cancelled}` payload. LAN-path sibling of the cloud relay's `request_human_input_multiple`. Each QuestionSpec has {header (≤12 chars), question (≤1000 chars), choices (2–4 strings), optional multi_select, optional allow_other}.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "questions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "properties": {
+                "header": {
+                  "type": "string",
+                  "maxLength": 12
+                },
+                "question": {
+                  "type": "string",
+                  "maxLength": 1000
+                },
+                "choices": {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 4,
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "multi_select": {
+                  "type": "boolean"
+                },
+                "allow_other": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "header",
+                "question",
+                "choices"
+              ]
+            }
+          },
+          "timeout_seconds": {
+            "type": "number",
+            "description": "Round-trip timeout. Default 300, hard cap 900."
+          },
+          "device": {
+            "type": "string",
+            "description": "Optional device token hash or device ID to target a specific connected phone."
+          }
+        },
+        "required": [
+          "questions"
+        ]
+      }
+    }
+  ],
+  "instructions": "Messages from the HITL mobile app arrive as <channel source=\"hitl-channel\" sender_id=\"...\" message_id=\"...\">. Use the reply_to_hitl tool to send responses back to the mobile app user. The sender_id indicates who sent the message (e.g., 'ceo', 'xo'). Treat inbound channel notifications as user queries from the paired HITL phone. For phone-relevant questions or actions (calendar, contacts, agents, navigation, send/compose, file ops, …), default to `call_phone_tool(name, arguments)` — see `list_phone_tools()` for the live catalog. Trust-tier confirms are gated on the phone UI; you do not need to ask the user for yes/no in chat — the user will tap Approve or Deny on a system sheet and the call returns with `approval:` populated. When you do speak back to the user, use `reply_to_hitl` with the inbound `message_id`. Requires Claude Code v2.1.80+ for `--dangerously-load-development-channels`. When you receive an inbound channel notification whose content is wrapped in `<workflow_delegation message_id=X>…</workflow_delegation>` tags, do all your work FIRST, then call `reply_to_hitl(message_id=X, content=<your final answer>)` EXACTLY ONCE. Intermediate calls to `reply_to_hitl(message_id=X, …)` for the same X are dropped by the waiter — only the first matching reply resolves. If you need to chat informally during the delegation (e.g. confirm receipt), use a different message_id or omit message_id; only the message_id matching the delegation envelope counts as the final answer.",
+  "standingOrders": "Treat inbound channel notifications as user queries from the paired HITL phone. For phone-relevant questions or actions (calendar, contacts, agents, navigation, send/compose, file ops, …), default to `call_phone_tool(name, arguments)` — see `list_phone_tools()` for the live catalog. Trust-tier confirms are gated on the phone UI; you do not need to ask the user for yes/no in chat — the user will tap Approve or Deny on a system sheet and the call returns with `approval:` populated. When you do speak back to the user, use `reply_to_hitl` with the inbound `message_id`. Requires Claude Code v2.1.80+ for `--dangerously-load-development-channels`."
+}

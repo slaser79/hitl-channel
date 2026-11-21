@@ -2,8 +2,12 @@
   "name": "hitl-channel",
   "version": "0.0.1",
   "type": "module",
+  "bin": {
+    "hitl-channel": "./src/cli.ts"
+  },
   "scripts": {
     "start": "bun src/server.ts",
+    "daemon": "bun src/daemon.ts",
     "test": "bun test"
   },
   "dependencies": {

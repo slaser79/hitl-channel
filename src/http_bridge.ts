@@ -425,9 +425,217 @@ export async function processAttachments(
   return contentForNotification;
 }
 
-export function startHttpBridge(mcp: Server) {
-  const apiKey = process.env.HITL_CHANNEL_API_KEY ?? "";
-  const port = Number(process.env.HITL_CHANNEL_PORT ?? 8789);
+export interface InboundMessage {
+  text: string;
+  attachments?: HitlAttachment[];
+  meta: Record<string, unknown>;
+}
+
+export interface InboundHandlers {
+  onInbound(input: InboundMessage): Promise<{ acpSessionId?: string | null } | void>;
+  onPairingCode(code: string): void | Promise<void>;
+  onClientOpen?(send: (frame: Record<string, unknown>) => boolean): void;
+}
+
+export interface HttpBridgeOptions {
+  port?: number;
+}
+
+export interface NormalizedInbound {
+  text: string;
+  rawMessage: string;
+  attachments?: HitlAttachment[];
+  metadata?: Record<string, any>;
+  meta: Record<string, unknown>;
+  isEmpty: boolean;
+}
+
+function isInboundHandlers(target: Server | InboundHandlers): target is InboundHandlers {
+  return (
+    typeof (target as InboundHandlers).onInbound === "function" &&
+    typeof (target as InboundHandlers).onPairingCode === "function"
+  );
+}
+
+/**
+ * Shared normaliser for both `POST /` and WebSocket chat frames so metadata
+ * flattening, `batch_id -> request_id` mapping, `client_message_id`, and
+ * `questions_batch_response` formatting match identically across transports.
+ */
+export function normalizeInboundPayload(body: HitlMessage): NormalizedInbound {
+  const rawMessage =
+    typeof body.message === "string" && body.message.length > 0
+      ? body.message
+      : typeof body.content === "string"
+        ? body.content
+        : String(body.message ?? body.content ?? "");
+  const senderId = String(body.sender_id ?? "unknown");
+  const agentId = body.agent_id ? String(body.agent_id) : undefined;
+  const attachments = body.attachments;
+  const clientMessageId =
+    typeof body.id === "string" && body.id.length > 0 ? body.id : undefined;
+
+  // The phone client flattens response metadata into the top-level
+  // envelope. Keep accepting the legacy nested shape while
+  // normalising the real wire shape for downstream formatting,
+  // notification metadata, and audit classification.
+  const metadata =
+    body.metadata ??
+    (typeof body.type === "string" && body.type !== "user_message"
+      ? {
+          type: body.type,
+          batch_id: body.batch_id,
+          batch_answer: body.batch_answer,
+          cancelled: body.cancelled,
+          ...(Array.isArray(body.selections)
+            ? { selections: body.selections }
+            : {}),
+        }
+      : undefined);
+
+  const isEmpty = !rawMessage.trim() && (!attachments || attachments.length === 0);
+
+  const extraMeta: Record<string, unknown> = { ...(metadata ?? {}) };
+  if (extraMeta.batch_id && !extraMeta.request_id) {
+    extraMeta.request_id = extraMeta.batch_id;
+  }
+
+  let text = rawMessage;
+  if (metadata?.type === "questions_batch_response") {
+    const batchAnswer = metadata.batch_answer;
+    const isCancelled = batchAnswer?.cancelled === true || metadata.cancelled === true;
+    const answers = batchAnswer?.answers;
+
+    const parts: string[] = [];
+    if (Array.isArray(answers) && answers.length > 0) {
+      const answersStr = answers
+        .map((ans: any) => {
+          const header = ans?.header ?? "";
+          const selected = Array.isArray(ans?.selected)
+            ? ans.selected.join(", ")
+            : "";
+          return `${header}: [${selected}]`;
+        })
+        .join("; ");
+      if (answersStr) {
+        parts.push(answersStr);
+      }
+    }
+
+    const suffix = isCancelled ? " (cancelled)" : "";
+    if (parts.length > 0) {
+      text = `${text}${suffix} — ${parts.join("; ")}`;
+    } else if (suffix) {
+      text = `${text}${suffix}`;
+    }
+  }
+
+  const meta: Record<string, unknown> = {
+    sender_id: senderId,
+    ...(agentId ? { agent_id: agentId } : {}),
+    ...(clientMessageId ? { client_message_id: clientMessageId } : {}),
+    ...extraMeta,
+  };
+
+  return {
+    text,
+    rawMessage,
+    attachments,
+    metadata,
+    meta,
+    isEmpty,
+  };
+}
+
+function emitInboundAudit(
+  normalized: NormalizedInbound,
+  opts: {
+    instanceId: string;
+    deviceId?: string;
+    acpSessionId?: string | null;
+  },
+): void {
+  const { count: attachmentCount, bytes: attachmentBytes } =
+    summariseAttachments(normalized.attachments ?? []);
+  const acpField =
+    opts.acpSessionId !== undefined
+      ? { acp_session_id: opts.acpSessionId }
+      : {};
+  const deviceField = opts.deviceId !== undefined ? { device_id: opts.deviceId } : {};
+
+  if (normalized.metadata?.type === "questions_batch_response") {
+    appendAudit({
+      ts: new Date().toISOString(),
+      instance_id: opts.instanceId,
+      direction: "phone_returns_to_cc",
+      kind: "questions_batch",
+      tool_name: null,
+      approval: null,
+      prompt_hash: sha256Hex(
+        stableStringify(normalized.metadata.batch_answer?.answers ?? null)
+      ),
+      duration_ms: null,
+      attachment_count: attachmentCount,
+      attachment_bytes: attachmentBytes,
+      ...deviceField,
+      ...acpField,
+    }).catch((err) =>
+      process.stderr.write(
+        `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
+      )
+    );
+  } else {
+    appendAudit({
+      ts: new Date().toISOString(),
+      instance_id: opts.instanceId,
+      direction: "phone_to_cc",
+      kind: "message",
+      tool_name: null,
+      approval: null,
+      prompt_hash: sha256Hex(normalized.rawMessage),
+      duration_ms: null,
+      attachment_count: attachmentCount,
+      attachment_bytes: attachmentBytes,
+      ...deviceField,
+      ...acpField,
+    }).catch((err) =>
+      process.stderr.write(
+        `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
+      )
+    );
+  }
+}
+
+export function startHttpBridge(
+  target: Server | InboundHandlers,
+  opts?: HttpBridgeOptions,
+) {
+  // Start each bridge with a clean in-memory reply buffer so prior test files or
+  // torn-down bridges in the same process cannot leak un-ACKed replies on WS open.
+  replyBuffer.drain();
+  const port =
+    opts?.port !== undefined
+      ? opts.port
+      : Number(process.env.HITL_CHANNEL_PORT ?? 8789);
+  const isDaemon = isInboundHandlers(target);
+  const handlers: InboundHandlers = isDaemon
+    ? target
+    : {
+        async onInbound(input) {
+          const contentForNotification = await processAttachments(
+            input.text,
+            input.attachments,
+          );
+          await sendChannelNotification(target, contentForNotification, input.meta);
+        },
+        async onPairingCode(code) {
+          await sendChannelNotification(
+            target,
+            `🔑 Pairing request received. Code: ${code} (expires in 5 minutes). Please relay this code to the user.`,
+            { sender_id: "hitl-channel", type: "pairing_request" },
+          );
+        },
+      };
 
   process.stderr.write(`[hitl-channel] Starting HTTP bridge on http://0.0.0.0:${port}\n`);
   return Bun.serve<HitlWebSocketData>({
@@ -439,7 +647,11 @@ export function startHttpBridge(mcp: Server) {
       // Health endpoint (no auth required)
       if (url.pathname === "/health") {
         return new Response(
-          JSON.stringify({ status: "ok", port: port, clients: clients.size }),
+          JSON.stringify({
+            status: "ok",
+            port: server.port ?? port,
+            clients: clients.size,
+          }),
           { headers: { "content-type": "application/json" } }
         );
       }
@@ -466,17 +678,15 @@ export function startHttpBridge(mcp: Server) {
           process.stderr.write(`\n[hitl-channel] PAIRING CODE: ${code}\n`);
           process.stderr.write(`[hitl-channel] Code expires in 5 minutes\n\n`);
 
-          // Push pairing code into Claude Code via channel notification
-          await sendChannelNotification(mcp,
-            `🔑 Pairing request received. Code: ${code} (expires in 5 minutes). Please relay this code to the user.`,
-            { sender_id: "hitl-channel", type: "pairing_request" }
-          );
+          await handlers.onPairingCode(code);
 
           // Return 202 Accepted (code NOT in response body)
           return new Response(
             JSON.stringify({
               status: "pending",
-              message: "Pairing code sent to Claude Code session",
+              message: isDaemon
+                ? "Pairing code shown on host"
+                : "Pairing code sent to Claude Code session",
               expires_in: 300, // 5 minutes in seconds
             }),
             {
@@ -573,124 +783,28 @@ export function startHttpBridge(mcp: Server) {
                 { status: 400, headers: { "content-type": "application/json" } }
               );
             }
-            const message = String(body.message ?? body.content ?? "");
-            const senderId = String(body.sender_id ?? "unknown");
-            const agentId = body.agent_id ? String(body.agent_id) : undefined;
-            const attachments = body.attachments;
-            // The phone client flattens response metadata into the top-level
-            // POST envelope. Keep accepting the legacy nested shape while
-            // normalising the real wire shape for downstream formatting,
-            // notification metadata, and audit classification.
-            const metadata = body.metadata ?? (
-              typeof body.type === "string" && body.type !== "user_message"
-                ? {
-                    type: body.type,
-                    batch_id: body.batch_id,
-                    batch_answer: body.batch_answer,
-                    cancelled: body.cancelled,
-                  }
-                : undefined
-            );
 
-            if (!message.trim() && (!attachments || attachments.length === 0)) {
+            const normalized = normalizeInboundPayload(body);
+            if (normalized.isEmpty) {
               return new Response(
                 JSON.stringify({ error: "empty message" }),
                 { status: 400, headers: { "content-type": "application/json" } }
               );
             }
 
-            let contentForNotification = await processAttachments(
-              message,
-              attachments
-            );
-
-            // Forward metadata, mapping batch_id -> request_id for agent convenience
-            const extraMeta = { ...metadata };
-            if (extraMeta.batch_id && !extraMeta.request_id) {
-              extraMeta.request_id = extraMeta.batch_id;
-            }
-
-            if (metadata?.type === "questions_batch_response") {
-              const batchAnswer = metadata.batch_answer;
-              const isCancelled = batchAnswer?.cancelled === true || metadata.cancelled === true;
-              const answers = batchAnswer?.answers;
-
-              let parts: string[] = [];
-              if (Array.isArray(answers) && answers.length > 0) {
-                const answersStr = answers
-                  .map((ans: any) => {
-                    const header = ans?.header ?? "";
-                    const selected = Array.isArray(ans?.selected)
-                      ? ans.selected.join(", ")
-                      : "";
-                    return `${header}: [${selected}]`;
-                  })
-                  .join("; ");
-                if (answersStr) {
-                  parts.push(answersStr);
-                }
-              }
-
-              let suffix = "";
-              if (isCancelled) {
-                suffix = " (cancelled)";
-              }
-
-              if (parts.length > 0) {
-                contentForNotification = `${contentForNotification}${suffix} — ${parts.join("; ")}`;
-              } else if (suffix) {
-                contentForNotification = `${contentForNotification}${suffix}`;
-              }
-            }
-
-            await sendChannelNotification(mcp, contentForNotification, {
-              sender_id: senderId,
-              ...(agentId ? { agent_id: agentId } : {}),
-              ...extraMeta,
+            const inboundRes = await handlers.onInbound({
+              text: normalized.text,
+              attachments: normalized.attachments,
+              meta: normalized.meta,
             });
+            const acpSessionId = isDaemon
+              ? (inboundRes?.acpSessionId ?? null)
+              : undefined;
 
-            // SPEC-HC-004 AV3 — Closed-schema audit emission for the return path.
-            const instanceId = process.env.HITL_INSTANCE_ID ?? "unknown";
-            const { count: attachmentCount, bytes: attachmentBytes } =
-              summariseAttachments(attachments ?? []);
-
-            if (metadata?.type === "questions_batch_response") {
-              appendAudit({
-                ts: new Date().toISOString(),
-                instance_id: instanceId,
-                direction: "phone_returns_to_cc",
-                kind: "questions_batch",
-                tool_name: null,
-                approval: null,
-                prompt_hash: sha256Hex(
-                  stableStringify(metadata.batch_answer?.answers ?? null)
-                ),
-                duration_ms: null,
-                attachment_count: attachmentCount,
-                attachment_bytes: attachmentBytes,
-              }).catch((err) =>
-                process.stderr.write(
-                  `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
-                )
-              );
-            } else {
-              appendAudit({
-                ts: new Date().toISOString(),
-                instance_id: instanceId,
-                direction: "phone_to_cc",
-                kind: "message",
-                tool_name: null,
-                approval: null,
-                prompt_hash: sha256Hex(message),
-                duration_ms: null,
-                attachment_count: attachmentCount,
-                attachment_bytes: attachmentBytes,
-              }).catch((err) =>
-                process.stderr.write(
-                  `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
-                )
-              );
-            }
+            emitInboundAudit(normalized, {
+              instanceId: process.env.HITL_INSTANCE_ID ?? "unknown",
+              acpSessionId,
+            });
 
             return new Response(JSON.stringify({ status: "delivered" }), {
               status: 200,
@@ -734,6 +848,18 @@ export function startHttpBridge(mcp: Server) {
             `[hitl-channel] buffer drain failed: ${err instanceof Error ? err.message : err}\n`
           );
         });
+        if (handlers.onClientOpen) {
+          try {
+            handlers.onClientOpen((frame) => {
+              if (typedWs.readyState !== 1) return false;
+              return wsSendAccepted(typedWs, JSON.stringify(frame));
+            });
+          } catch (err) {
+            process.stderr.write(
+              `[hitl-channel] onClientOpen failed: ${err instanceof Error ? err.message : err}\n`
+            );
+          }
+        }
       },
       close(ws) {
         clients.delete(ws as unknown as HitlWebSocket);
@@ -914,40 +1040,29 @@ export function startHttpBridge(mcp: Server) {
             return;
           }
 
-          const message = data.message?.trim() || data.content?.trim();
-          if (message || (data.attachments && data.attachments.length > 0)) {
-            // Parity with POST /: real attachment_count/bytes via summariseAttachments
-            const { count: chatAttachmentCount, bytes: chatAttachmentBytes } =
-              summariseAttachments(data.attachments);
-            processAttachments(message ?? "", data.attachments)
-              .then((content) =>
-                sendChannelNotification(mcp, content, {
-                  sender_id: data.sender_id ?? "unknown",
-                  ...(data.agent_id ? { agent_id: data.agent_id } : {}),
-                })
-              )
+          const normalized = normalizeInboundPayload(data);
+          if (!normalized.isEmpty) {
+            void handlers
+              .onInbound({
+                text: normalized.text,
+                attachments: normalized.attachments,
+                meta: normalized.meta,
+              })
+              .then((inboundRes) => {
+                const acpSessionId = isDaemon
+                  ? (inboundRes?.acpSessionId ?? null)
+                  : undefined;
+                emitInboundAudit(normalized, {
+                  instanceId: process.env.HITL_INSTANCE_ID ?? "unknown",
+                  deviceId: senderDeviceId,
+                  acpSessionId,
+                });
+              })
               .catch((err) => {
                 process.stderr.write(
-                  `[hitl-channel] Failed to send notification: ${err instanceof Error ? err.message : err}\n`
+                  `[hitl-channel] Failed to process inbound message: ${err instanceof Error ? err.message : err}\n`
                 );
               });
-            appendAudit({
-              ts: new Date().toISOString(),
-              instance_id: process.env.HITL_INSTANCE_ID ?? "unknown",
-              direction: "phone_to_cc",
-              kind: "message",
-              tool_name: null,
-              approval: null,
-              prompt_hash: sha256Hex(message ?? ""),
-              duration_ms: null,
-              attachment_count: chatAttachmentCount,
-              attachment_bytes: chatAttachmentBytes,
-              device_id: senderDeviceId,
-            }).catch((err) =>
-              process.stderr.write(
-                `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
-              )
-            );
           }
         } catch {
           // Ignore malformed messages

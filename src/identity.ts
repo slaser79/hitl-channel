@@ -1,16 +1,23 @@
 /**
  * Instance identity management.
  *
- * - Stored at ~/.hitl/channels/identity.json
+ * - Default path: ~/.hitl/channels/identity.json (overridable via HITL_CHANNEL_IDENTITY_FILE)
  * - Instance ID is a random UUID (stable across restarts)
  * - Used for multi-instance support
  */
 
-import { $ } from "bun";
-import { homedir } from "node:os";
+import { mkdir } from "node:fs/promises";
+import { homedir, hostname as osHostname } from "node:os";
+import { dirname } from "node:path";
 
-const IDENTITY_DIR = `${homedir()}/.hitl/channels`;
-const IDENTITY_FILE = `${IDENTITY_DIR}/identity.json`;
+export function getIdentityFilePath(): string {
+  const override = process.env.HITL_CHANNEL_IDENTITY_FILE?.trim();
+  if (override) {
+    return override;
+  }
+  const home = process.env.HOME?.trim() || homedir();
+  return `${home}/.hitl/channels/identity.json`;
+}
 
 export interface InstanceIdentity {
   instanceId: string;
@@ -22,9 +29,9 @@ export interface InstanceIdentity {
 /**
  * Ensure the identity directory exists.
  */
-async function ensureDir(): Promise<void> {
+async function ensureDir(filePath: string): Promise<void> {
   try {
-    await $`mkdir -p ${IDENTITY_DIR}`.quiet();
+    await mkdir(dirname(filePath), { recursive: true });
   } catch (error) {
     process.stderr.write(`[hitl-channel] Failed to create directory: ${error}\n`);
   }
@@ -35,8 +42,9 @@ async function ensureDir(): Promise<void> {
  * Creates a new identity if it doesn't exist.
  */
 export async function loadIdentity(): Promise<InstanceIdentity> {
+  const filePath = getIdentityFilePath();
   try {
-    const file = Bun.file(IDENTITY_FILE);
+    const file = Bun.file(filePath);
     if (await file.exists()) {
       const content = await file.text();
       return JSON.parse(content) as InstanceIdentity;
@@ -71,8 +79,9 @@ async function createIdentity(): Promise<InstanceIdentity> {
  * Save the instance identity to disk.
  */
 async function saveIdentity(identity: InstanceIdentity): Promise<void> {
-  await ensureDir();
-  const file = Bun.file(IDENTITY_FILE);
+  const filePath = getIdentityFilePath();
+  await ensureDir(filePath);
+  const file = Bun.file(filePath);
   await Bun.write(file, JSON.stringify(identity, null, 2));
 }
 
@@ -93,17 +102,27 @@ export async function getIdentity(): Promise<InstanceIdentity> {
 /**
  * Get the hostname (for identity purposes).
  */
-async function getHostname(): Promise<string> {
+export async function getHostname(): Promise<string> {
   try {
     // Try to read from /etc/hostname first
     const hostnameFile = Bun.file("/etc/hostname");
     if (await hostnameFile.exists()) {
-      return (await hostnameFile.text()).trim();
+      const fileHost = (await hostnameFile.text()).trim();
+      if (fileHost) return fileHost;
     }
-
-    // Fallback to environment
-    return process.env.HOSTNAME || "unknown";
   } catch {
-    return process.env.HOSTNAME || "unknown";
+    // Fall through to env / os.hostname()
   }
+
+  const envHost = process.env.HOSTNAME?.trim();
+  if (envHost) return envHost;
+
+  try {
+    const sysHost = osHostname().trim();
+    if (sysHost) return sysHost;
+  } catch {
+    // Fall through
+  }
+
+  return "unknown";
 }
