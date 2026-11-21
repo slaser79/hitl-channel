@@ -174,6 +174,7 @@ If an ACP harness does not support HTTP MCP (`mcpCapabilities.http === false`), 
 - **Separate identity:** Stored at `~/.hitl/channels/identity-daemon-<harness>.json` (override with `HITL_CHANNEL_IDENTITY_FILE`), so `agy`, `codex`, `hermes`, and Claude Code channel instances on the same host advertise distinct `instanceId`s.
 - **Shared allowlist:** Paired device tokens are stored in `~/.hitl/channels/allowlist.json` (SHA-256 hashed).
 - **Hook isolation (`HITL_DAEMON_SESSION=1`):** The daemon sets `HITL_DAEMON_SESSION=1` in spawned harness subprocess environments. Updated `hitl-cli` hooks (`hitl-hook-review-and-continue`, `review_and_continue_antigravity.py`, `review_and_continue_wrapper.sh`, and `hitl-codex-notify`) check `HITL_DAEMON_SESSION=1` and exit immediately without pinging the cloud relay or blocking turns. Set `HITL_HOOK_DEBUG=1` to log `daemon_session_skip` diagnostic markers.
+- **Codex approval mode (`INITIAL_AGENT_MODE`):** `@agentclientprotocol/codex-acp` defaults to `agent` (Auto review), which executes workspace/sandboxed actions without raising `session/request_permission`. Export `INITIAL_AGENT_MODE=workspace-write` (prompt outside workspace or for network access) or `INITIAL_AGENT_MODE=read-only` (prompt before edits/commands) when starting `hitl-channel daemon --harness codex` to receive phone approval cards for those actions.
 
 ### Running at Login on macOS (`launchd`)
 

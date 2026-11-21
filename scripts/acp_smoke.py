@@ -331,6 +331,10 @@ def main() -> int:
     env["HITL_HOOK_DEBUG_FILE"] = str(hook_debug_file)
     env["NODE_ENV"] = "production"
     env.pop("BUN_ENV", None)
+    if args.harness == "codex" and not args.handshake_only:
+        # codex-acp defaults to `agent` (auto-review), which executes `/tmp` writes without
+        # raising `session/request_permission`; `read-only` routes writes to phone approvals.
+        env.setdefault("INITIAL_AGENT_MODE", "read-only")
 
     stderr_lines: list[str] = []
     daemon_proc = subprocess.Popen(
