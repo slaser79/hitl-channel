@@ -21,14 +21,7 @@ depends_on: ["SPEC-HC-001", "SPEC-HC-002", "SPEC-HC-003", "SPEC-HC-004", "SPEC-H
 
 ## 1. Executive Summary
 
-Today the phone can only push into, and receive from, a **Claude Code** session. Claude Code's research-preview `notifications/claude/channel` capability is hitl-channel's only inbound path, and Claude Code itself spawns hitl-channel as a stdio MCP child. The other harnesses the CEO uses (Antigravity `agy`, Hermes, Codex) can only reach the phone through the relay-based HITL MCP. That path talks one way, long-polls for ~15 minutes, cannot start a new session and cannot inject a message into a running one. This spec adds a **daemon mode**: `hitl-channel daemon --harness agy`, a long-lived process that **spawns the harness's ACP server and acts as its ACP client**. The phone-facing HTTP/WS surface stays the same (pairing, allowlist, mDNS, reply buffer, ACK protocol, correlator).
-
-- **Messages.** Phone messages become ACP `session/prompt`. The agent's turn text comes back as the existing `reply` frame.
-- **Permissions.** ACP permission requests become the existing `choices` frame.
-- **Phone tool bridge.** `call_phone_tool`, `list_phone_tools`, `push_file`, `reply_to_hitl` attachments and the rest are injected into every ACP session as a loopback MCP server, so a remote agent can drive the phone as Claude Code does today.
-- **Sessions.** Sessions are created, listed and resumed from the phone with chat slash commands.
-
-**Phase 1 needs no hitl-app change and no relay.** The path stays relay-free for privacy-conscious users.
+Today the phone can only push into, and receive from, a **Claude Code** session. Claude Code's research-preview `notifications/claude/channel` capability is hitl-channel's only inbound path, and Claude Code itself spawns hitl-channel as a stdio MCP child. The other harnesses the CEO uses (Antigravity `agy`, Hermes, Codex) can only reach the phone through the relay-based HITL MCP, which talks one way, long-polls for ~15 minutes, cannot start a new session and cannot inject a message into a running one. This spec adds a **daemon mode**, `hitl-channel daemon --harness agy`: a long-lived process that **spawns the harness's ACP server and acts as its ACP client**, while the phone-facing HTTP/WS surface stays the same (pairing, allowlist, mDNS, reply buffer, ACK protocol, correlator). Phone messages become ACP `session/prompt`, and the agent's turn text comes back as the existing `reply` frame. ACP permission requests become the existing `choices` frame. The phone tool bridge (`call_phone_tool`, `list_phone_tools`, `push_file`, `reply_to_hitl` attachments and the rest) is injected into every ACP session as a loopback MCP server, so a remote agent can drive the phone exactly as Claude Code does today. Sessions are created, listed and resumed from the phone with chat slash commands. Phase 1 needs **no hitl-app change and no relay**, which keeps the path relay-free for privacy-conscious users.
 
 ## 2. CEO Business Outcomes
 
@@ -112,12 +105,12 @@ hitl-app (phone)               hitl-channel daemon (Bun, long-lived)            
 3. **Permission pending on the active session?**
    - If the message is a `choice_response`, or its trimmed text equals an option name (case-insensitive), it resolves the **oldest** pending permission with `{outcome:{outcome:"selected", optionId}}`. Exactly one outcome is sent per `request_permission` id.
    - Any other message, including workflow delegations, is **queued FIFO**, and the daemon replies "⚠ waiting for your approval above (queued)".
-4. **`choice_response` with no pending permission?** If at least one `present_choices_to_hitl` card is still open, the open-card count is decremented and the message is forwarded as a prompt (step 6). Otherwise the daemon replies "no pending approval" and nothing reaches the agent.
+4. **`choice_response` with no pending permission?** If at least one `present_choices_to_hitl` card is still open, the open-card count is decremented and the message is forwarded as a prompt (step 6). Otherwise the daemon replies "no pending approval" and nothing reaches the agent. The open-card count resets to 0 when a plain (non-choice) prompt starts a turn, and whenever the active session changes (`/new`, `/resume`, auto-create). That way a stale card from earlier can't turn a late permission tap into a prompt.
 5. **Turn running?** The message is queued FIFO, and the daemon replies "⏳ queued (n ahead)".
-6. **Otherwise it becomes a prompt.** The daemon sends `session/prompt`; if no session exists yet, it first auto-creates one in the default cwd and says so. It collects `agent_message_chunk` text. When the prompt's response (`stopReason`) arrives, it calls the existing `broadcastReply()` **exactly once** with the collected text, then dequeues the next message. If the inbound content was wrapped in `<workflow_delegation message_id="X">…</workflow_delegation>`, that end-of-turn reply carries `message_id = X`. Otherwise it carries the phone's `client_message_id` (from `body.id`) when one is present. A turn that produced no text yields the reply "(no text output — stopReason: …)", so delegations always resolve.
+6. **Otherwise it becomes a prompt.** The daemon sends `session/prompt`; if no session exists yet, it first auto-creates one in the default cwd and says so. It collects `agent_message_chunk` text. When the prompt's response (`stopReason`) arrives, it calls the existing `broadcastReply()` **exactly once** with the collected text, then dequeues the next message. If the inbound content was wrapped in `<workflow_delegation message_id="X">…</workflow_delegation>`, that end-of-turn reply carries `message_id = X`. Otherwise it carries the phone's `client_message_id` (from `body.id`) when one is present. A turn that produced no text yields the reply "(no text output — stopReason: …)", but only when the turn was a workflow delegation, `stopReason` is not `end_turn`, or the agent did not call `reply_to_hitl` during the turn. Delegations therefore always resolve, and an attachment-only reply doesn't get a spurious bubble under it.
 
 **Permission and connectivity lifecycle.**
-- **Replay on reconnect.** Permission `choices` frames are unicast, as today. Any still-unresolved permission frame is re-sent on every WS `open`; the app already ACKs `choices` frames by `id`, so a re-sent card does not duplicate.
+- **Replay on reconnect.** Permission `choices` frames are unicast, as today. The daemon stores each pending permission's original `choices` frame, including its generated `id`, and re-sends that **exact frame** (same `id`) on every WS `open` via `onClientOpen`. The re-send is safe: the app's chat history deduplicates incoming frames by `id` (`ClaudeCodeHistoryRepository.addMessage` skips a row whose `messageId` already exists), so a re-sent card does not appear twice.
 - **Cancellation.** `/cancel`, harness exit and daemon shutdown resolve every pending permission with `{outcome:{outcome:"cancelled"}}` before anything else happens.
 - **Late taps.** A tap that arrives after its permission was already resolved gets the reply "no pending approval".
 
@@ -139,7 +132,7 @@ hitl-app (phone)               hitl-channel daemon (Bun, long-lived)            
 | **HTTP** MCP (`{type:"http", name, url, headers:[{name,value}]}`) | works even though not advertised. agy first POSTs a pre-initialize `server/discover`, then probes `GET /.well-known/oauth-protected-resource[/mcp]` and proceeds on 404/405 |
 | MCP client per session | agy opens a **separate** MCP client for each ACP session (`session/new`, `session/resume`) |
 | Session attribution | every MCP `tools/call` carries `_meta["antigravity.google/conversation_id"]` = ACP `sessionId` |
-| Injected tool naming | agy namespaces MCP tools as `mcp_<server>_<tool>` (spike: `mcp_hitlspike_spike_ping`). That name is also what appears in `request_permission.toolCall.name` |
+| Injected tool naming | agy namespaces MCP tools as `mcp_<server>_<tool>` (spike: `mcp_hitlspike_spike_ping`). The spike's **captured `session/request_permission` wire payload** carried `toolCall: {toolCallId, name:"mcp_hitlspike_spike_ping", title:"Run mcp_hitlspike_spike_ping", kind:"other", rawInput, status:"pending", …}`. Note that `toolCall.name` is an **agy extension**: ACP v1's `ToolCallUpdate` has no `name` field, while `toolCallId`, `title`, `kind` and `rawInput` are standard |
 | System-prompt injection | `session/new._meta.antigravity.systemPrompt.append` is honoured |
 | Permission request | `session/request_permission` options `{optionId:"allow",kind:"allow_once"}`, `{optionId:"deny",kind:"reject_once"}`, **including for injected MCP tools**. The response shape is `{outcome:{outcome:"selected",optionId}}` |
 | `session/list` | returns all agy sessions in the app-data dir (432 on the dev Mac), with `title`, `cwd`, `updatedAt` |
@@ -156,7 +149,16 @@ Extension-sites checklist results. Each item says why an existing component can 
 
 1. **Inbound seam (extend `http_bridge.ts`; no new transport class).**
    - **Signature.** `startHttpBridge(target: Server | InboundHandlers, opts?: { port?: number })`. Existing callers that pass an MCP `Server` keep today's behaviour exactly: the bridge wraps the server in default handlers that call `processAttachments` and then `sendChannelNotification`. Four existing test files call `startHttpBridge(mcpMock)` and must pass unmodified.
-   - **`InboundHandlers`** is `{ onInbound(input: { text, attachments?: HitlAttachment[], meta }), onPairingCode(code: string) }`. `onInbound` receives the **raw** attachments before `processAttachments` runs, so daemon mode can build ACP image blocks from the original base64 + MIME.
+   - **`InboundHandlers`** is:
+     ```
+     {
+       onInbound(input: { text, attachments?: HitlAttachment[], meta }): Promise<{ acpSessionId?: string | null } | void>,
+       onPairingCode(code: string): void,
+       onClientOpen?(send: (frame: Record<string, unknown>) => boolean): void,
+     }
+     ```
+   - **`onInbound`** receives the **raw** attachments before `processAttachments` runs, so daemon mode can build ACP image blocks from the original base64 + MIME. It returns the ACP session id the message was routed to. On both the POST `/` and WS chat paths, the bridge **awaits** `onInbound` before writing its existing inbound audit line, and copies `acpSessionId` into it. This keeps one audit line per inbound message, with the session id attached.
+   - **`onClientOpen`** is invoked synchronously inside the WS `open` handler, right after the reply-buffer drain, with a sender bound to that socket. It sends through the bridge's existing accepted-send path. The session manager uses it to re-send pending permission cards (§4.1).
    - **Shared normaliser.** POST `/`'s metadata normalisation (the flat/nested shape and `questions_batch_response` formatting) is extracted into a function that the WS chat path also uses. The phone's `body.id` is carried as `meta.client_message_id`.
    - **Port.** `opts.port` overrides the `HITL_CHANNEL_PORT ?? 8789` default.
    - **Response text.** In daemon mode the pairing-request response says the code is shown on the host, not "sent to Claude Code session".
@@ -171,7 +173,7 @@ Extension-sites checklist results. Each item says why an existing component can 
    - **Startup.** `daemon.ts` parses `--harness`, `--port` (default 8790; tests use an ephemeral port because `server.test.ts` already binds 8790) and `--name`. It then sets `HITL_CHANNEL_IDENTITY_FILE`, `HITL_CHANNEL_NAME` and `HITL_INSTANCE_ID` before loading identity or starting the bridge (item 7). It starts the bridge with the session manager's `InboundHandlers`, starts mDNS (expected to fix issue #3 as a side effect), and reuses the existing graceful-shutdown pattern.
    - **Loopback MCP endpoint.** The endpoint runs on `Bun.serve({ hostname: "127.0.0.1", port: 0 })` using the SDK's **`WebStandardStreamableHTTPServerTransport` in stateless mode**. Each `POST /mcp` request gets a fresh `(Server, transport)` pair with `sessionIdGenerator: undefined` and `enableJsonResponse: true`. This is required because agy opens a separate MCP client per ACP session, and one SDK `Server`/transport pair cannot serve multiple initializations.
    - **Auth on that endpoint.** `/mcp` requires `Authorization: Bearer <per-process random token>` and returns 401 otherwise. `GET /.well-known/*` returns 404 with **no** auth, so agy's OAuth probe proceeds. A pre-initialize `server/discover` must get a JSON-RPC response (result or `-32601`), not an HTTP 4xx.
-   - *Why new:* the lifecycle is orthogonal. Channel mode dies with Claude Code's stdin; the daemon must not.
+   - *Why new:* `daemon.ts` has an orthogonal lifecycle. Channel mode dies with Claude Code's stdin; the daemon must not. `cli.ts` is a thin `bin` router, so subcommand dispatch never imports `server.ts` and never triggers its top-level stdio connect.
 4. **ACP client + session manager (`src/acp_session_manager.ts`, new).**
    - **Spawning.** Spawns the harness child with `detached: true` (its own process group) and env `HITL_DAEMON_SESSION=1` (item 9), then calls `initialize`.
    - **New sessions.** `session/new` takes `{ cwd: <absolute; leading ~ expanded via homedir()>, mcpServers: [hitlHttp], _meta: { antigravity: { systemPrompt: { append: DAEMON_INSTRUCTIONS } } } }`, where `hitlHttp = {type:"http", name:"hitl-channel", url, headers:[{name:"Authorization", value:"Bearer …"}]}`.
@@ -199,13 +201,20 @@ Extension-sites checklist results. Each item says why an existing component can 
    - **Daemon defaults.** Identity file `~/.hitl/channels/identity-daemon-<harness>.json`, display name `<harness>@<hostname>`, `HITL_INSTANCE_ID` set from it. As a result `GET /instance`, the tool handlers and the audit lines all report the daemon identity, never the CC channel's.
    - **Allowlist.** The allowlist file stays shared.
    - *Why extend:* one dynamic path lookup and one fallback on an existing module.
-8. **Auto-allow own tools.** When `request_permission.toolCall.name` starts with the harness's injected prefix (`mcp_hitl-channel_` for agy), the daemon answers `allow` itself and audits it. The phone already gates those tools with its own trust-tier sheet (SPEC-HITL-CC-001), so asking again would double-prompt. All other permission requests go to the phone.
-9. **Customization isolation: one mechanism, cross-repo.** The daemon sets `HITL_DAEMON_SESSION=1` in the harness child's environment. **`hitl-cli`** honours it: `hitl_cli/hooks/review_and_continue.py` `main()` returns `{"decision":"allow","reason":""}` immediately when the variable is `"1"`, and `review_and_continue_wrapper.sh` gets the same early exit. The guard lives in the Python entry point so it holds for every install, not just one wrapper. **Phase 1 starts with a wire check:** does agy pass its process environment to hook subprocesses? `scripts/acp_smoke.py` asserts the hook's early exit is hit, via a marker the guard writes when `HITL_HOOK_DEBUG=1`. If agy turns out not to propagate the environment, implementation stops and goes back to the CEO; there is no silent fallback.
+8. **Auto-allow own tools.** The phone already gates the daemon's own tools with its trust-tier sheet (SPEC-HITL-CC-001), so the daemon answers their permission requests with `allow` itself and audits the decision, rather than prompting twice. A request counts as one of the daemon's own tools when the harness's **identification rule** matches. All other permission requests go to the phone.
+   - **agy rule:** `toolCall.name` (an agy extension, observed on the wire) starts with `mcp_hitl-channel_`, **or** `toolCall.title` (standard ACP) starts with `Run mcp_hitl-channel_`.
+   - **Phase 2 harnesses:** if a harness sends neither field, the daemon correlates `toolCall.toolCallId` with the preceding `session/update` `tool_call` notification for that id.
+   - **Fail closed:** if no rule matches, the request goes to the phone. Auto-allow never applies by default.
+9. **Customization isolation: one mechanism, cross-repo.** The daemon sets `HITL_DAEMON_SESSION=1` in the harness child's environment.
+   - **Python hook.** In **`hitl-cli`**, `hitl_cli/hooks/review_and_continue.py` `main()` exits early when the variable is `"1"`. Under Antigravity (`--antigravity` / `IS_ANTIGRAVITY=1`) it prints `{"decision":"allow","reason":""}`; under Claude Code it prints nothing and exits 0, matching the existing per-harness stdout contract.
+   - **Other entry points.** `review_and_continue_antigravity.py` and `review_and_continue_wrapper.sh` get the same guard. The wrapper guard takes effect immediately on the dev Mac. The Python guard reaches the Nix-built `result/bin/hitl-hook-review-and-continue` only after a `nix build` in hitl-cli, and that rebuild is part of Phase 1.
+   - **Why the Python entry point.** Putting the guard there means it holds for every install, not just one wrapper. **Phase 1 starts with a wire check:** does agy pass its process environment to hook subprocesses? `scripts/acp_smoke.py` asserts the hook's early exit is hit, via a marker the guard writes when `HITL_HOOK_DEBUG=1`. If agy turns out not to propagate the environment, implementation stops and goes back to the CEO; there is no silent fallback.
 10. **Pairing code delivery.** `onPairingCode(code)` writes the 6-digit code to stdout and the daemon log, and raises a desktop notification (`osascript` on macOS, `notify-send` on Linux) when one is available. Pairing endpoints, expiry and allowlist semantics are unchanged.
 11. **Audit (extend `audit.ts`).**
     - **New optional field.** `AuditEvent` gains `acp_session_id?: string | null`. Channel mode omits it, so its lines stay byte-compatible. Daemon mode fills it from `_meta["antigravity.google/conversation_id"]` on tool calls, and from the session manager for prompts and replies.
     - **New permission events.** The closed enums gain `AuditKind "permission"` and `AuditApproval "cancelled"`. Permission events use `direction: "harness_to_phone"` (new) with `approval` one of `auto`, `user_approved`, `user_denied` or `cancelled`.
-    - **Tests.** `audit.test.ts` is extended for the new values. Existing assertions are unchanged.
+    - **`tool_name` on permission events.** It holds the tool identifier (the agy `toolCall.name`, or the title-derived name), never `null`.
+    - **Tests.** Tests for the new field and enum values go in a **new** file, `src/__tests__/daemon_audit.test.ts`. The existing `audit.test.ts` is not touched (AV13).
 
 **Capability-already-exists check, app side** (grep run 2026-11-21):
 ```
@@ -304,7 +313,7 @@ $ grep -n "backgroundGracePeriod" packages/hitl_agents/lib/src/services/claude_c
 | Second ACP session fails to initialise MCP | stateless per-request MCP server (AV6) |
 | Loopback MCP reachable beyond localhost, or OAuth probe mis-signalled | `127.0.0.1` bind, bearer on `/mcp`, unauthenticated 404 on `/.well-known/*` (AV12) |
 | Orphaned or wrongly signalled processes on shutdown | child in its own process group; group kill on exit (AV10) |
-| Relay stop hook stalls daemon sessions or leaks to the relay | `HITL_DAEMON_SESSION` guard in `hitl-cli`, verified end-to-end (AV11) |
+| Relay stop hook stalls daemon sessions or leaks to the relay | `HITL_DAEMON_SESSION` guard in `hitl-cli`, unit-tested (AV11) and verified on real agy (CV6) |
 | Early `reply_to_hitl` resolves a workflow delegation | `message_id` stripped in daemon mode; exactly one end-of-turn reply (AV7, AV9) |
 | Permission card lost while the app is backgrounded wedges the session | re-sent on WS open; `/cancel` cancels pending (AV8, AV10) |
 | Out-of-turn agent output bleeds into the next reply | separate out-of-turn buffer (AV5) |
@@ -344,8 +353,8 @@ $ grep -n "backgroundGracePeriod" packages/hitl_agents/lib/src/services/claude_c
 - [ ] **AV8** Permissions:
   - **Card and outcome.** A `session/request_permission` for a non-hitl tool sends one `choices` frame whose choices are the option names. A following `choice_response` "Allow" sends exactly one response, `{outcome:{outcome:"selected", optionId:"allow"}}`. A second tap afterwards gets "no pending approval" and nothing is sent.
   - **Queueing.** A plain message sent while the approval is pending gets "⚠ waiting for your approval above (queued)" and is dispatched after the turn.
-  - **Reconnect.** A pending card is re-sent when a WS client reconnects.
-  - **Auto-allow.** A request whose tool name starts with `mcp_hitl-channel_` is answered `allow` with no phone frame, and audited as `kind:"permission", approval:"auto"`.
+  - **Reconnect.** A pending card is re-sent with its **original `id`** when a WS client reconnects, via `onClientOpen`.
+  - **Auto-allow.** Requests matching the agy identification rule in either form get an `allow` with no phone frame, audited as `kind:"permission", approval:"auto"` with `tool_name` populated. The two forms are fixtures modelled on the captured wire payload: `toolCall.name` = `mcp_hitl-channel_call_phone_tool`, or no `name` with `toolCall.title` = `Run mcp_hitl-channel_call_phone_tool`. A request matching neither form goes to the phone.
   - **Open card.** With no pending permission but an open `present_choices_to_hitl` card, a `choice_response` is forwarded as a `session/prompt`. With neither, it gets "no pending approval" and no ACP call is made.
 - [ ] **AV9** An inbound message wrapped in `<workflow_delegation message_id="X">` yields exactly one frame with `message_id: "X"`: the end-of-turn reply, even if the agent called `reply_to_hitl(message_id="X")` during the turn.
 - [ ] **AV10** Commands and process lifecycle:
@@ -358,12 +367,12 @@ $ grep -n "backgroundGracePeriod" packages/hitl_agents/lib/src/services/claude_c
   - **Crash and shutdown.** Killing the fake child produces an error reply, one restart and a "/resume" hint. On SIGTERM the child's process group is gone within 5 s.
 - [ ] **AV11** Hook guard:
   - **Daemon side.** The harness child is spawned with `HITL_DAEMON_SESSION=1`.
-  - **hitl-cli side.** With the variable set, `hitl_cli/hooks/review_and_continue.py` `main()` and `review_and_continue_wrapper.sh` output `{"decision":"allow","reason":""}`, exit 0 and make no network call (unit test in hitl-cli).
-  - **End-to-end.** `scripts/acp_smoke.py` records the guard marker from a real `agy acp` daemon session. This proves the environment reaches agy's hook subprocess.
+  - **hitl-cli side.** With the variable set, `review_and_continue.py` `main()` (in both Antigravity and Claude Code modes), `review_and_continue_antigravity.py` and `review_and_continue_wrapper.sh` exit 0 with the per-harness stdout contract (Antigravity: `{"decision":"allow","reason":""}`; Claude Code: empty) and make no network call. Covered by unit tests in hitl-cli.
+  - **Out of CI scope.** The real-agy end-to-end proof is CV6.
 - [ ] **AV12** Loopback security and relay independence:
   - **Bind and auth.** The loopback MCP endpoint binds `127.0.0.1` only. `/mcp` returns 401 without the per-process bearer token; `GET /.well-known/oauth-protected-resource` returns 404 without auth.
   - **No relay.** A test asserts there are no `hitlrelay.app` references in `hitl-channel/src/`.
-- [ ] **AV13** All pre-existing hitl-channel test files pass unmodified in channel mode. Daemon tests use ephemeral ports. No file under `hitl-app` changes in Phase 1.
+- [ ] **AV13** All pre-existing hitl-channel test files, **including `audit.test.ts`**, pass unmodified in channel mode. New daemon tests live in new files and use ephemeral ports. No file under `hitl-app` changes in Phase 1.
 
 ### CEO device-verify (work-with-CEO on device)
 - [ ] **CV1** On a real phone over Tailscale: discover (or enter) `agy@<host>:8790`, pair with the code shown on the host, and send "hello". The agent's reply bubble appears. If you background the app before the reply lands, the reply and its local notification appear when you return to the app (reply-buffer drain).
@@ -374,6 +383,13 @@ $ grep -n "backgroundGracePeriod" packages/hitl_agents/lib/src/services/claude_c
 - [ ] **CV3** From the phone, ask the agy agent to "list my phone tools, create a test local agent on my phone, and send me a screenshot of the result". The phone's trust-tier sheet appears for the create. After approval the agent exists in the app, and an image arrives in chat.
 - [ ] **CV4** Ask the agent to run a shell command that requires permission. An Allow/Deny card appears on the phone. Deny makes the agent report the denial; Allow on retry runs the command. Repeat with the app backgrounded when the request arrives: the card is there when you return.
 - [ ] **CV5** With hitlrelay.app blocked on the Mac (e.g. `/etc/hosts`), CV1 and CV2 still pass, including `session/new`.
+- [ ] **CV6** *(external-system: real `agy acp` on the dev Mac, run by the implementing agent with the CEO's machine)* `scripts/acp_smoke.py` passes against the real `agy acp`. It covers:
+  - HTTP MCP injection with bearer auth across two sessions, plus `session/resume`;
+  - a permission round-trip;
+  - an injected `hitl-channel` tool call that is auto-allowed with **zero** phone `choices` frames (proves the identification rule on the live wire);
+  - the hook-guard marker written with `HITL_HOOK_DEBUG=1` (proves `HITL_DAEMON_SESSION` reaches agy's hook subprocess).
+
+  If that marker check fails, implementation stops and goes back to the CEO (§4.2 item 9).
 
 ### Two checks on the finished list
 1. **Read as a set for contradictions.**
@@ -384,7 +400,7 @@ $ grep -n "backgroundGracePeriod" packages/hitl_agents/lib/src/services/claude_c
    - **AV2 vs AV13.** The 8790 default is a CLI default; the tests use ephemeral ports. Consistent.
 2. **Generated-string proxies.**
    - **AV1 and AV7** assert tool-list and instructions text. They are deliberate contract snapshots, and the behaviour behind them is covered by AV6, AV9 and CV3.
-   - **AV11** pairs its env/spawn-argument assertion with an end-to-end marker from a real agy session, so it is not a proxy-only check.
+   - **AV11** asserts spawn env plus hitl-cli unit behaviour. The live-wire proof that the environment reaches agy's hook subprocess is CV6, so the proxy gap is covered by an explicit external check.
 
 ## 7a. User-Story → AC Traceability
 
@@ -397,7 +413,7 @@ $ grep -n "backgroundGracePeriod" packages/hitl_agents/lib/src/services/claude_c
 | "message sent mid-turn is queued" | AV10 | |
 | "`/cancel` to stop the running turn" | AV10 | |
 | "permission requests show up as tappable Allow / Deny … even if backgrounded" | AV8, CV4 | |
-| "own LAN/Tailscale with the same pairing-code flow … no third party" | AV2, AV11, AV12, CV1, CV5 | |
+| "own LAN/Tailscale with the same pairing-code flow … no third party" | AV2, AV11, AV12, CV1, CV5, CV6 | |
 | "tools in my tool list, plus standing orders" | AV7, AV10, CV3 | |
 | "act on the phone as if I were running on it" | AV6, AV7, CV3 | |
 | "`<workflow_delegation message_id=X>` resolves with the final answer" | AV9 | an on-device workflow CV is optional in Phase 1 (the app can already target the daemon as a Claude Code instance) |
