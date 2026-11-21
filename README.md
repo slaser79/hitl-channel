@@ -19,7 +19,11 @@ hitl-channel is a TypeScript MCP server that enables bidirectional communication
 
 - [Bun](https://bun.sh) (recommended; required for `daemon` mode) or Node.js 20+ (Claude Code channel mode)
 - **Channel mode:** Claude Code v2.1.80+ (channels require research preview)
-- **Daemon mode (`--harness agy`):** Antigravity CLI (`agy` supporting `agy acp`) on `PATH`, plus `hitl-cli` hooks updated for `HITL_DAEMON_SESSION=1` if Antigravity Stop hooks are enabled
+- **Daemon mode:**
+  - `--harness agy`: Antigravity CLI (`agy` supporting `agy acp`) on `PATH` (or `HITL_AGY_BIN`)
+  - `--harness codex`: [`@agentclientprotocol/codex-acp`](https://www.npmjs.com/package/@agentclientprotocol/codex-acp) (`codex-acp` on `PATH`, `HITL_CODEX_ACP_BIN`, or automatic `npx -y @agentclientprotocol/codex-acp` fallback)
+  - `--harness hermes`: Hermes Agent CLI (`hermes acp` on `PATH`, or `HITL_HERMES_BIN`)
+  - If you use `hitl-cli` Stop/notify hooks (`hitl-hook-review-and-continue`, `hitl-codex-notify`), update `hitl-cli` so hooks honor `HITL_DAEMON_SESSION=1`
 
 ### Install
 
@@ -87,9 +91,11 @@ Claude Code (your terminal)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HITL_CHANNEL_PORT` | `8789` (`8790` in daemon mode) | HTTP/WebSocket bridge port |
+| `HITL_CHANNEL_PORT` | `8789` (`8790` `agy`, `8791` `codex`, `8792` `hermes`) | HTTP/WebSocket bridge port |
 | `HITL_CHANNEL_NAME` | `<harness>@<hostname>` (daemon mode) | Override instance display name |
 | `HITL_CHANNEL_IDENTITY_FILE` | `~/.hitl/channels/identity.json` (daemon: `identity-daemon-<harness>.json`) | Override identity file path |
+| `HITL_MCP_TRANSPORT` | `auto` (daemon mode) | MCP transport: `auto`, `http`, or `stdio` (`mcp-shim`) |
+| `HITL_AGY_BIN` / `HITL_CODEX_ACP_BIN` / `HITL_HERMES_BIN` | binary on `PATH` | Override harness binary path in daemon mode |
 | `HITL_CHANNEL_API_KEY` | (none) | Legacy API key auth (optional) |
 
 ## Data Storage
@@ -122,35 +128,42 @@ bun src/server.ts
 
 ## Daemon mode
 
-Run `hitl-channel` as a long-lived daemon to drive non-Claude ACP harnesses (Antigravity `agy` in Phase 1) directly from the HITL phone over LAN or Tailscale, without a cloud intermediary:
+Run `hitl-channel` as a long-lived daemon (one daemon per harness: `agy`, `codex`, or `hermes`) to drive ACP harnesses directly from the HITL phone over LAN or Tailscale, without a cloud intermediary:
 
 ```bash
-# Default port 8790, display name agy@<hostname>
-bun run src/cli.ts daemon --harness agy
-# or directly:
-bun run src/daemon.ts --harness agy --port 8790 --cwd ~/lab/hitl
+# Antigravity (default port 8790, display name agy@<hostname>)
+bun run src/cli.ts daemon --harness agy --cwd ~/lab/hitl
+
+# Codex via @agentclientprotocol/codex-acp (default port 8791)
+bun run src/cli.ts daemon --harness codex --cwd ~/lab/hitl
+
+# Hermes Agent (default port 8792)
+bun run src/cli.ts daemon --harness hermes --cwd ~/lab/hitl
 ```
+
+If an ACP harness does not support HTTP MCP (`mcpCapabilities.http === false`), daemon mode automatically falls back in `--mcp-transport auto` (or when forced via `--mcp-transport stdio`) to spawning `hitl-channel mcp-shim` as a stdio↔loopback-HTTP proxy.
 
 ### Pairing from the HITL App
 
-1. Confirm `agy` is installed and on `PATH` (`which agy`).
-2. Start the daemon (for example: `bun run src/cli.ts daemon --harness agy --cwd ~/lab/hitl`).
-3. Open the HITL app on your phone, add/discover your host on port `8790` (display name defaults to `agy@<hostname>`), and tap **Pair**.
+1. Confirm your chosen harness binary is on `PATH` (`which agy`, `which codex-acp` / `npx -y @agentclientprotocol/codex-acp`, or `which hermes`).
+2. Start the daemon for that harness (`bun run src/cli.ts daemon --harness <agy|codex|hermes> --cwd ~/lab/hitl`).
+3. Open the HITL app on your phone, add/discover your host on that harness's port (`8790` `agy`, `8791` `codex`, `8792` `hermes`), and tap **Pair**.
 4. Enter the 6-digit pairing code shown on daemon `stdout` (`PAIRING CODE: ...`) or in your desktop notification (`osascript` on macOS, `notify-send` on Linux).
 
 ### CLI Options
 
 | Flag | Default | Description |
 |---|---|---|
-| `--harness <name>` | `agy` | ACP harness to spawn (`agy` in Phase 1) |
-| `--port <port>` | `8790` (or `HITL_CHANNEL_PORT`) | HTTP/WS bridge listen port |
+| `--harness <name>` | `agy` | ACP harness to spawn (`agy`, `codex`, or `hermes`) |
+| `--port <port>` | `8790` (`agy`), `8791` (`codex`), `8792` (`hermes`) | HTTP/WS bridge listen port (or `HITL_CHANNEL_PORT`) |
 | `--name <displayName>` | `<harness>@<hostname>` | Override instance display name |
 | `--cwd <dir>` | current working directory | Default directory for auto-created / `/new` sessions |
+| `--mcp-transport <mode>` | `auto` (or `HITL_MCP_TRANSPORT`) | MCP injection mode: `auto`, `http`, or `stdio` (`mcp-shim`) |
 
 ### Phone Chat Slash Commands
 
 - `/help` — show supported daemon commands
-- `/new [harness] [cwd]` — create and switch to a new session (default cwd if omitted; Phase 1 harness: `agy`)
+- `/new [harness] [cwd]` — create and switch to a new session (default cwd if omitted; run a separate daemon per harness)
 - `/sessions` — list the 10 most recent sessions with title, folder, and relative time
 - `/resume <n|id>` — resume a session from `/sessions` (or by session ID)
 - `/cancel` — cancel any pending approval cards and stop the active turn
@@ -158,9 +171,9 @@ bun run src/daemon.ts --harness agy --port 8790 --cwd ~/lab/hitl
 
 ### Daemon Identity & Hook Isolation
 
-- **Separate identity:** Stored at `~/.hitl/channels/identity-daemon-<harness>.json` (override with `HITL_CHANNEL_IDENTITY_FILE`), so a daemon and a Claude Code channel session on the same host advertise distinct `instanceId`s.
+- **Separate identity:** Stored at `~/.hitl/channels/identity-daemon-<harness>.json` (override with `HITL_CHANNEL_IDENTITY_FILE`), so `agy`, `codex`, `hermes`, and Claude Code channel instances on the same host advertise distinct `instanceId`s.
 - **Shared allowlist:** Paired device tokens are stored in `~/.hitl/channels/allowlist.json` (SHA-256 hashed).
-- **Stop-hook isolation (`HITL_DAEMON_SESSION=1`):** The daemon sets `HITL_DAEMON_SESSION=1` in spawned `agy acp` subprocess environments. Updated `hitl-cli` Stop hooks (`hitl-hook-review-and-continue`, `review_and_continue_antigravity.py`, and `review_and_continue_wrapper.sh`) check `HITL_DAEMON_SESSION=1` and exit immediately without pinging the cloud relay or blocking turns. Set `HITL_HOOK_DEBUG=1` to log `daemon_session_skip` diagnostic markers.
+- **Hook isolation (`HITL_DAEMON_SESSION=1`):** The daemon sets `HITL_DAEMON_SESSION=1` in spawned harness subprocess environments. Updated `hitl-cli` hooks (`hitl-hook-review-and-continue`, `review_and_continue_antigravity.py`, `review_and_continue_wrapper.sh`, and `hitl-codex-notify`) check `HITL_DAEMON_SESSION=1` and exit immediately without pinging the cloud relay or blocking turns. Set `HITL_HOOK_DEBUG=1` to log `daemon_session_skip` diagnostic markers.
 
 ### Running at Login on macOS (`launchd`)
 
@@ -204,10 +217,12 @@ Save a plist such as `~/Library/LaunchAgents/com.hitl-channel.daemon.agy.plist` 
 
 Load it with `launchctl load ~/Library/LaunchAgents/com.hitl-channel.daemon.agy.plist`.
 
-### Wire Smoke (`agy acp`)
+### Wire Smoke (`agy` / `codex` / `hermes`)
 
 ```bash
-python3 scripts/acp_smoke.py
+python3 scripts/acp_smoke.py --harness agy
+python3 scripts/acp_smoke.py --harness codex --handshake-only
+python3 scripts/acp_smoke.py --harness hermes --handshake-only
 ```
 
 ## Related Projects

@@ -8,6 +8,7 @@ import {
   AcpSessionManager,
   HARNESS_REGISTRY,
   type AcpSessionManagerOptions,
+  type McpTransportMode,
 } from "./acp_session_manager.js";
 import { pruneOldAuditFiles } from "./audit.js";
 import { startHttpBridge } from "./http_bridge.js";
@@ -21,16 +22,41 @@ export interface DaemonCliArgs {
   port: number;
   name?: string;
   cwd: string;
+  mcpTransport: McpTransportMode;
   help: boolean;
+}
+
+function parseMcpTransportMode(raw: string): McpTransportMode {
+  if (raw === "auto" || raw === "http" || raw === "stdio") {
+    return raw;
+  }
+  throw new Error(
+    `Invalid --mcp-transport '${raw}'. Expected: auto, http, stdio`,
+  );
+}
+
+function parsePortNumber(raw: string, label: string): number {
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
+    throw new Error(`Invalid ${label}: ${raw}`);
+  }
+  return parsed;
 }
 
 export function parseDaemonArgs(argv: string[]): DaemonCliArgs {
   let harness = "agy";
-  const envPort = process.env.HITL_CHANNEL_PORT;
-  let port =
-    envPort !== undefined && envPort.trim() !== "" ? Number(envPort) : 8790;
+  const rawEnvPort = process.env.HITL_CHANNEL_PORT;
+  const envPort =
+    rawEnvPort !== undefined && rawEnvPort.trim() !== ""
+      ? parsePortNumber(rawEnvPort, "HITL_CHANNEL_PORT")
+      : undefined;
+  let explicitPort: number | undefined;
   let name: string | undefined;
   let cwd = process.cwd();
+  const rawEnvTransport = process.env.HITL_MCP_TRANSPORT?.trim();
+  let mcpTransport: McpTransportMode = rawEnvTransport
+    ? parseMcpTransportMode(rawEnvTransport)
+    : "auto";
   let help = false;
 
   for (let i = 0; i < argv.length; i++) {
@@ -50,11 +76,7 @@ export function parseDaemonArgs(argv: string[]): DaemonCliArgs {
       if (raw === undefined || raw === "") {
         throw new Error("--port requires a value");
       }
-      const parsed = Number(raw);
-      if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
-        throw new Error(`Invalid port: ${raw}`);
-      }
-      port = parsed;
+      explicitPort = parsePortNumber(raw, "port");
       continue;
     }
     if (arg === "--name" || arg.startsWith("--name=")) {
@@ -69,6 +91,14 @@ export function parseDaemonArgs(argv: string[]): DaemonCliArgs {
       cwd = val;
       continue;
     }
+    if (arg === "--mcp-transport" || arg.startsWith("--mcp-transport=")) {
+      const val = arg.includes("=")
+        ? arg.slice("--mcp-transport=".length)
+        : argv[++i];
+      if (!val) throw new Error("--mcp-transport requires a value");
+      mcpTransport = parseMcpTransportMode(val);
+      continue;
+    }
     throw new Error(`Unknown daemon flag: ${arg}`);
   }
 
@@ -78,7 +108,10 @@ export function parseDaemonArgs(argv: string[]): DaemonCliArgs {
     );
   }
 
-  return { harness, port, name, cwd, help };
+  const defaultPort = HARNESS_REGISTRY[harness]?.defaultPort ?? 8790;
+  const port = explicitPort ?? envPort ?? defaultPort;
+
+  return { harness, port, name, cwd, mcpTransport, help };
 }
 
 function constantTimeBearerMatch(
@@ -95,6 +128,7 @@ function constantTimeBearerMatch(
 
 export interface LoopbackMcpServerOptions {
   token?: string;
+  getFallbackAcpSessionId?: () => string | null;
   onChoicesPresented?: () => void;
   onReplySent?: (acpSessionId?: string | null) => void;
 }
@@ -176,12 +210,16 @@ export function startLoopbackMcpServer(
               })(),
             });
 
+      const requestAcpSessionId =
+        req.headers.get("x-hitl-acp-session-id")?.trim() || null;
       const mcpServer = new Server(
         { name: "hitl-channel", version: "0.1.0" },
         { capabilities: { tools: {} } },
       );
       registerHitlTools(mcpServer, {
         mode: "daemon",
+        requestAcpSessionId,
+        getFallbackAcpSessionId: opts.getFallbackAcpSessionId,
         onChoicesPresented: opts.onChoicesPresented,
         onReplySent: opts.onReplySent,
       });
@@ -239,6 +277,7 @@ export interface StartDaemonOptions {
   port?: number;
   name?: string;
   cwd?: string;
+  mcpTransport?: McpTransportMode;
   identityFile?: string;
   enableMdns?: boolean;
   enableDesktopNotifications?: boolean;
@@ -262,14 +301,22 @@ export async function startDaemon(
   options: StartDaemonOptions = {},
 ): Promise<DaemonHandle> {
   const harness = options.harness ?? "agy";
-  if (!HARNESS_REGISTRY[harness]) {
+  const harnessDef = HARNESS_REGISTRY[harness];
+  if (!harnessDef) {
     throw new Error(`Unsupported harness '${harness}'`);
   }
 
+  const rawEnvPort = process.env.HITL_CHANNEL_PORT?.trim();
   const requestedPort =
     options.port !== undefined
       ? options.port
-      : Number(process.env.HITL_CHANNEL_PORT ?? 8790);
+      : rawEnvPort
+        ? parsePortNumber(rawEnvPort, "HITL_CHANNEL_PORT")
+        : harnessDef.defaultPort;
+  const rawEnvTransport = process.env.HITL_MCP_TRANSPORT?.trim();
+  const mcpTransport: McpTransportMode =
+    options.mcpTransport ??
+    (rawEnvTransport ? parseMcpTransportMode(rawEnvTransport) : "auto");
 
   const home = process.env.HOME?.trim() || homedir();
   const identityFile =
@@ -292,6 +339,7 @@ export async function startDaemon(
   let manager!: AcpSessionManager;
 
   const mcpHandle = startLoopbackMcpServer({
+    getFallbackAcpSessionId: () => manager.getAttributionSessionId(),
     onChoicesPresented: () => manager.onChoicesPresented(),
     onReplySent: (sid) => manager.onReplySent(sid),
   });
@@ -301,6 +349,7 @@ export async function startDaemon(
     defaultCwd: options.cwd ?? process.cwd(),
     mcpUrl: mcpHandle.url,
     mcpToken: mcpHandle.token,
+    mcpTransport,
     instanceId: identity.instanceId,
     transportFactory: options.transportFactory,
     outOfTurnQuietMs: options.outOfTurnQuietMs,
@@ -382,11 +431,12 @@ export async function runDaemonCli(argv: string[]): Promise<void> {
         "Usage: hitl-channel daemon [options]",
         "",
         "Options:",
-        "  --harness <name>   ACP harness to run (default: agy)",
-        "  --port <port>      HTTP/WS bridge port (default: 8790)",
-        "  --name <name>      Display name (default: <harness>@<hostname>)",
-        "  --cwd <dir>        Default working directory (default: cwd)",
-        "  -h, --help         Show this help message",
+        "  --harness <name>          ACP harness to run: agy, codex, hermes (default: agy)",
+        "  --port <port>             HTTP/WS bridge port (defaults: agy=8790, codex=8791, hermes=8792)",
+        "  --name <name>             Display name (default: <harness>@<hostname>)",
+        "  --cwd <dir>               Default working directory (default: cwd)",
+        "  --mcp-transport <mode>    MCP transport: auto, http, stdio (default: auto)",
+        "  -h, --help                Show this help message",
         "",
       ].join("\n"),
     );
@@ -415,6 +465,7 @@ export async function runDaemonCli(argv: string[]): Promise<void> {
     port: parsed.port,
     name: parsed.name,
     cwd: parsed.cwd,
+    mcpTransport: parsed.mcpTransport,
   });
 
   if (exitRequestedDuringBoot) {

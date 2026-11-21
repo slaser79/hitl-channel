@@ -266,7 +266,24 @@ def wait_for_reply(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="CV6 live wire smoke against agy acp")
+    parser = argparse.ArgumentParser(description="CV6 live wire smoke against real ACP harnesses")
+    parser.add_argument(
+        "--harness",
+        choices=["agy", "codex", "hermes"],
+        default="agy",
+        help="ACP harness to test (default: agy)",
+    )
+    parser.add_argument(
+        "--mcp-transport",
+        choices=["auto", "http", "stdio"],
+        default="auto",
+        help="MCP injection transport for daemon mode (default: auto)",
+    )
+    parser.add_argument(
+        "--handshake-only",
+        action="store_true",
+        help="Verify daemon boot, /new, /sessions, /resume, and SIGTERM cleanup without running an LLM prompt turn",
+    )
     parser.add_argument("--bun", help="Path to bun executable")
     parser.add_argument("--timeout", type=float, default=120.0, help="Per-turn timeout in seconds")
     args = parser.parse_args()
@@ -317,7 +334,19 @@ def main() -> int:
 
     stderr_lines: list[str] = []
     daemon_proc = subprocess.Popen(
-        [bun_bin, "run", "src/daemon.ts", "--harness", "agy", "--port", str(port), "--cwd", "/tmp"],
+        [
+            bun_bin,
+            "run",
+            "src/daemon.ts",
+            "--harness",
+            args.harness,
+            "--mcp-transport",
+            args.mcp_transport,
+            "--port",
+            str(port),
+            "--cwd",
+            "/tmp",
+        ],
         cwd=str(repo_root),
         env=env,
         stdout=subprocess.PIPE,
@@ -411,116 +440,135 @@ def main() -> int:
                 items.append(choices_frames.get_nowait())
             return items
 
-        # ── Check 1: Session 1 + HTTP MCP bearer + auto-allow + hook guard ───────────
-        print("[smoke] Step 1: /new /tmp + smoke_ping (auto-allow + hook guard)")
+        # ── Check 1: Session 1 (+ full prompt/MCP check unless --handshake-only) ──────
+        print(f"[smoke] Step 1 ({args.harness}/{args.mcp_transport}): /new /tmp")
         post_msg({"message": "/new /tmp"})
-        r_new1 = wait_for_reply(replies, lambda f: "New agy session" in f.get("text", ""), timeout=args.timeout)
+        r_new1 = wait_for_reply(replies, lambda f: f"New {args.harness} session" in f.get("text", ""), timeout=args.timeout)
         m1 = re.search(r"\(id ([^)]+)\)", r_new1["text"])
         if not m1:
             raise RuntimeError(f"Could not parse session1 id from: {r_new1['text']}")
         session1_id = m1.group(1)
         print(f"[smoke]   session1_id={session1_id}")
 
-        drain_choices()
-        post_msg({
-            "message": (
-                "Call the hitl-channel MCP tool call_phone_tool with name=\"smoke_ping\" "
-                "and arguments={}. Reply with ONLY the exact token string it returns."
-            ),
-        })
-        r_p1 = wait_for_reply(replies, lambda f: tokens["smoke_ping"] in f.get("text", ""), timeout=args.timeout)
-        print(f"[smoke]   session1 reply={r_p1['text']!r}")
-        if "smoke_ping" not in tool_calls_seen:
-            raise RuntimeError("smoke_ping did not reach simulated phone")
-        extra_choices_1 = drain_choices()
-        if extra_choices_1:
-            raise RuntimeError(f"Expected 0 choices frames for auto-allowed hitl tool, got {extra_choices_1}")
-        if not hook_debug_file.exists():
-            raise RuntimeError(f"Hook debug file was not created: {hook_debug_file}")
-        hook_log = hook_debug_file.read_text(encoding="utf-8")
-        if "daemon_session_skip" not in hook_log:
-            raise RuntimeError(f"Hook guard marker missing from {hook_debug_file}: {hook_log!r}")
-        print("[smoke]   PASS: HTTP MCP bearer auth, auto-allow (0 choices), and hook guard marker verified")
+        if args.handshake_only:
+            print(f"[smoke] Step 2 (handshake-only): /sessions + /resume {session1_id}")
+            post_msg({"message": "/sessions"})
+            r_sess = wait_for_reply(
+                replies,
+                lambda f: "1. " in f.get("text", "") or "No sessions found" in f.get("text", ""),
+                timeout=args.timeout,
+            )
+            print(f"[smoke]   /sessions top line={r_sess['text'].splitlines()[0]!r}")
 
-        # ── Check 2: Session 2 via stateless loopback MCP ────────────────────────────
-        print("[smoke] Step 2: /new /tmp + smoke_ping_2 (second sequential session)")
-        post_msg({"message": "/new /tmp"})
-        r_new2 = wait_for_reply(replies, lambda f: "New agy session" in f.get("text", ""), timeout=args.timeout)
-        m2 = re.search(r"\(id ([^)]+)\)", r_new2["text"])
-        if not m2:
-            raise RuntimeError(f"Could not parse session2 id from: {r_new2['text']}")
-        session2_id = m2.group(1)
-        assert session2_id != session1_id, "Expected distinct session2_id"
-        print(f"[smoke]   session2_id={session2_id}")
+            post_msg({"message": f"/resume {session1_id}"})
+            r_res = wait_for_reply(replies, lambda f: "Resumed" in f.get("text", ""), timeout=args.timeout)
+            print(f"[smoke]   /resume reply={r_res['text']!r}")
+        else:
+            drain_choices()
+            post_msg({
+                "message": (
+                    "Call the hitl-channel MCP tool call_phone_tool with name=\"smoke_ping\" "
+                    "and arguments={}. Reply with ONLY the exact token string it returns."
+                ),
+            })
+            r_p1 = wait_for_reply(replies, lambda f: tokens["smoke_ping"] in f.get("text", ""), timeout=args.timeout)
+            print(f"[smoke]   session1 reply={r_p1['text']!r}")
+            if "smoke_ping" not in tool_calls_seen:
+                raise RuntimeError("smoke_ping did not reach simulated phone")
+            extra_choices_1 = drain_choices()
+            if extra_choices_1:
+                raise RuntimeError(f"Expected 0 choices frames for auto-allowed hitl tool, got {extra_choices_1}")
+            if hook_debug_file.exists():
+                hook_log = hook_debug_file.read_text(encoding="utf-8")
+                if args.harness == "agy" and "daemon_session_skip" not in hook_log:
+                    raise RuntimeError(f"Hook guard marker missing from {hook_debug_file}: {hook_log!r}")
+                print(f"[smoke]   hook debug log lines={len(hook_log.splitlines())}")
+            elif args.harness == "agy":
+                raise RuntimeError(f"Hook debug file was not created: {hook_debug_file}")
+            print("[smoke]   PASS: MCP auth, auto-allow (0 choices), and hook isolation checked")
 
-        drain_choices()
-        post_msg({
-            "message": (
-                "Call the hitl-channel MCP tool call_phone_tool with name=\"smoke_ping_2\" "
-                "and arguments={}. Reply with ONLY the exact token string it returns."
-            ),
-        })
-        r_p2 = wait_for_reply(replies, lambda f: tokens["smoke_ping_2"] in f.get("text", ""), timeout=args.timeout)
-        print(f"[smoke]   session2 reply={r_p2['text']!r}")
-        if "smoke_ping_2" not in tool_calls_seen:
-            raise RuntimeError("smoke_ping_2 did not reach simulated phone")
-        extra_choices_2 = drain_choices()
-        if extra_choices_2:
-            raise RuntimeError(f"Expected 0 choices frames in session 2, got {extra_choices_2}")
-        print("[smoke]   PASS: Session 2 MCP round-trip + auto-allow verified")
+            # ── Check 2: Session 2 via stateless loopback MCP ────────────────────────────
+            print("[smoke] Step 2: /new /tmp + smoke_ping_2 (second sequential session)")
+            post_msg({"message": "/new /tmp"})
+            r_new2 = wait_for_reply(replies, lambda f: f"New {args.harness} session" in f.get("text", ""), timeout=args.timeout)
+            m2 = re.search(r"\(id ([^)]+)\)", r_new2["text"])
+            if not m2:
+                raise RuntimeError(f"Could not parse session2 id from: {r_new2['text']}")
+            session2_id = m2.group(1)
+            assert session2_id != session1_id, "Expected distinct session2_id"
+            print(f"[smoke]   session2_id={session2_id}")
 
-        # ── Check 3: /sessions + /resume <session1_id> ───────────────────────────────
-        print(f"[smoke] Step 3: /sessions + /resume {session1_id}")
-        post_msg({"message": "/sessions"})
-        r_sess = wait_for_reply(replies, lambda f: "1. " in f.get("text", ""), timeout=args.timeout)
-        print(f"[smoke]   /sessions top line={r_sess['text'].splitlines()[0]!r}")
+            drain_choices()
+            post_msg({
+                "message": (
+                    "Call the hitl-channel MCP tool call_phone_tool with name=\"smoke_ping_2\" "
+                    "and arguments={}. Reply with ONLY the exact token string it returns."
+                ),
+            })
+            r_p2 = wait_for_reply(replies, lambda f: tokens["smoke_ping_2"] in f.get("text", ""), timeout=args.timeout)
+            print(f"[smoke]   session2 reply={r_p2['text']!r}")
+            if "smoke_ping_2" not in tool_calls_seen:
+                raise RuntimeError("smoke_ping_2 did not reach simulated phone")
+            extra_choices_2 = drain_choices()
+            if extra_choices_2:
+                raise RuntimeError(f"Expected 0 choices frames in session 2, got {extra_choices_2}")
+            print("[smoke]   PASS: Session 2 MCP round-trip + auto-allow verified")
 
-        post_msg({"message": f"/resume {session1_id}"})
-        r_res = wait_for_reply(replies, lambda f: "Resumed" in f.get("text", ""), timeout=args.timeout)
-        print(f"[smoke]   /resume reply={r_res['text']!r}")
+            # ── Check 3: /sessions + /resume <session1_id> ───────────────────────────────
+            print(f"[smoke] Step 3: /sessions + /resume {session1_id}")
+            post_msg({"message": "/sessions"})
+            r_sess = wait_for_reply(replies, lambda f: "1. " in f.get("text", ""), timeout=args.timeout)
+            print(f"[smoke]   /sessions top line={r_sess['text'].splitlines()[0]!r}")
 
-        drain_choices()
-        post_msg({
-            "message": (
-                "Call the hitl-channel MCP tool call_phone_tool with name=\"smoke_ping_resume\" "
-                "and arguments={}. Reply with ONLY the exact token string it returns."
-            ),
-        })
-        r_p3 = wait_for_reply(replies, lambda f: tokens["smoke_ping_resume"] in f.get("text", ""), timeout=args.timeout)
-        print(f"[smoke]   resumed session reply={r_p3['text']!r}")
-        if drain_choices():
-            raise RuntimeError("Expected 0 choices frames on resumed session hitl tool")
-        print("[smoke]   PASS: session/resume with re-injected MCP verified")
+            post_msg({"message": f"/resume {session1_id}"})
+            r_res = wait_for_reply(replies, lambda f: "Resumed" in f.get("text", ""), timeout=args.timeout)
+            print(f"[smoke]   /resume reply={r_res['text']!r}")
 
-        # ── Check 4: Non-hitl tool permission round-trip ─────────────────────────────
-        print("[smoke] Step 4: Non-hitl permission round-trip (Allow via choice_response)")
-        if perm_target_file.exists():
-            perm_target_file.unlink()
-        drain_choices()
-        post_msg({
-            "message": (
-                f"Run this exact shell command: printf 'SMOKE_PERM_OK\\n' > {perm_target_file} "
-                "and then reply with DONE."
-            ),
-        })
-        perm_card = choices_frames.get(timeout=args.timeout)
-        print(f"[smoke]   received permission choices card: {perm_card.get('content')!r} options={perm_card.get('choices')}")
-        options = perm_card.get("choices") or []
-        allow_label = next((c for c in options if "allow" in str(c).lower()), options[0] if options else "Allow")
-        post_msg({
-            "type": "choice_response",
-            "content": allow_label,
-            "selections": [allow_label],
-        })
-        r_perm = wait_for_reply(
-            replies,
-            lambda f: "DONE" in f.get("text", "").upper() or "SMOKE_PERM_OK" in f.get("text", ""),
-            timeout=args.timeout,
-        )
-        print(f"[smoke]   permission turn reply={r_perm['text']!r}")
-        if not perm_target_file.exists():
-            raise RuntimeError(f"Expected shell command to create {perm_target_file} after Allow")
-        print("[smoke]   PASS: Permission card -> choice_response Allow -> command executed")
+            drain_choices()
+            post_msg({
+                "message": (
+                    "Call the hitl-channel MCP tool call_phone_tool with name=\"smoke_ping_resume\" "
+                    "and arguments={}. Reply with ONLY the exact token string it returns."
+                ),
+            })
+            r_p3 = wait_for_reply(replies, lambda f: tokens["smoke_ping_resume"] in f.get("text", ""), timeout=args.timeout)
+            print(f"[smoke]   resumed session reply={r_p3['text']!r}")
+            if drain_choices():
+                raise RuntimeError("Expected 0 choices frames on resumed session hitl tool")
+            print("[smoke]   PASS: session/resume with re-injected MCP verified")
+
+            # ── Check 4: Non-hitl tool permission round-trip ─────────────────────────────
+            print("[smoke] Step 4: Non-hitl permission round-trip (Allow via choice_response)")
+            if perm_target_file.exists():
+                perm_target_file.unlink()
+            drain_choices()
+            post_msg({
+                "message": (
+                    f"Run this exact shell command: printf 'SMOKE_PERM_OK\\n' > {perm_target_file} "
+                    "and then reply with DONE."
+                ),
+            })
+            perm_card = choices_frames.get(timeout=args.timeout)
+            print(f"[smoke]   received permission choices card: {perm_card.get('content')!r} options={perm_card.get('choices')}")
+            options = perm_card.get("choices") or []
+            allow_label = next(
+                (c for c in options if any(tok in str(c).lower() for tok in ("allow", "yes"))),
+                options[0] if options else "Allow",
+            )
+            post_msg({
+                "type": "choice_response",
+                "content": allow_label,
+                "selections": [allow_label],
+            })
+            r_perm = wait_for_reply(
+                replies,
+                lambda f: "DONE" in f.get("text", "").upper() or "SMOKE_PERM_OK" in f.get("text", ""),
+                timeout=args.timeout,
+            )
+            print(f"[smoke]   permission turn reply={r_perm['text']!r}")
+            if not perm_target_file.exists():
+                raise RuntimeError(f"Expected shell command to create {perm_target_file} after Allow")
+            print("[smoke]   PASS: Permission card -> choice_response Allow -> command executed")
 
         # ── Check 5: SIGTERM clean shutdown + pgid cleanup <= 5s ─────────────────────
         print("[smoke] Step 5: SIGTERM clean shutdown")
@@ -539,7 +587,7 @@ def main() -> int:
         if surviving_pgid_pids:
             raise RuntimeError(f"Detached child process group still alive after SIGTERM: {surviving_pgid_pids}")
         print("[smoke]   PASS: Daemon and all descendant/process-group children terminated cleanly")
-        print("CV6_ACP_SMOKE_PASS")
+        print("CV6_HANDSHAKE_SMOKE_PASS" if args.handshake_only else "CV6_ACP_SMOKE_PASS")
         return 0
     finally:
         if ws is not None:

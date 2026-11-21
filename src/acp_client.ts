@@ -23,6 +23,11 @@ export type AcpContentBlock =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string };
 
+export interface AcpSystemPrompt {
+  mode: "append";
+  content: Array<{ type: "text"; text: string }>;
+}
+
 export interface AcpSessionInfo {
   sessionId: string;
   cwd?: string;
@@ -67,6 +72,13 @@ export interface AcpAgentCapabilities {
     close?: Record<string, unknown>;
     load?: Record<string, unknown>;
     list?: Record<string, unknown>;
+    systemPrompt?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+  mcpCapabilities?: {
+    http?: boolean;
+    sse?: boolean;
+    acp?: boolean;
     [key: string]: unknown;
   };
   promptCapabilities?: {
@@ -99,6 +111,11 @@ export interface AcpSessionUpdateParams {
     sessionUpdate: string;
     content?: { type?: string; text?: string };
     title?: string;
+    toolCallId?: string;
+    name?: string;
+    kind?: string;
+    rawInput?: unknown;
+    status?: string;
     [key: string]: unknown;
   };
   [key: string]: unknown;
@@ -485,12 +502,36 @@ export class AcpClient {
     });
   }
 
+  private buildSessionLifecyclePayload<
+    T extends {
+      cwd: string;
+      mcpServers: AcpMcpServer[];
+      systemPrompt?: AcpSystemPrompt;
+      _meta?: Record<string, unknown>;
+      sessionId?: string;
+    },
+  >(params: T): Record<string, unknown> {
+    const payload: Record<string, unknown> = {
+      ...(params.sessionId !== undefined ? { sessionId: params.sessionId } : {}),
+      cwd: params.cwd,
+      mcpServers: params.mcpServers,
+    };
+    if (params.systemPrompt !== undefined) {
+      payload.systemPrompt = params.systemPrompt;
+    }
+    if (params._meta !== undefined) {
+      payload._meta = params._meta;
+    }
+    return payload;
+  }
+
   async sessionNew(params: {
     cwd: string;
     mcpServers: AcpMcpServer[];
+    systemPrompt?: AcpSystemPrompt;
     _meta?: Record<string, unknown>;
   }): Promise<{ sessionId: string; [key: string]: unknown }> {
-    return this.request("session/new", params);
+    return this.request("session/new", this.buildSessionLifecyclePayload(params));
   }
 
   async sessionList(
@@ -521,18 +562,20 @@ export class AcpClient {
     sessionId: string;
     cwd: string;
     mcpServers: AcpMcpServer[];
+    systemPrompt?: AcpSystemPrompt;
     _meta?: Record<string, unknown>;
   }): Promise<{ [key: string]: unknown }> {
-    return this.request("session/resume", params);
+    return this.request("session/resume", this.buildSessionLifecyclePayload(params));
   }
 
   async sessionLoad(params: {
     sessionId: string;
     cwd: string;
     mcpServers: AcpMcpServer[];
+    systemPrompt?: AcpSystemPrompt;
     _meta?: Record<string, unknown>;
   }): Promise<{ [key: string]: unknown }> {
-    return this.request("session/load", params);
+    return this.request("session/load", this.buildSessionLifecyclePayload(params));
   }
 
   async sessionPrompt(params: {

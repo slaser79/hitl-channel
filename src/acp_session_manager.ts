@@ -1,6 +1,7 @@
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   AcpClient,
   spawnAcpTransport,
@@ -12,6 +13,7 @@ import {
   type AcpPermissionToolCall,
   type AcpSessionInfo,
   type AcpSessionUpdateParams,
+  type AcpSystemPrompt,
   type AcpTransport,
 } from "./acp_client.js";
 import { appendAudit, sha256Hex, stableStringify } from "./audit.js";
@@ -25,13 +27,26 @@ import {
 import { DAEMON_INSTRUCTIONS } from "./mcp_instructions.js";
 import type { HitlAttachment } from "./types.js";
 
+export type McpTransportMode = "auto" | "http" | "stdio";
+export type SystemPromptStrategy =
+  | "agy_meta"
+  | "acp_system_prompt"
+  | "first_prompt_prefix";
+
 export interface HarnessDefinition {
   name: string;
   command: string;
   args: string[];
+  fallbackCommand?: string;
+  fallbackArgs?: string[];
+  commandEnvVar?: string;
+  defaultPort: number;
+  defaultMcpTransport: "http" | "stdio";
   mcpServerName: string;
   autoAllowPrefixes: string[];
-  buildSystemPromptMeta(instructions: string): Record<string, unknown>;
+  matchBareTitlePrefix: boolean;
+  systemPromptStrategy: SystemPromptStrategy;
+  buildSystemPromptMeta?: (instructions: string) => Record<string, unknown>;
 }
 
 export const HARNESS_REGISTRY: Record<string, HarnessDefinition> = {
@@ -39,8 +54,13 @@ export const HARNESS_REGISTRY: Record<string, HarnessDefinition> = {
     name: "agy",
     command: "agy",
     args: ["acp"],
+    commandEnvVar: "HITL_AGY_BIN",
+    defaultPort: 8790,
+    defaultMcpTransport: "http",
     mcpServerName: "hitl-channel",
     autoAllowPrefixes: ["mcp_hitl-channel_"],
+    matchBareTitlePrefix: false,
+    systemPromptStrategy: "agy_meta",
     buildSystemPromptMeta(instructions: string) {
       return {
         antigravity: {
@@ -51,7 +71,92 @@ export const HARNESS_REGISTRY: Record<string, HarnessDefinition> = {
       };
     },
   },
+  codex: {
+    name: "codex",
+    command: "codex-acp",
+    args: [],
+    fallbackCommand: "npx",
+    fallbackArgs: ["-y", "@agentclientprotocol/codex-acp"],
+    commandEnvVar: "HITL_CODEX_ACP_BIN",
+    defaultPort: 8791,
+    defaultMcpTransport: "http",
+    mcpServerName: "hitl-channel",
+    autoAllowPrefixes: ["mcp.hitl-channel."],
+    matchBareTitlePrefix: true,
+    systemPromptStrategy: "acp_system_prompt",
+  },
+  hermes: {
+    name: "hermes",
+    command: "hermes",
+    args: ["acp"],
+    commandEnvVar: "HITL_HERMES_BIN",
+    defaultPort: 8792,
+    defaultMcpTransport: "http",
+    mcpServerName: "hitl-channel",
+    autoAllowPrefixes: ["mcp__hitl_channel__"],
+    matchBareTitlePrefix: true,
+    systemPromptStrategy: "first_prompt_prefix",
+  },
 };
+
+export function resolveHarnessLaunch(
+  def: HarnessDefinition,
+  env: NodeJS.ProcessEnv = process.env,
+  whichFn: (cmd: string) => string | null = (cmd) => Bun.which(cmd),
+): { command: string; args: string[] } {
+  if (def.commandEnvVar) {
+    const override = env[def.commandEnvVar]?.trim();
+    if (override) {
+      return { command: override, args: [...def.args] };
+    }
+  }
+  if (!def.fallbackCommand || whichFn(def.command)) {
+    return { command: def.command, args: [...def.args] };
+  }
+  return {
+    command: def.fallbackCommand,
+    args: [...(def.fallbackArgs ?? def.args)],
+  };
+}
+
+function hasCommandField(rawInput: unknown): boolean {
+  if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) {
+    return false;
+  }
+  return typeof (rawInput as Record<string, unknown>).command === "string";
+}
+
+function evaluateOwnHitlCandidate(
+  candidate: AcpPermissionToolCall,
+  autoAllowPrefixes: string[],
+  matchBareTitlePrefix: boolean,
+  extraRawInput?: unknown,
+): { decided: boolean; allowed: boolean } {
+  const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
+  const title = typeof candidate.title === "string" ? candidate.title.trim() : "";
+
+  if (name.length > 0) {
+    return {
+      decided: true,
+      allowed: autoAllowPrefixes.some((prefix) => name.startsWith(prefix)),
+    };
+  }
+  if (title.length > 0) {
+    if (autoAllowPrefixes.some((prefix) => title.startsWith(`Run ${prefix}`))) {
+      return { decided: true, allowed: true };
+    }
+    if (
+      matchBareTitlePrefix &&
+      autoAllowPrefixes.some((prefix) => title.startsWith(prefix)) &&
+      !hasCommandField(candidate.rawInput) &&
+      !hasCommandField(extraRawInput)
+    ) {
+      return { decided: true, allowed: true };
+    }
+    return { decided: true, allowed: false };
+  }
+  return { decided: false, allowed: false };
+}
 
 /**
  * Fail-closed check for whether a `session/request_permission` belongs to the
@@ -61,14 +166,31 @@ export const HARNESS_REGISTRY: Record<string, HarnessDefinition> = {
 export function isOwnHitlTool(
   toolCall: AcpPermissionToolCall,
   autoAllowPrefixes: string[],
+  opts?: {
+    matchBareTitlePrefix?: boolean;
+    correlatedToolCall?: AcpPermissionToolCall;
+  },
 ): boolean {
-  const name = typeof toolCall.name === "string" ? toolCall.name : "";
-  if (name.length > 0) {
-    return autoAllowPrefixes.some((prefix) => name.startsWith(prefix));
+  const matchBare = opts?.matchBareTitlePrefix ?? false;
+  const direct = evaluateOwnHitlCandidate(
+    toolCall,
+    autoAllowPrefixes,
+    matchBare,
+    opts?.correlatedToolCall?.rawInput,
+  );
+  if (direct.decided) {
+    return direct.allowed;
   }
-  const title = typeof toolCall.title === "string" ? toolCall.title : "";
-  if (title.length > 0) {
-    return autoAllowPrefixes.some((prefix) => title.startsWith(`Run ${prefix}`));
+  if (opts?.correlatedToolCall) {
+    const correlated = evaluateOwnHitlCandidate(
+      opts.correlatedToolCall,
+      autoAllowPrefixes,
+      matchBare,
+      toolCall.rawInput,
+    );
+    if (correlated.decided) {
+      return correlated.allowed;
+    }
   }
   return false;
 }
@@ -81,13 +203,24 @@ export function extractWorkflowDelegationMessageId(text: string): string | null 
   return match[1] ?? match[2] ?? match[3] ?? null;
 }
 
-function deriveToolName(toolCall: AcpPermissionToolCall): string {
-  if (typeof toolCall.name === "string" && toolCall.name.trim().length > 0) {
-    return toolCall.name.trim();
-  }
-  if (typeof toolCall.title === "string" && toolCall.title.trim().length > 0) {
-    const title = toolCall.title.trim();
+function deriveToolName(
+  toolCall: AcpPermissionToolCall,
+  correlated?: AcpPermissionToolCall,
+): string {
+  const name = typeof toolCall.name === "string" ? toolCall.name.trim() : "";
+  if (name.length > 0) return name;
+  const title = typeof toolCall.title === "string" ? toolCall.title.trim() : "";
+  if (title.length > 0) {
     return title.startsWith("Run ") ? title.slice(4).trim() : title;
+  }
+  if (correlated) {
+    const corrName = typeof correlated.name === "string" ? correlated.name.trim() : "";
+    if (corrName.length > 0) return corrName;
+    const corrTitle =
+      typeof correlated.title === "string" ? correlated.title.trim() : "";
+    if (corrTitle.length > 0) {
+      return corrTitle.startsWith("Run ") ? corrTitle.slice(4).trim() : corrTitle;
+    }
   }
   if (typeof toolCall.kind === "string" && toolCall.kind.trim().length > 0) {
     return toolCall.kind.trim();
@@ -105,12 +238,19 @@ function oneLineSummary(value: unknown): string {
   }
 }
 
-function formatPermissionPrompt(toolCall: AcpPermissionToolCall): string {
-  const title =
-    typeof toolCall.title === "string" && toolCall.title.trim().length > 0
-      ? toolCall.title.trim()
-      : deriveToolName(toolCall);
-  const inputSummary = oneLineSummary(toolCall.rawInput);
+function formatPermissionPrompt(
+  toolCall: AcpPermissionToolCall,
+  correlated?: AcpPermissionToolCall,
+): string {
+  const ownTitle = typeof toolCall.title === "string" ? toolCall.title.trim() : "";
+  const corrTitle =
+    correlated && typeof correlated.title === "string"
+      ? correlated.title.trim()
+      : "";
+  const title = ownTitle || corrTitle || deriveToolName(toolCall, correlated);
+  const rawInput =
+    toolCall.rawInput !== undefined ? toolCall.rawInput : correlated?.rawInput;
+  const inputSummary = oneLineSummary(rawInput);
   const raw = inputSummary ? `${title}: ${inputSummary}` : title;
   return raw.length > 300 ? `${raw.slice(0, 297)}...` : raw;
 }
@@ -169,6 +309,8 @@ export interface AcpSessionManagerOptions {
   defaultCwd?: string;
   mcpUrl: string;
   mcpToken: string;
+  mcpTransport?: McpTransportMode;
+  cliScriptPath?: string;
   instanceId: string;
   onPairingCode?: (code: string) => void | Promise<void>;
   transportFactory?: (
@@ -190,6 +332,8 @@ export class AcpSessionManager {
   readonly defaultCwd: string;
   private readonly mcpUrl: string;
   private readonly mcpToken: string;
+  private readonly mcpTransport: McpTransportMode;
+  private readonly cliScriptPath: string;
   private readonly instanceId: string;
   private readonly onPairingCodeCb: (code: string) => void | Promise<void>;
   private readonly transportFactory: (
@@ -228,6 +372,9 @@ export class AcpSessionManager {
 
   private lastListing: AcpSessionInfo[] = [];
   private readonly loadingSessionIds = new Set<string>();
+  private readonly instructionsDeliveredSessions = new Set<string>();
+  private readonly seenToolCalls = new Map<string, AcpPermissionToolCall>();
+  private static readonly MAX_SEEN_TOOL_CALLS = 500;
 
   private crashTimestamps: number[] = [];
   private restartStopped = false;
@@ -243,6 +390,9 @@ export class AcpSessionManager {
     this.defaultCwd = resolvePath(opts.defaultCwd ?? process.cwd());
     this.mcpUrl = opts.mcpUrl;
     this.mcpToken = opts.mcpToken;
+    this.mcpTransport = opts.mcpTransport ?? "auto";
+    this.cliScriptPath =
+      opts.cliScriptPath ?? fileURLToPath(new URL("./cli.ts", import.meta.url));
     this.instanceId = opts.instanceId;
     this.onPairingCodeCb = opts.onPairingCode ?? (() => {});
     this.transportFactory = opts.transportFactory ?? spawnAcpTransport;
@@ -261,6 +411,20 @@ export class AcpSessionManager {
       onPairingCode: (code) => this.onPairingCodeCb(code),
       onClientOpen: (send) => this.handleClientOpen(send),
     };
+  }
+
+  getAttributionSessionId(): string | null {
+    return this.runningTurn?.sessionId ?? this.activeSessionId;
+  }
+
+  effectiveMcpTransport(): "http" | "stdio" {
+    if (this.mcpTransport === "http" || this.mcpTransport === "stdio") {
+      return this.mcpTransport;
+    }
+    if (this.agentCapabilities.mcpCapabilities?.http === false) {
+      return "stdio";
+    }
+    return this.harness.defaultMcpTransport;
   }
 
   onChoicesPresented(): void {
@@ -291,17 +455,69 @@ export class AcpSessionManager {
     };
   }
 
-  private buildMcpServer(): AcpMcpServer {
+  private buildMcpServer(sessionIdHint?: string): AcpMcpServer {
+    if (this.effectiveMcpTransport() === "stdio") {
+      const env = [{ name: "HITL_MCP_SHIM_TOKEN", value: this.mcpToken }];
+      if (sessionIdHint) {
+        env.push({ name: "HITL_MCP_SHIM_SESSION_ID", value: sessionIdHint });
+      }
+      return {
+        name: this.harness.mcpServerName,
+        command: process.execPath,
+        args: ["run", this.cliScriptPath, "mcp-shim", "--url", this.mcpUrl],
+        env,
+      };
+    }
+
+    const headers = [
+      { name: "Authorization", value: `Bearer ${this.mcpToken}` },
+    ];
+    if (sessionIdHint) {
+      headers.push({ name: "X-Hitl-Acp-Session-Id", value: sessionIdHint });
+    }
     return {
       type: "http",
       name: this.harness.mcpServerName,
       url: this.mcpUrl,
-      headers: [{ name: "Authorization", value: `Bearer ${this.mcpToken}` }],
+      headers,
     };
   }
 
-  private buildSessionMeta(): Record<string, unknown> {
-    return this.harness.buildSystemPromptMeta(DAEMON_INSTRUCTIONS);
+  private buildSessionInitExtensions(): {
+    systemPrompt?: AcpSystemPrompt;
+    _meta?: Record<string, unknown>;
+  } {
+    const out: {
+      systemPrompt?: AcpSystemPrompt;
+      _meta?: Record<string, unknown>;
+    } = {};
+
+    if (
+      this.harness.systemPromptStrategy === "agy_meta" &&
+      this.harness.buildSystemPromptMeta
+    ) {
+      out._meta = this.harness.buildSystemPromptMeta(DAEMON_INSTRUCTIONS);
+    }
+
+    if (
+      this.harness.systemPromptStrategy === "acp_system_prompt" ||
+      this.agentCapabilities.sessionCapabilities?.systemPrompt
+    ) {
+      out.systemPrompt = {
+        mode: "append",
+        content: [{ type: "text", text: DAEMON_INSTRUCTIONS }],
+      };
+    }
+
+    return out;
+  }
+
+  private needsFirstPromptInstructions(sessionId: string): boolean {
+    return (
+      this.harness.systemPromptStrategy === "first_prompt_prefix" &&
+      !this.agentCapabilities.sessionCapabilities?.systemPrompt &&
+      !this.instructionsDeliveredSessions.has(sessionId)
+    );
   }
 
   async start(): Promise<AcpClient> {
@@ -325,9 +541,10 @@ export class AcpSessionManager {
     }
 
     this.startPromise = (async () => {
+      const launch = resolveHarnessLaunch(this.harness);
       const transport = this.transportFactory(
-        this.harness.command,
-        this.harness.args,
+        launch.command,
+        launch.args,
         { cwd: this.defaultCwd },
       );
       const client = new AcpClient(transport);
@@ -426,6 +643,38 @@ export class AcpSessionManager {
     }
   }
 
+  private recordSeenToolCall(
+    sessionId: string,
+    toolCallId: string,
+    update: AcpSessionUpdateParams["update"],
+  ): void {
+    const key = `${sessionId}:${toolCallId}`;
+    const existing = this.seenToolCalls.get(key) ?? { toolCallId };
+    const merged: AcpPermissionToolCall = {
+      ...existing,
+      toolCallId,
+      ...(typeof update.name === "string" && update.name.trim().length > 0
+        ? { name: update.name }
+        : {}),
+      ...(typeof update.title === "string" && update.title.trim().length > 0
+        ? { title: update.title }
+        : {}),
+      ...(typeof update.kind === "string" && update.kind.trim().length > 0
+        ? { kind: update.kind }
+        : {}),
+      ...(update.rawInput !== undefined ? { rawInput: update.rawInput } : {}),
+    };
+    if (this.seenToolCalls.has(key)) {
+      this.seenToolCalls.delete(key);
+    } else if (this.seenToolCalls.size >= AcpSessionManager.MAX_SEEN_TOOL_CALLS) {
+      const oldestKey = this.seenToolCalls.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.seenToolCalls.delete(oldestKey);
+      }
+    }
+    this.seenToolCalls.set(key, merged);
+  }
+
   private handleSessionUpdate(params: AcpSessionUpdateParams): void {
     if (this.loadingSessionIds.has(params.sessionId)) {
       return;
@@ -433,6 +682,16 @@ export class AcpSessionManager {
 
     const update = params.update;
     if (!update || typeof update !== "object") return;
+
+    if (
+      (update.sessionUpdate === "tool_call" ||
+        update.sessionUpdate === "tool_call_update") &&
+      typeof update.toolCallId === "string" &&
+      update.toolCallId.length > 0
+    ) {
+      this.recordSeenToolCall(params.sessionId, update.toolCallId, update);
+      return;
+    }
 
     if (
       update.sessionUpdate === "session_info_update" &&
@@ -503,11 +762,28 @@ export class AcpSessionManager {
   ): void {
     const toolCall = params.toolCall ?? {};
     const options = Array.isArray(params.options) ? params.options : [];
-    const toolName = deriveToolName(toolCall);
-    const promptHash = sha256Hex(stableStringify(toolCall.rawInput ?? null));
     const sessionId = params.sessionId ?? this.activeSessionId ?? "";
+    const toolCallId =
+      typeof toolCall.toolCallId === "string" && toolCall.toolCallId.length > 0
+        ? toolCall.toolCallId
+        : undefined;
+    const correlated =
+      toolCallId && sessionId
+        ? this.seenToolCalls.get(`${sessionId}:${toolCallId}`)
+        : undefined;
+    const toolName = deriveToolName(toolCall, correlated);
+    const rawInputForHash =
+      toolCall.rawInput !== undefined
+        ? toolCall.rawInput
+        : correlated?.rawInput ?? null;
+    const promptHash = sha256Hex(stableStringify(rawInputForHash));
 
-    if (isOwnHitlTool(toolCall, this.harness.autoAllowPrefixes)) {
+    if (
+      isOwnHitlTool(toolCall, this.harness.autoAllowPrefixes, {
+        matchBareTitlePrefix: this.harness.matchBareTitlePrefix,
+        correlatedToolCall: correlated,
+      })
+    ) {
       const allowOpt =
         options.find((o) => o.kind === "allow_once") ??
         options.find((o) => o.kind?.startsWith("allow")) ??
@@ -522,7 +798,7 @@ export class AcpSessionManager {
       // Fail closed: if no explicit allow option exists, fall through to phone prompt.
     }
 
-    const prompt = formatPermissionPrompt(toolCall);
+    const prompt = formatPermissionPrompt(toolCall, correlated);
     const choices = options.map((o) => o.name || o.optionId);
     const frame: Record<string, unknown> = {
       type: "choices",
@@ -586,6 +862,8 @@ export class AcpSessionManager {
     this.activeSessionCwd = null;
     this.activeSessionTitle = null;
     this.openUserChoices = 0;
+    this.seenToolCalls.clear();
+    this.instructionsDeliveredSessions.clear();
 
     const now = this.nowMs();
     this.crashTimestamps = this.crashTimestamps.filter(
@@ -781,7 +1059,7 @@ export class AcpSessionManager {
       const helpText = [
         "Available commands:",
         "- /help — show this command list",
-        "- /new [harness] [cwd] — start a new session (Phase 1 harness: agy)",
+        `- /new [harness] [cwd] — start a new session (this daemon runs harness: ${this.harness.name})`,
         "- /sessions — list recent sessions",
         "- /resume <n|id> — switch to and resume a session",
         "- /cancel — cancel pending approvals and stop the running turn",
@@ -847,7 +1125,7 @@ export class AcpSessionManager {
 
       if (targetHarness !== this.harness.name) {
         this.sendStandaloneReply(
-          `Unsupported harness '${targetHarness}'. Phase 1 only supports '${this.harness.name}'.`,
+          `Unsupported harness '${targetHarness}' on this '${this.harness.name}' daemon. Run a separate daemon with --harness ${targetHarness}.`,
           this.activeSessionId,
         );
         return { acpSessionId: this.activeSessionId };
@@ -878,7 +1156,7 @@ export class AcpSessionManager {
         const res = await client.sessionNew({
           cwd: absCwd,
           mcpServers: [this.buildMcpServer()],
-          _meta: this.buildSessionMeta(),
+          ...this.buildSessionInitExtensions(),
         });
         this.activeSessionId = res.sessionId;
         this.activeSessionCwd = absCwd;
@@ -996,25 +1274,23 @@ export class AcpSessionManager {
         const supportsResume = Boolean(
           this.agentCapabilities.sessionCapabilities?.resume,
         );
-        if (supportsResume) {
-          await client.sessionResume({
-            sessionId,
-            cwd,
-            mcpServers: [this.buildMcpServer()],
-            _meta: this.buildSessionMeta(),
-          });
-        } else {
-          this.loadingSessionIds.add(sessionId);
-          try {
-            await client.sessionLoad({
-              sessionId,
-              cwd,
-              mcpServers: [this.buildMcpServer()],
-              _meta: this.buildSessionMeta(),
-            });
-          } finally {
-            this.loadingSessionIds.delete(sessionId);
+        const resumeParams = {
+          sessionId,
+          cwd,
+          mcpServers: [this.buildMcpServer(sessionId)],
+          ...this.buildSessionInitExtensions(),
+        };
+        // Suppress history replay notifications emitted synchronously during both
+        // session/load and session/resume (Hermes streams replay inside resume_session).
+        this.loadingSessionIds.add(sessionId);
+        try {
+          if (supportsResume) {
+            await client.sessionResume(resumeParams);
+          } else {
+            await client.sessionLoad(resumeParams);
           }
+        } finally {
+          this.loadingSessionIds.delete(sessionId);
         }
 
         this.activeSessionId = sessionId;
@@ -1053,7 +1329,7 @@ export class AcpSessionManager {
         const res = await client.sessionNew({
           cwd: this.defaultCwd,
           mcpServers: [this.buildMcpServer()],
-          _meta: this.buildSessionMeta(),
+          ...this.buildSessionInitExtensions(),
         });
         this.activeSessionId = res.sessionId;
         this.activeSessionCwd = this.defaultCwd;
@@ -1117,7 +1393,7 @@ export class AcpSessionManager {
     input: InboundMessage,
   ): Promise<void> {
     try {
-      const promptBlocks = await this.buildPromptBlocks(input);
+      let promptBlocks = await this.buildPromptBlocks(input);
       if (turn.cancelledByCommand) {
         const targetMsgId =
           turn.delegationMessageId ?? turn.clientMessageId ?? undefined;
@@ -1125,10 +1401,21 @@ export class AcpSessionManager {
         return;
       }
 
+      if (this.needsFirstPromptInstructions(turn.sessionId)) {
+        promptBlocks = [
+          {
+            type: "text",
+            text: `<system_instructions>\n${DAEMON_INSTRUCTIONS}\n</system_instructions>`,
+          },
+          ...promptBlocks,
+        ];
+      }
+
       const result = await client.sessionPrompt({
         sessionId: turn.sessionId,
         prompt: promptBlocks,
       });
+      this.instructionsDeliveredSessions.add(turn.sessionId);
 
       const targetMsgId =
         turn.delegationMessageId ?? turn.clientMessageId ?? undefined;
@@ -1235,6 +1522,8 @@ export class AcpSessionManager {
 
     this.cancelAllPendingPermissions(true);
     this.queue.length = 0;
+    this.seenToolCalls.clear();
+    this.instructionsDeliveredSessions.clear();
 
     const toClose = this.client ?? this.pendingClient;
     if (toClose) {
