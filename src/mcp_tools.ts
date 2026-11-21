@@ -38,7 +38,7 @@ export interface RegisterHitlToolsOptions {
   mode: HitlToolsMode;
   requestAcpSessionId?: string | null;
   getFallbackAcpSessionId?: () => string | null;
-  onChoicesPresented?: () => void;
+  onChoicesPresented?: (choiceId: string) => void;
   onReplySent?: (acpSessionId?: string | null) => void;
 }
 
@@ -486,7 +486,9 @@ export function registerHitlTools(
         `[hitl-channel] Reply: ${text} (msg: ${messageId}, agent: ${agentId}, attachments: ${attachmentCount})\n`
       );
 
-      broadcastReply(text, messageId, agentId, attachments);
+      broadcastReply(text, messageId, agentId, attachments, {
+        acpSessionId: options.mode === "daemon" ? acpSessionId : undefined,
+      });
       options.onReplySent?.(acpSessionId);
       const identity = await getIdentity();
       appendAudit({
@@ -556,13 +558,20 @@ export function registerHitlTools(
         `[hitl-channel] Choices: ${prompt} [${choices.join(", ")}] (multi: ${multiSelect ?? false})\n`
       );
 
-      const frame = {
+      const frameId = `c${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const frame: Record<string, unknown> = {
         type: "choices",
+        category: "choice",
         content: prompt,
         choices: choices,
         multiSelect: multiSelect ?? false,
-        id: `c${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        id: frameId,
         ts: new Date().toISOString(),
+        ...(options.mode === "daemon" &&
+        typeof acpSessionId === "string" &&
+        acpSessionId.length > 0
+          ? { acpSessionId }
+          : {}),
       };
 
       const unicastResult = unicastFrame(frame, targetDevice);
@@ -578,7 +587,7 @@ export function registerHitlTools(
         };
       }
 
-      options.onChoicesPresented?.();
+      options.onChoicesPresented?.(frameId);
 
       const identity = await getIdentity();
       appendAudit({

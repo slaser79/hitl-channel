@@ -242,6 +242,9 @@ export async function presentQuestionsToHitl(
     type: "questions_batch_request",
     request_id: requestId,
     questions: v.questions,
+    ...(typeof deps.acpSessionId === "string" && deps.acpSessionId.length > 0
+      ? { acpSessionId: deps.acpSessionId }
+      : {}),
     ts,
   };
 

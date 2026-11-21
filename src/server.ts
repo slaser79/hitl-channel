@@ -99,7 +99,10 @@ if (process.env.BUN_ENV !== "test" && process.env.NODE_ENV !== "test") {
   void pruneOldAuditFiles();
 
   // Start mDNS advertising
-  startMDNS(PORT, identity.instanceId, identity.displayName);
+  startMDNS(PORT, identity.instanceId, identity.displayName, {
+    mode: "channel",
+    harness: "claude-code",
+  });
 
   // Start periodic cleanup of expired pairing codes (every minute)
   pairingCleanupInterval = setInterval(() => {
@@ -108,7 +111,15 @@ if (process.env.BUN_ENV !== "test" && process.env.NODE_ENV !== "test") {
 
   await mcp.connect(new StdioServerTransport());
 
-  httpServer = startHttpBridge(mcp);
+  httpServer = startHttpBridge(mcp, {
+    mode: "channel",
+    harness: "claude-code",
+    capabilities: {
+      sessions: false,
+      streaming: false,
+      choicesId: true,
+    },
+  });
 
   // Belt-and-braces: if stdin already reached end while we were awaiting the
   // transport / HTTP bridge, the `end` event has already fired and our late

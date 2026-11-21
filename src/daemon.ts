@@ -129,7 +129,7 @@ function constantTimeBearerMatch(
 export interface LoopbackMcpServerOptions {
   token?: string;
   getFallbackAcpSessionId?: () => string | null;
-  onChoicesPresented?: () => void;
+  onChoicesPresented?: (choiceId: string) => void;
   onReplySent?: (acpSessionId?: string | null) => void;
 }
 
@@ -285,6 +285,7 @@ export interface StartDaemonOptions {
   transportFactory?: AcpSessionManagerOptions["transportFactory"];
   onPairingCode?: (code: string) => void | Promise<void>;
   outOfTurnQuietMs?: number;
+  sessionLoadTimeoutMs?: number;
 }
 
 export interface DaemonHandle {
@@ -340,7 +341,7 @@ export async function startDaemon(
 
   const mcpHandle = startLoopbackMcpServer({
     getFallbackAcpSessionId: () => manager.getAttributionSessionId(),
-    onChoicesPresented: () => manager.onChoicesPresented(),
+    onChoicesPresented: (choiceId) => manager.onChoicesPresented(choiceId),
     onReplySent: (sid) => manager.onReplySent(sid),
   });
 
@@ -353,6 +354,7 @@ export async function startDaemon(
     instanceId: identity.instanceId,
     transportFactory: options.transportFactory,
     outOfTurnQuietMs: options.outOfTurnQuietMs,
+    sessionLoadTimeoutMs: options.sessionLoadTimeoutMs,
     onPairingCode: async (code) => {
       process.stdout.write(`PAIRING CODE: ${code}\n`);
       if (options.enableDesktopNotifications !== false) {
@@ -364,12 +366,22 @@ export async function startDaemon(
 
   const httpServer = startHttpBridge(manager.getInboundHandlers(), {
     port: requestedPort,
+    mode: "daemon",
+    harness,
+    capabilities: {
+      sessions: true,
+      streaming: false,
+      choicesId: true,
+    },
   });
   const actualPort = httpServer.port ?? requestedPort;
 
   const useMdns = options.enableMdns !== false;
   if (useMdns) {
-    startMDNS(actualPort, identity.instanceId, identity.displayName);
+    startMDNS(actualPort, identity.instanceId, identity.displayName, {
+      mode: "daemon",
+      harness,
+    });
   }
 
   const pairingCleanupInterval = setInterval(() => {
