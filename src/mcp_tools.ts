@@ -433,7 +433,6 @@ export function registerHitlTools(
 
   server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const args = (req.params.arguments ?? {}) as Record<string, unknown>;
-    const identity = await getIdentity();
     const rawMeta =
       (extra as { _meta?: Record<string, unknown> } | undefined)?._meta ??
       (req.params as { _meta?: Record<string, unknown> })._meta;
@@ -469,6 +468,7 @@ export function registerHitlTools(
 
       broadcastReply(text, messageId, agentId, attachments);
       options.onReplySent?.(acpSessionId);
+      const identity = await getIdentity();
       appendAudit({
         ts: new Date().toISOString(),
         instance_id: identity.instanceId,
@@ -560,6 +560,7 @@ export function registerHitlTools(
 
       options.onChoicesPresented?.();
 
+      const identity = await getIdentity();
       appendAudit({
         ts: new Date().toISOString(),
         instance_id: identity.instanceId,
@@ -686,6 +687,7 @@ export function registerHitlTools(
         Math.max(1, Number.isFinite(rawTimeout) ? rawTimeout : 60),
       );
       const targetDevice = args.device as string | undefined;
+      const identity = await getIdentity();
       const requestId = generateRequestId();
       const frame = {
         type: "tool_call_request" as const,
@@ -1046,6 +1048,7 @@ export function registerHitlTools(
       }
 
       const targetDevice = args.device as string | undefined;
+      const identity = await getIdentity();
       const timeoutSeconds = 60;
       const requestId = generateRequestId();
       const frame = {
@@ -1198,6 +1201,7 @@ export function registerHitlTools(
     }
 
     if (req.params.name === "present_questions_to_hitl") {
+      const identity = await getIdentity();
       return presentQuestionsToHitl(args, {
         correlator,
         unicastFrame,

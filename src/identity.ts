@@ -6,7 +6,7 @@
  * - Used for multi-instance support
  */
 
-import { $ } from "bun";
+import { mkdir } from "node:fs/promises";
 import { homedir, hostname as osHostname } from "node:os";
 import { dirname } from "node:path";
 
@@ -31,7 +31,7 @@ export interface InstanceIdentity {
  */
 async function ensureDir(filePath: string): Promise<void> {
   try {
-    await $`mkdir -p ${dirname(filePath)}`.quiet();
+    await mkdir(dirname(filePath), { recursive: true });
   } catch (error) {
     process.stderr.write(`[hitl-channel] Failed to create directory: ${error}\n`);
   }
