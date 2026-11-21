@@ -483,6 +483,7 @@ export class AcpSessionManager {
 
   private lastListing: AcpSessionInfo[] = [];
   private sessionCatalog: AcpSessionInfo[] = [];
+  private catalogMutationSeq = 0;
   private recentCwds: string[];
   private readonly loadingSessionIds = new Set<string>();
   private readonly inFlightSessionLoads = new Map<string, Promise<void>>();
@@ -818,6 +819,7 @@ export class AcpSessionManager {
   private updateCatalogFromList(sessions: AcpSessionInfo[]): AcpSessionInfo[] {
     const sorted = this.sortSessionsDesc(sessions);
     this.sessionCatalog = sorted;
+    this.catalogMutationSeq++;
     this.mergeListedCwds(sorted);
     return sorted;
   }
@@ -827,6 +829,7 @@ export class AcpSessionManager {
       (s) => s.sessionId !== entry.sessionId,
     );
     this.sessionCatalog = this.sortSessionsDesc([entry, ...rest]);
+    this.catalogMutationSeq++;
   }
 
   private buildSessionListFrame(requestId?: string): SessionListFrame {
@@ -965,11 +968,20 @@ export class AcpSessionManager {
 
     if (frameType === "session_list_request") {
       if (!this.turnBusy && !this.sessionOpInFlight) {
+        const seqBefore = this.catalogMutationSeq;
         try {
           const client = await this.ensureClient();
           try {
             const res = await client.sessionList({});
-            this.updateCatalogFromList(res.sessions ?? []);
+            // Skip overwriting if a concurrent session_new/session_resume
+            // updated the catalog while session/list was in flight.
+            if (
+              this.catalogMutationSeq === seqBefore &&
+              !this.turnBusy &&
+              !this.sessionOpInFlight
+            ) {
+              this.updateCatalogFromList(res.sessions ?? []);
+            }
           } catch {
             // Gracefully reuse cached listing when session/list is unsupported or fails
           }
@@ -1086,6 +1098,101 @@ export class AcpSessionManager {
     }
   }
 
+  private async performSessionLoadWithTimeout(
+    ws: HitlWebSocket,
+    client: AcpClient,
+    sessionId: string,
+    resumeParams: {
+      sessionId: string;
+      cwd: string;
+      mcpServers: AcpMcpServer[];
+      [key: string]: unknown;
+    },
+    requestId: string | undefined,
+    capture?: ReplayCaptureBuffer,
+  ): Promise<{ ok: true } | { ok: false; timedOut: boolean; error: unknown }> {
+    if (capture) {
+      this.replayCaptureBuffers.set(sessionId, capture);
+    }
+    this.loadingSessionIds.add(sessionId);
+
+    const loadPromise = client.sessionLoad(resumeParams);
+    let settled = false;
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const trackedPromise = loadPromise
+      .then(
+        () => undefined,
+        () => undefined,
+      )
+      .finally(() => {
+        settled = true;
+        if (this.inFlightSessionLoads.get(sessionId) === trackedPromise) {
+          this.inFlightSessionLoads.delete(sessionId);
+          this.loadingSessionIds.delete(sessionId);
+        }
+        if (capture && this.replayCaptureBuffers.get(sessionId) === capture) {
+          this.replayCaptureBuffers.delete(sessionId);
+        }
+      });
+    this.inFlightSessionLoads.set(sessionId, trackedPromise);
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(
+            new Error(
+              `session/load timed out after ${this.sessionLoadTimeoutMs}ms`,
+            ),
+          );
+        }, this.sessionLoadTimeoutMs);
+        loadPromise.then(
+          () => {
+            if (timer) clearTimeout(timer);
+            resolve();
+          },
+          (err) => {
+            if (timer) clearTimeout(timer);
+            reject(err);
+          },
+        );
+      });
+      if (!settled) {
+        await trackedPromise;
+      }
+      return { ok: true };
+    } catch (err) {
+      if (timedOut) {
+        if (capture) {
+          capture.detached = true;
+          if (this.replayCaptureBuffers.get(sessionId) === capture) {
+            this.replayCaptureBuffers.delete(sessionId);
+          }
+        }
+        this.sendSessionError(ws, {
+          action: "session_resume",
+          code: "load_timeout",
+          message: `Timed out loading session '${sessionId}' after ${this.sessionLoadTimeoutMs}ms`,
+          requestId,
+        });
+        return { ok: false, timedOut: true, error: err };
+      }
+
+      if (!settled) {
+        await trackedPromise;
+      }
+      if (capture) {
+        capture.detached = true;
+        this.replayCaptureBuffers.delete(sessionId);
+      }
+      return { ok: false, timedOut: false, error: err };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   private async handleWsSessionResume(
     ws: HitlWebSocket,
     frame: Record<string, unknown>,
@@ -1155,124 +1262,66 @@ export class AcpSessionManager {
           turns: [],
           detached: false,
         };
-        this.replayCaptureBuffers.set(sessionId, capture);
-        this.loadingSessionIds.add(sessionId);
-
-        const loadPromise = client.sessionLoad(resumeParams);
-        let settled = false;
-        let timedOut = false;
-        let timer: ReturnType<typeof setTimeout> | undefined;
-
-        const trackedPromise = loadPromise
-          .then(
-            () => undefined,
-            () => undefined,
-          )
-          .finally(() => {
-            settled = true;
-            if (this.inFlightSessionLoads.get(sessionId) === trackedPromise) {
-              this.inFlightSessionLoads.delete(sessionId);
-              this.loadingSessionIds.delete(sessionId);
-            }
-            if (this.replayCaptureBuffers.get(sessionId) === capture) {
-              this.replayCaptureBuffers.delete(sessionId);
-            }
-          });
-        this.inFlightSessionLoads.set(sessionId, trackedPromise);
-
-        try {
-          await new Promise<void>((resolve, reject) => {
-            timer = setTimeout(() => {
-              timedOut = true;
-              reject(
-                new Error(
-                  `session/load timed out after ${this.sessionLoadTimeoutMs}ms`,
-                ),
-              );
-            }, this.sessionLoadTimeoutMs);
-            loadPromise.then(
-              () => {
-                if (timer) clearTimeout(timer);
-                resolve();
-              },
-              (err) => {
-                if (timer) clearTimeout(timer);
-                reject(err);
-              },
-            );
-          });
-        } catch (err) {
-          if (timedOut) {
-            capture.detached = true;
-            if (this.replayCaptureBuffers.get(sessionId) === capture) {
-              this.replayCaptureBuffers.delete(sessionId);
-            }
-            this.sendSessionError(ws, {
-              action: "session_resume",
-              code: "load_timeout",
-              message: `Timed out loading session '${sessionId}' after ${this.sessionLoadTimeoutMs}ms`,
-              requestId,
-            });
-            return;
-          }
-
-          if (!settled) {
-            await trackedPromise;
-          }
-          capture.detached = true;
-          this.replayCaptureBuffers.delete(sessionId);
-
-          if (!supportsResume) {
-            this.sendSessionError(ws, {
-              action: "session_resume",
-              code: "load_failed",
-              message: `Failed to load session '${sessionId}': ${
-                err instanceof Error ? err.message : String(err)
-              }`,
-              requestId,
-            });
-            return;
-          }
-
-          this.loadingSessionIds.add(sessionId);
-          try {
-            await client.sessionResume(resumeParams);
-          } catch (resumeErr) {
-            this.sendSessionError(ws, {
-              action: "session_resume",
-              code: "load_failed",
-              message: `Failed to resume session '${sessionId}': ${
-                resumeErr instanceof Error
-                  ? resumeErr.message
-                  : String(resumeErr)
-              }`,
-              requestId,
-            });
-            return;
-          } finally {
-            this.loadingSessionIds.delete(sessionId);
-          }
-
+        const outcome = await this.performSessionLoadWithTimeout(
+          ws,
+          client,
+          sessionId,
+          resumeParams,
+          requestId,
+          capture,
+        );
+        if (outcome.ok) {
           this.commitActiveSessionSwitch({
             sessionId,
             cwd,
             title: capture.title ?? catalogEntry?.title ?? null,
-            recentTurns: [],
+            recentTurns: capture.turns,
+            requestId,
+          });
+          return;
+        }
+        if (outcome.timedOut) {
+          return;
+        }
+
+        if (!supportsResume) {
+          this.sendSessionError(ws, {
+            action: "session_resume",
+            code: "load_failed",
+            message: `Failed to load session '${sessionId}': ${
+              outcome.error instanceof Error
+                ? outcome.error.message
+                : String(outcome.error)
+            }`,
+            requestId,
+          });
+          return;
+        }
+
+        this.loadingSessionIds.add(sessionId);
+        try {
+          await client.sessionResume(resumeParams);
+        } catch (resumeErr) {
+          this.sendSessionError(ws, {
+            action: "session_resume",
+            code: "load_failed",
+            message: `Failed to resume session '${sessionId}': ${
+              resumeErr instanceof Error
+                ? resumeErr.message
+                : String(resumeErr)
+            }`,
             requestId,
           });
           return;
         } finally {
-          if (timer) clearTimeout(timer);
+          this.loadingSessionIds.delete(sessionId);
         }
 
-        if (!settled) {
-          await trackedPromise;
-        }
         this.commitActiveSessionSwitch({
           sessionId,
           cwd,
           title: capture.title ?? catalogEntry?.title ?? null,
-          recentTurns: capture.turns,
+          recentTurns: [],
           requestId,
         });
         return;
@@ -1281,24 +1330,46 @@ export class AcpSessionManager {
       const capture: ReplayCaptureBuffer | undefined = includeRecentTurns
         ? { turns: [], detached: false }
         : undefined;
-      if (capture) {
-        this.replayCaptureBuffers.set(sessionId, capture);
-      }
-      this.loadingSessionIds.add(sessionId);
-      try {
-        if (supportsResume) {
-          await client.sessionResume(resumeParams);
-        } else if (supportsLoad) {
-          await client.sessionLoad(resumeParams);
-        } else {
-          throw new Error(
-            "Harness does not support session/resume or session/load",
-          );
+      if (supportsResume) {
+        if (capture) {
+          this.replayCaptureBuffers.set(sessionId, capture);
         }
-      } finally {
-        if (capture) capture.detached = true;
-        this.replayCaptureBuffers.delete(sessionId);
-        this.loadingSessionIds.delete(sessionId);
+        this.loadingSessionIds.add(sessionId);
+        try {
+          await client.sessionResume(resumeParams);
+        } finally {
+          if (capture) capture.detached = true;
+          this.replayCaptureBuffers.delete(sessionId);
+          this.loadingSessionIds.delete(sessionId);
+        }
+      } else if (supportsLoad) {
+        const outcome = await this.performSessionLoadWithTimeout(
+          ws,
+          client,
+          sessionId,
+          resumeParams,
+          requestId,
+          capture,
+        );
+        if (!outcome.ok) {
+          if (!outcome.timedOut) {
+            this.sendSessionError(ws, {
+              action: "session_resume",
+              code: "load_failed",
+              message: `Failed to load session '${sessionId}': ${
+                outcome.error instanceof Error
+                  ? outcome.error.message
+                  : String(outcome.error)
+              }`,
+              requestId,
+            });
+          }
+          return;
+        }
+      } else {
+        throw new Error(
+          "Harness does not support session/resume or session/load",
+        );
       }
 
       this.commitActiveSessionSwitch({
@@ -1605,6 +1676,7 @@ export class AcpSessionManager {
     this.activeSessionId = null;
     this.activeSessionCwd = null;
     this.activeSessionTitle = null;
+    this.catalogMutationSeq++;
     this.openUserChoiceIds.clear();
     this.replayCaptureBuffers.clear();
     this.inFlightSessionLoads.clear();

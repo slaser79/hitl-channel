@@ -1086,4 +1086,146 @@ describe("SPEC-HITL-APP-10827 Milestone 3a AV4 & AV6: sessions, caps, resume tai
       { role: "assistant", text: "REPLAYED_ON_LOAD " },
     ]);
   });
+
+  it("enforces sessionLoadTimeoutMs and inFlightSessionLoads suppression when !supportsResume && includeRecentTurns is false", async () => {
+    let releaseSlowLoad!: () => void;
+    const { manager, replies, controlUnicasts, handlers } =
+      createSessionManagerHarness({
+        harness: "agy",
+        sessionLoadTimeoutMs: 40,
+        onOutbound: (msg, peer) => {
+          if (msg.method === "initialize") {
+            peer.emit({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: {
+                protocolVersion: 1,
+                agentCapabilities: {
+                  loadSession: true,
+                  sessionCapabilities: {},
+                },
+              },
+            });
+          } else if (msg.method === "session/new") {
+            peer.emit({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "prior-sess" } });
+          } else if (msg.method === "session/load") {
+            const sid = String((msg.params as Record<string, unknown>).sessionId);
+            releaseSlowLoad = () => {
+              peer.emit({
+                jsonrpc: "2.0",
+                method: "session/update",
+                params: {
+                  sessionId: sid,
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text: "late-replay-without-turns" },
+                  },
+                },
+              });
+              peer.emit({ jsonrpc: "2.0", id: msg.id, result: {} });
+            };
+          } else if (msg.method === "session/prompt") {
+            const sid = String((msg.params as Record<string, unknown>).sessionId);
+            peer.emit({
+              jsonrpc: "2.0",
+              method: "session/update",
+              params: {
+                sessionId: sid,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: { type: "text", text: "fresh-reply" },
+                },
+              },
+            });
+            peer.emit({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+          }
+        },
+      });
+    cleanups.push(() => manager.shutdown());
+
+    const ws = makeCapableWs();
+    await handlers.onControlFrame?.(ws, { type: "session_new", requestId: "n1" });
+    await handlers.onControlFrame?.(ws, {
+      type: "session_resume",
+      sessionId: "slow-no-turns",
+      includeRecentTurns: false,
+      requestId: "r-timeout",
+    });
+
+    const err = controlUnicasts.find(
+      (u) => u.frame.type === "session_error" && u.frame.requestId === "r-timeout",
+    );
+    expect(err?.frame.code).toBe("load_timeout");
+    expect(manager.getStateSnapshot().activeSessionId).toBe("prior-sess");
+
+    releaseSlowLoad();
+    await new Promise((r) => setTimeout(r, 60));
+    expect(replies).toHaveLength(0);
+
+    await handlers.onInbound({ text: "hello", attachments: [], meta: {} });
+    await waitFor(() => replies.some((r) => r.text === "fresh-reply"));
+    expect(replies.map((r) => r.text)).toEqual(["fresh-reply"]);
+  });
+
+  it("prevents stale session_list_request RPC from clobbering concurrent session_new catalog entry", async () => {
+    let releaseList!: () => void;
+    const { manager, controlUnicasts, handlers } = createSessionManagerHarness({
+      harness: "agy",
+      onOutbound: (msg, peer) => {
+        if (msg.method === "initialize") {
+          peer.emit({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: {
+              protocolVersion: 1,
+              agentCapabilities: {
+                loadSession: true,
+                sessionCapabilities: { list: {} },
+              },
+            },
+          });
+        } else if (msg.method === "session/list") {
+          releaseList = () =>
+            peer.emit({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: {
+                sessions: [{ sessionId: "old-sess", cwd: tempHome }],
+              },
+            });
+        } else if (msg.method === "session/new") {
+          peer.emit({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { sessionId: "brand-new-sess" },
+          });
+        }
+      },
+    });
+    cleanups.push(() => manager.shutdown());
+
+    const ws = makeCapableWs();
+    const listPending = handlers.onControlFrame?.(ws, {
+      type: "session_list_request",
+      requestId: "req-stale",
+    });
+    await waitFor(() => typeof releaseList === "function");
+
+    await handlers.onControlFrame?.(ws, {
+      type: "session_new",
+      requestId: "req-new",
+    });
+
+    releaseList();
+    await listPending;
+
+    controlUnicasts.length = 0;
+    await handlers.onClientHello?.(ws);
+    const listFrame = controlUnicasts.find((u) => u.frame.type === "session_list")?.frame as
+      | { sessions?: Array<{ sessionId: string }> }
+      | undefined;
+    expect(
+      listFrame?.sessions?.some((s) => s.sessionId === "brand-new-sess"),
+    ).toBe(true);
+  });
 });
