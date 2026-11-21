@@ -206,6 +206,7 @@ export class AcpSessionManager {
   private readonly nowMs: () => number;
 
   private client: AcpClient | null = null;
+  private pendingClient: AcpClient | null = null;
   private startPromise: Promise<AcpClient> | null = null;
   private agentCapabilities: AcpAgentCapabilities = {};
 
@@ -214,6 +215,7 @@ export class AcpSessionManager {
   private activeSessionTitle: string | null = null;
 
   private turnBusy = false;
+  private sessionOpInFlight = false;
   private runningTurn: RunningTurn | null = null;
   private cancelRequestedBeforeTurn = false;
   private readonly queue: QueuedTurn[] = [];
@@ -329,6 +331,7 @@ export class AcpSessionManager {
         { cwd: this.defaultCwd },
       );
       const client = new AcpClient(transport);
+      this.pendingClient = client;
       client.onSessionUpdate((params) => this.handleSessionUpdate(params));
       client.onPermissionRequest((id, params) =>
         this.handlePermissionRequest(client, id, params),
@@ -337,10 +340,16 @@ export class AcpSessionManager {
 
       try {
         const initRes = await client.initialize();
+        if (this.shuttingDown) {
+          await client.close().catch(() => {});
+          throw new Error("Daemon shut down during harness initialization");
+        }
         this.agentCapabilities = initRes.agentCapabilities ?? {};
         this.client = client;
+        this.pendingClient = null;
         return client;
       } catch (err) {
+        this.pendingClient = null;
         await client.close().catch(() => {});
         throw err;
       }
@@ -731,8 +740,8 @@ export class AcpSessionManager {
       }
     }
 
-    // Step 5: Turn running? Queue FIFO
-    if (this.turnBusy) {
+    // Step 5: Turn running or session switch in flight? Queue FIFO
+    if (this.turnBusy || this.sessionOpInFlight) {
       this.queue.push({ input, isChoiceResponse });
       this.sendStandaloneReply(
         `⏳ queued (${this.queue.length} ahead)`,
@@ -743,6 +752,25 @@ export class AcpSessionManager {
 
     // Step 6: Start prompt turn
     return this.startTurn({ input, isChoiceResponse });
+  }
+
+  /** Reject `/new` or `/resume` with a distinct reply when a turn or session switch is active. */
+  private rejectIfBusyForSessionSwitch(): boolean {
+    if (this.turnBusy) {
+      this.sendStandaloneReply(
+        "⚠ A turn is currently running — send /cancel first",
+        this.activeSessionId,
+      );
+      return true;
+    }
+    if (this.sessionOpInFlight) {
+      this.sendStandaloneReply(
+        "⚠ A session switch is currently in progress — please wait",
+        this.activeSessionId,
+      );
+      return true;
+    }
+    return false;
   }
 
   private async handleSlashCommand(
@@ -798,11 +826,7 @@ export class AcpSessionManager {
     }
 
     if (cmd === "/new") {
-      if (this.turnBusy) {
-        this.sendStandaloneReply(
-          "⚠ A turn is currently running — send /cancel first",
-          this.activeSessionId,
-        );
+      if (this.rejectIfBusyForSessionSwitch()) {
         return { acpSessionId: this.activeSessionId };
       }
       const tokens = argsText ? argsText.split(/\s+/) : [];
@@ -830,24 +854,25 @@ export class AcpSessionManager {
       }
 
       const absCwd = expandHomeAndResolve(rawCwd, this.defaultCwd);
+      this.sessionOpInFlight = true;
       try {
-        const st = await stat(absCwd);
-        if (!st.isDirectory()) {
+        try {
+          const st = await stat(absCwd);
+          if (!st.isDirectory()) {
+            this.sendStandaloneReply(
+              `Not a directory: ${absCwd}`,
+              this.activeSessionId,
+            );
+            return { acpSessionId: this.activeSessionId };
+          }
+        } catch {
           this.sendStandaloneReply(
-            `Not a directory: ${absCwd}`,
+            `Directory does not exist: ${absCwd}`,
             this.activeSessionId,
           );
           return { acpSessionId: this.activeSessionId };
         }
-      } catch {
-        this.sendStandaloneReply(
-          `Directory does not exist: ${absCwd}`,
-          this.activeSessionId,
-        );
-        return { acpSessionId: this.activeSessionId };
-      }
 
-      try {
         const client = await this.ensureClient();
         this.flushOutOfTurnBuffer();
         const res = await client.sessionNew({
@@ -870,6 +895,9 @@ export class AcpSessionManager {
           this.activeSessionId,
         );
         return { acpSessionId: this.activeSessionId };
+      } finally {
+        this.sessionOpInFlight = false;
+        void this.drainQueue();
       }
     }
 
@@ -925,11 +953,7 @@ export class AcpSessionManager {
     }
 
     if (cmd === "/resume") {
-      if (this.turnBusy) {
-        this.sendStandaloneReply(
-          "⚠ A turn is currently running — send /cancel first",
-          this.activeSessionId,
-        );
+      if (this.rejectIfBusyForSessionSwitch()) {
         return { acpSessionId: this.activeSessionId };
       }
       const target = argsText.split(/\s+/)[0]?.trim();
@@ -956,6 +980,7 @@ export class AcpSessionManager {
         resolved = this.lastListing.find((s) => s.sessionId === target);
       }
 
+      this.sessionOpInFlight = true;
       try {
         const client = await this.ensureClient();
         if (!resolved) {
@@ -1004,6 +1029,9 @@ export class AcpSessionManager {
           this.activeSessionId,
         );
         return { acpSessionId: this.activeSessionId };
+      } finally {
+        this.sessionOpInFlight = false;
+        void this.drainQueue();
       }
     }
 
@@ -1013,6 +1041,9 @@ export class AcpSessionManager {
   private async startTurn(item: QueuedTurn): Promise<{ acpSessionId?: string | null }> {
     this.turnBusy = true;
     this.cancelRequestedBeforeTurn = false;
+    if (!item.isChoiceResponse) {
+      this.openUserChoices = 0;
+    }
     let client: AcpClient;
     let sessionId: string;
 
@@ -1045,10 +1076,6 @@ export class AcpSessionManager {
       );
       void this.drainQueue();
       return { acpSessionId: this.activeSessionId };
-    }
-
-    if (!item.isChoiceResponse) {
-      this.openUserChoices = 0;
     }
 
     this.flushOutOfTurnBuffer();
@@ -1184,7 +1211,12 @@ export class AcpSessionManager {
   }
 
   private async drainQueue(): Promise<void> {
-    if (this.turnBusy || this.pendingPermissions.length > 0 || this.shuttingDown) {
+    if (
+      this.turnBusy ||
+      this.sessionOpInFlight ||
+      this.pendingPermissions.length > 0 ||
+      this.shuttingDown
+    ) {
       return;
     }
     const next = this.queue.shift();
@@ -1204,9 +1236,14 @@ export class AcpSessionManager {
     this.cancelAllPendingPermissions(true);
     this.queue.length = 0;
 
-    if (this.client) {
-      await this.client.close();
+    const toClose = this.client ?? this.pendingClient;
+    if (toClose) {
+      await toClose.close();
       this.client = null;
+      this.pendingClient = null;
+    }
+    if (this.startPromise) {
+      await this.startPromise.catch(() => {});
     }
   }
 }

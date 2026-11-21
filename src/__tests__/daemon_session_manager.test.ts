@@ -546,4 +546,47 @@ describe("AcpSessionManager (unit — AV3, AV4, AV5, AV8, AV9, AV10)", () => {
     await noResHarness.manager.shutdown();
     await manager.shutdown();
   });
+
+  it("adversarial lifecycle: queues prompt arriving during in-flight /new and closes transport on shutdown during initialize", async () => {
+    let releaseNew!: () => void;
+    const promptedSessionIds: string[] = [];
+
+    const switchHarness = createHarness({
+      onOutbound: (msg, peer) => {
+        if (msg.method === "initialize") {
+          peer.emit({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+        } else if (msg.method === "session/new") {
+          releaseNew = () => peer.emit({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "switched-sess" } });
+        } else if (msg.method === "session/prompt") {
+          promptedSessionIds.push(String((msg.params as any).sessionId));
+          peer.emit({ jsonrpc: "2.0", method: "session/update", params: { sessionId: (msg.params as any).sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "after-new" } } } });
+          peer.emit({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+        }
+      },
+    });
+
+    const newPromise = switchHarness.handlers.onInbound({ text: "/new", meta: {} });
+    await waitFor(() => typeof releaseNew === "function");
+    await switchHarness.handlers.onInbound({ text: "hello mid-new", meta: {} });
+    expect(switchHarness.replies.at(-1)?.text).toBe("⏳ queued (1 ahead)");
+
+    releaseNew();
+    await newPromise;
+    await waitFor(() => switchHarness.replies.some((r) => r.text === "after-new"));
+    expect(promptedSessionIds).toEqual(["switched-sess"]);
+    await switchHarness.manager.shutdown();
+
+    // dispose-during-start: shutdown while initialize() has not yet responded
+    const initHangingHarness = createHarness({
+      onOutbound: () => {
+        // intentionally never respond to initialize
+      },
+    });
+    const startP = initHangingHarness.manager.start().catch((err) => err as Error);
+    await waitFor(() => initHangingHarness.peers.length === 1);
+    await initHangingHarness.manager.shutdown();
+    const err = await startP;
+    expect(initHangingHarness.peers[0]!.closed).toBe(true);
+    expect(err).toBeInstanceOf(Error);
+  });
 });
