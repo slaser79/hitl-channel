@@ -36,8 +36,30 @@ export type HitlToolsMode = "channel" | "daemon";
 
 export interface RegisterHitlToolsOptions {
   mode: HitlToolsMode;
+  requestAcpSessionId?: string | null;
+  getFallbackAcpSessionId?: () => string | null;
   onChoicesPresented?: () => void;
   onReplySent?: (acpSessionId?: string | null) => void;
+}
+
+function resolveDaemonAcpSessionId(
+  rawConvId: unknown,
+  options: RegisterHitlToolsOptions,
+): string | null {
+  if (typeof rawConvId === "string" && rawConvId.length > 0) {
+    return rawConvId;
+  }
+  if (
+    typeof options.requestAcpSessionId === "string" &&
+    options.requestAcpSessionId.length > 0
+  ) {
+    return options.requestAcpSessionId;
+  }
+  const fallback = options.getFallbackAcpSessionId?.();
+  if (typeof fallback === "string" && fallback.length > 0) {
+    return fallback;
+  }
+  return null;
 }
 
 function generateRequestId(): string {
@@ -439,9 +461,7 @@ export function registerHitlTools(
     const rawConvId = rawMeta?.["antigravity.google/conversation_id"];
     const acpSessionId: string | null | undefined =
       options.mode === "daemon"
-        ? typeof rawConvId === "string" && rawConvId.length > 0
-          ? rawConvId
-          : null
+        ? resolveDaemonAcpSessionId(rawConvId, options)
         : undefined;
     const acpAuditField =
       acpSessionId !== undefined ? { acp_session_id: acpSessionId } : {};
