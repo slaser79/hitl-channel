@@ -2,7 +2,6 @@ import { describe, expect, it } from "bun:test";
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { mcp } from "../server.js";
@@ -37,7 +36,7 @@ async function getFreePort(): Promise<number> {
 }
 
 async function verifyChannelBoot(entryRelPath: string): Promise<void> {
-  const dir = mkdtempSync(join(tmpdir(), "hitl-parity-"));
+  const dir = mkdtempSync(join(process.env.HOME!, "hitl-parity-"));
   const port = await getFreePort();
   const identityFile = join(dir, "identity.json");
   const env: Record<string, string | undefined> = { ...process.env };

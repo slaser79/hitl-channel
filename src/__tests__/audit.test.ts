@@ -1,7 +1,46 @@
 import { describe, expect, it } from "bun:test";
-import { sha256Hex, type AuditEvent } from "../audit.js";
+import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { appendBufferDrainAudit, pruneOldAuditFiles, sha256Hex, type AuditEvent } from "../audit.js";
 
 describe("audit.ts", () => {
+  it("prunes only old audit files in the configured channel home", async () => {
+    const auditDir = join(process.env.HITL_CHANNEL_HOME!, "audit");
+    const oldLog = join(auditDir, "2026-01-01.jsonl");
+    const recentLog = join(auditDir, "2026-02-11.jsonl");
+    const now = new Date("2026-02-11T12:00:00Z");
+    const old = new Date("2026-01-01T12:00:00Z");
+    await mkdir(auditDir, { recursive: true });
+    await writeFile(oldLog, "{}\n");
+    await writeFile(recentLog, "{}\n");
+    await utimes(oldLog, old, old);
+    await utimes(recentLog, now, now);
+
+    expect(await pruneOldAuditFiles(now)).toBe(1);
+    expect(await Bun.file(oldLog).exists()).toBe(false);
+    expect(await Bun.file(recentLog).exists()).toBe(true);
+  });
+
+  it("rejects unsafe audit appends and pruning even though audit I/O is best-effort", async () => {
+    const channelHome = process.env.HITL_CHANNEL_HOME!;
+    const outside = await mkdtemp(join(tmpdir(), "hitl-outside-audit-"));
+    process.env.HITL_CHANNEL_HOME = outside;
+    try {
+      await expect(appendBufferDrainAudit({
+        ts: new Date().toISOString(),
+        instance_id: "test",
+        event: "phone_offline_buffer_drain",
+        replies_drained: 1,
+        oldest_buffered_seconds: 1,
+      })).rejects.toThrow("outside the temporary test directory");
+      await expect(pruneOldAuditFiles()).rejects.toThrow("outside the temporary test directory");
+    } finally {
+      process.env.HITL_CHANNEL_HOME = channelHome;
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
   it("sha256Hex returns a stable 64-char hex digest", () => {
     const h1 = sha256Hex("hello");
     const h2 = sha256Hex("hello");

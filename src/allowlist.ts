@@ -1,16 +1,20 @@
 /**
  * Sender allowlist management.
  *
- * - Stored at ~/.hitl/channels/allowlist.json
+ * - Stored at allowlist.json in the channel home
  * - Device tokens stored as SHA-256 hashes (not plaintext)
  * - Persistent across restarts
  */
 
 import { $ } from "bun";
-import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { assertTestStatePath, getChannelHome } from "./channel_home.js";
 
-const ALLOWLIST_DIR = `${homedir()}/.hitl/channels`;
-const ALLOWLIST_FILE = `${ALLOWLIST_DIR}/allowlist.json`;
+function getAllowlistFile(): string {
+  const path = join(getChannelHome(), "allowlist.json");
+  assertTestStatePath(path);
+  return path;
+}
 
 export interface AllowlistEntry {
   tokenHash: string;
@@ -25,9 +29,9 @@ export interface AllowlistData {
 /**
  * Ensure the allowlist directory exists.
  */
-async function ensureDir(): Promise<void> {
+async function ensureDir(dir: string): Promise<void> {
   try {
-    await $`mkdir -p ${ALLOWLIST_DIR}`.quiet();
+    await $`mkdir -p ${dir}`.quiet();
   } catch (error) {
     process.stderr.write(`[hitl-channel] Failed to create directory: ${error}\n`);
   }
@@ -38,8 +42,9 @@ async function ensureDir(): Promise<void> {
  * Returns empty allowlist if file doesn't exist.
  */
 export async function loadAllowlist(): Promise<AllowlistData> {
+  const path = getAllowlistFile();
   try {
-    const file = Bun.file(ALLOWLIST_FILE);
+    const file = Bun.file(path);
     if (!(await file.exists())) {
       return { entries: {} };
     }
@@ -55,9 +60,9 @@ export async function loadAllowlist(): Promise<AllowlistData> {
  * Save the allowlist to disk.
  */
 async function saveAllowlist(data: AllowlistData): Promise<void> {
-  await ensureDir();
-  const file = Bun.file(ALLOWLIST_FILE);
-  await Bun.write(file, JSON.stringify(data, null, 2));
+  const path = getAllowlistFile();
+  await ensureDir(dirname(path));
+  await Bun.write(path, JSON.stringify(data, null, 2));
 }
 
 /**

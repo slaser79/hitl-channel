@@ -1,7 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
-import { readFile } from "node:fs/promises";
-import { writeFileSync, existsSync, unlinkSync } from "node:fs";
-import { tmpdir, homedir } from "node:os";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   clients,
@@ -13,7 +11,7 @@ import {
 import { mcp } from "../server.js";
 import { presentQuestionsToHitl } from "../questions_batch.js";
 import type { HitlWebSocket, ToolCallResultFrame } from "../types.js";
-import { auditDir } from "../audit.js";
+import { getAuditDir } from "../audit.js";
 
 function getCallHandler() {
   const handler = (mcp as any)._requestHandlers.get("tools/call");
@@ -127,29 +125,24 @@ describe("Multi-device routing and arbitration (Issue #40)", () => {
     clients.add(clientA);
     clients.add(clientB);
 
-    const tmpFile = join(homedir(), "hitl-multi-push-test.txt");
-    writeFileSync(tmpFile, "hello from push_file test", "utf8");
-    process.env.HITL_CHANNEL_ATTACHMENT_ROOTS = `${homedir()}:${tmpdir()}:/tmp`;
-    try {
-      const pushPromise = callTool("push_file", {
-        local_path: tmpFile,
-        dest: "documents/test.txt",
-      });
-      await waitForFrames(clientA, clientB, 1);
-      expect(clientA.sent.length).toBe(0);
-      expect(clientB.sent.length).toBe(1);
-      const req2 = JSON.parse(clientB.sent[0]!);
-      expect(req2.type).toBe("tool_call_request");
-      expect(req2.name).toBe("write_file");
-      correlator.resolve(req2.request_id, {
-        type: "tool_call_result",
-        request_id: req2.request_id,
-        success: true,
-      }, "hash-device-B");
-      await pushPromise;
-    } finally {
-      if (existsSync(tmpFile)) unlinkSync(tmpFile);
-    }
+    const tmpFile = join(process.env.HOME!, "hitl-multi-push-test.txt");
+    await writeFile(tmpFile, "hello from push_file test", "utf8");
+    const pushPromise = callTool("push_file", {
+      local_path: tmpFile,
+      dest: "documents/test.txt",
+    });
+    await waitForFrames(clientA, clientB, 1);
+    expect(clientA.sent.length).toBe(0);
+    expect(clientB.sent.length).toBe(1);
+    const req2 = JSON.parse(clientB.sent[0]!);
+    expect(req2.type).toBe("tool_call_request");
+    expect(req2.name).toBe("write_file");
+    correlator.resolve(req2.request_id, {
+      type: "tool_call_result",
+      request_id: req2.request_id,
+      success: true,
+    }, "hash-device-B");
+    await pushPromise;
   });
 
   it("AV3c: list_phone_tools sends list_tools_request to unicast target", async () => {
@@ -444,7 +437,7 @@ describe("Multi-device routing and arbitration (Issue #40)", () => {
     await new Promise((r) => setTimeout(r, 50));
 
     const todayStr = new Date().toISOString().slice(0, 10);
-    const auditFile = join(auditDir, `${todayStr}.jsonl`);
+    const auditFile = join(getAuditDir(), `${todayStr}.jsonl`);
     const content = await readFile(auditFile, "utf8");
     const lines = content.trim().split("\n").map((l) => JSON.parse(l));
 

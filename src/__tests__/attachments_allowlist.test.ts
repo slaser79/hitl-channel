@@ -15,8 +15,8 @@ describe("Attachments Allowlist and Warnings", () => {
     }
   });
 
-  it("AV1: resolveAttachments with a file under /tmp returns one entry with data", async () => {
-    const filePath = "/tmp/hitl-test-av1.txt";
+  it("AV1: resolveAttachments with a file under the test home returns one entry with data", async () => {
+    const filePath = join(process.env.HOME!, "hitl-test-av1.txt");
     writeFileSync(filePath, "hello world av1", "utf8");
     try {
       const { attachments, warnings } = await resolveAttachments([{ path: filePath }]);
@@ -34,8 +34,8 @@ describe("Attachments Allowlist and Warnings", () => {
 
   it("AV2: realpath/symlink normalisation allows symlinked paths", async () => {
     // Create a target directory and a symlink to it
-    const targetDir = "/tmp/hitl-sym-target";
-    const symlinkDir = "/tmp/hitl-sym-link";
+    const targetDir = join(process.env.HOME!, "hitl-sym-target");
+    const symlinkDir = join(process.env.HOME!, "hitl-sym-link");
     
     if (existsSync(targetDir)) rmSync(targetDir, { recursive: true, force: true });
     if (existsSync(symlinkDir)) unlinkSync(symlinkDir);
@@ -69,7 +69,7 @@ describe("Attachments Allowlist and Warnings", () => {
   });
 
   it("AV2.1: symlink inside allowlisted root pointing outside must be rejected (Security)", async () => {
-    const testWorkdir = join(tmpdir(), "hitl-security-test-" + Date.now());
+    const testWorkdir = join(process.env.HOME!, "hitl-security-test");
     if (existsSync(testWorkdir)) rmSync(testWorkdir, { recursive: true, force: true });
     mkdirSync(testWorkdir);
 
@@ -97,7 +97,7 @@ describe("Attachments Allowlist and Warnings", () => {
   it("AV3: rejected path (outside allowlist / missing / oversized) produces warnings", async () => {
     // 1. Outside allowlist
     process.env.HITL_CHANNEL_ATTACHMENT_ROOTS = "/tmp/some-strict-dir";
-    const outsidePath = "/tmp/hitl-outside-test.txt";
+    const outsidePath = join(process.env.HOME!, "hitl-outside-test.txt");
     writeFileSync(outsidePath, "outside content", "utf8");
     try {
       const res1 = await resolveAttachments([{ path: outsidePath }]);
@@ -112,14 +112,14 @@ describe("Attachments Allowlist and Warnings", () => {
     delete process.env.HITL_CHANNEL_ATTACHMENT_ROOTS;
 
     // 2. Missing file
-    const missingPath = "/tmp/hitl-nonexistent-file.txt";
+    const missingPath = join(process.env.HOME!, "hitl-nonexistent-file.txt");
     const res2 = await resolveAttachments([{ path: missingPath }]);
     expect(res2.attachments.length).toBe(0);
     expect(res2.warnings.length).toBe(1);
     expect(res2.warnings[0]).toContain("failed to resolve path");
 
     // 3. Oversized file (write 5MB + 1 byte file)
-    const oversizedPath = "/tmp/hitl-oversized.txt";
+    const oversizedPath = join(process.env.HOME!, "hitl-oversized.txt");
     const oversizedSize = kMaxFileReadBytes + 1;
     const buf = Buffer.alloc(oversizedSize);
     writeFileSync(oversizedPath, buf);
@@ -140,7 +140,7 @@ describe("Attachments Allowlist and Warnings", () => {
     // Should contain resolved /tmp/only-here
     expect(roots).toContain(resolvePath("/tmp/only-here"));
     
-    // Should NOT contain tmpdir() or homedir()
     expect(roots).not.toContain(resolvePath(tmpdir()));
+    expect(roots).not.toContain(process.env.HOME!);
   });
 });

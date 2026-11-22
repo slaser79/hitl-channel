@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeAll, afterAll } from "bun:test";
+import { describe, expect, it, beforeEach, afterEach } from "bun:test";
 import { mcp } from "../server.js";
 import { clients, correlator } from "../http_bridge.js";
 import { writeFileSync, unlinkSync, mkdirSync, symlinkSync, rmSync, existsSync } from "node:fs";
@@ -7,12 +7,11 @@ import { join, resolve as resolvePath } from "node:path";
 describe("push_file MCP Tool", () => {
   const originalEnv = process.env.HITL_CHANNEL_ATTACHMENT_ROOTS;
 
-  beforeAll(() => {
-    // Set a custom attachment roots for testing
-    process.env.HITL_CHANNEL_ATTACHMENT_ROOTS = "/tmp";
+  beforeEach(() => {
+    process.env.HITL_CHANNEL_ATTACHMENT_ROOTS = process.env.HOME!;
   });
 
-  afterAll(() => {
+  afterEach(() => {
     if (originalEnv !== undefined) {
       process.env.HITL_CHANNEL_ATTACHMENT_ROOTS = originalEnv;
     } else {
@@ -84,7 +83,7 @@ describe("push_file MCP Tool", () => {
   it("should reject local_path outside allowlisted roots", async () => {
     const callHandler = (mcp as any)._requestHandlers.get("tools/call");
 
-    const outsideFile = "/home/slaser79/outside.txt";
+    const outsideFile = join(process.env.HOME!, "..", "missing.txt");
     const result = await callHandler({
       method: "tools/call",
       params: {
@@ -104,7 +103,7 @@ describe("push_file MCP Tool", () => {
     const callHandler = (mcp as any)._requestHandlers.get("tools/call");
 
     // Create a symlink to escape the roots
-    const symlinkPath = "/tmp/hitl-escape-link";
+    const symlinkPath = join(process.env.HOME!, "hitl-escape-link");
     if (existsSync(symlinkPath)) unlinkSync(symlinkPath);
     try {
       symlinkSync("/etc", symlinkPath);
@@ -130,7 +129,7 @@ describe("push_file MCP Tool", () => {
   it("should reject destination paths containing dot (.) or dot-dot (..)", async () => {
     const callHandler = (mcp as any)._requestHandlers.get("tools/call");
 
-    const tempFile = "/tmp/hitl-dot-dest-test.txt";
+    const tempFile = join(process.env.HOME!, "hitl-dot-dest-test.txt");
     writeFileSync(tempFile, "hello from push_file dot test", "utf8");
 
     try {
@@ -166,10 +165,10 @@ describe("push_file MCP Tool", () => {
     }
   });
 
-  it("should succeed with an os.tmpdir() based path and invoke write_file on client for general paths", async () => {
+  it("should succeed with a path inside the attachment root and invoke write_file on client for general paths", async () => {
     const callHandler = (mcp as any)._requestHandlers.get("tools/call");
 
-    const tempFile = "/tmp/hitl-push-test.txt";
+    const tempFile = join(process.env.HOME!, "hitl-push-test.txt");
     writeFileSync(tempFile, "hello from push_file test", "utf8");
 
     let receivedFrame: any = null;
@@ -237,7 +236,7 @@ describe("push_file MCP Tool", () => {
   it("should invoke write_skill_file on client for skills paths", async () => {
     const callHandler = (mcp as any)._requestHandlers.get("tools/call");
 
-    const tempFile = "/tmp/hitl-skill-push-test.txt";
+    const tempFile = join(process.env.HOME!, "hitl-skill-push-test.txt");
     writeFileSync(tempFile, "my skill script content", "utf8");
 
     let receivedFrame: any = null;
@@ -306,7 +305,7 @@ describe("push_file MCP Tool", () => {
   it("must not leak media_type/overwrite or alias keys into the phone args", async () => {
     const callHandler = (mcp as any)._requestHandlers.get("tools/call");
 
-    const tempFile = "/tmp/hitl-infer-test.json";
+    const tempFile = join(process.env.HOME!, "hitl-infer-test.json");
     writeFileSync(tempFile, '{"hello": "world"}', "utf8");
 
     let receivedFrame: any = null;

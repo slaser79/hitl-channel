@@ -93,17 +93,19 @@ Claude Code (your terminal)
 |----------|---------|-------------|
 | `HITL_CHANNEL_PORT` | `8789` (`8790` `agy`, `8791` `codex`, `8792` `hermes`) | HTTP/WebSocket bridge port |
 | `HITL_CHANNEL_NAME` | `<harness>@<hostname>` (daemon mode) | Override instance display name |
-| `HITL_CHANNEL_IDENTITY_FILE` | `~/.hitl/channels/identity.json` (daemon: `identity-daemon-<harness>.json`) | Override identity file path |
+| `HITL_CHANNEL_HOME` | `~/.hitl/channels` | Directory for paired devices, audit logs, and identity files |
+| `HITL_CHANNEL_IDENTITY_FILE` | `identity.json` in the channel home (daemon: `identity-daemon-<harness>.json`) | Override identity file path |
 | `HITL_MCP_TRANSPORT` | `auto` (daemon mode) | MCP transport: `auto`, `http`, or `stdio` (`mcp-shim`) |
 | `HITL_AGY_BIN` / `HITL_CODEX_ACP_BIN` / `HITL_HERMES_BIN` | binary on `PATH` | Override harness binary path in daemon mode |
 | `HITL_CHANNEL_API_KEY` | (none) | Legacy API key auth (optional) |
 
 ## Data Storage
 
-Identity and allowlist are stored in `~/.hitl/channels/`:
+The channel home contains the following files.
 
 - `identity.json` — Instance ID (stable across restarts)
 - `allowlist.json` — Paired device token hashes (SHA-256)
+- `audit/<YYYY-MM-DD>.jsonl` — Daily audit log (UTC)
 
 ## API Endpoints
 

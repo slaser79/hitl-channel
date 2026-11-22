@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
-import { hostname as osHostname, tmpdir } from "node:os";
+import { hostname as osHostname } from "node:os";
 import { join } from "node:path";
 import { spawnAcpTransport } from "../acp_client.js";
 import {
@@ -9,7 +9,7 @@ import {
   isOwnHitlTool,
   resolveHarnessLaunch,
 } from "../acp_session_manager.js";
-import { auditDir, type AuditEvent } from "../audit.js";
+import { getAuditDir, type AuditEvent } from "../audit.js";
 import { parseDaemonArgs, startDaemon, type DaemonHandle } from "../daemon.js";
 import { replyBuffer } from "../http_bridge.js";
 import { DAEMON_INSTRUCTIONS } from "../mcp_instructions.js";
@@ -45,6 +45,7 @@ function readLog(logFile: string): Array<Record<string, unknown>> {
 }
 
 function readAuditEvents(instanceId: string): AuditEvent[] {
+  const auditDir = getAuditDir();
   try {
     const files = readdirSync(auditDir).filter((f) => f.endsWith(".jsonl"));
     return files
@@ -240,22 +241,19 @@ describe("SPEC-HC-005 Phase 2 Integration (Codex, Hermes, stdio mcp-shim)", () =
   });
 
   function setupEnv() {
-    const dir = mkdtempSync(join(tmpdir(), "hitl-p2-int-"));
+    const dir = mkdtempSync(join(process.env.HOME!, "hitl-p2-int-"));
     const prev = {
-      HOME: process.env.HOME,
       HITL_CHANNEL_IDENTITY_FILE: process.env.HITL_CHANNEL_IDENTITY_FILE,
       HITL_CHANNEL_NAME: process.env.HITL_CHANNEL_NAME,
       HITL_INSTANCE_ID: process.env.HITL_INSTANCE_ID,
       HITL_CHANNEL_API_KEY: process.env.HITL_CHANNEL_API_KEY,
     };
-    process.env.HOME = dir;
     process.env.HITL_CHANNEL_API_KEY = "phase2-key";
     delete process.env.HITL_CHANNEL_IDENTITY_FILE;
     delete process.env.HITL_CHANNEL_NAME;
     delete process.env.HITL_INSTANCE_ID;
 
     cleanups.push(() => {
-      process.env.HOME = prev.HOME;
       if (prev.HITL_CHANNEL_IDENTITY_FILE !== undefined)
         process.env.HITL_CHANNEL_IDENTITY_FILE = prev.HITL_CHANNEL_IDENTITY_FILE;
       else delete process.env.HITL_CHANNEL_IDENTITY_FILE;
@@ -356,7 +354,7 @@ describe("SPEC-HC-005 Phase 2 Integration (Codex, Hermes, stdio mcp-shim)", () =
 
     expect(daemon.displayName).toBe(`codex@${osHostname()}`);
     expect(
-      readFileSync(join(dir, ".hitl", "channels", "identity-daemon-codex.json"), "utf8"),
+      readFileSync(join(process.env.HITL_CHANNEL_HOME!, "identity-daemon-codex.json"), "utf8"),
     ).toContain(daemon.instanceId);
 
     // 1. Auto-creates codex session with top-level systemPrompt, invokes HTTP MCP hitl tool

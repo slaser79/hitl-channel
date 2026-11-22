@@ -1,22 +1,23 @@
 /**
  * Instance identity management.
  *
- * - Default path: ~/.hitl/channels/identity.json (overridable via HITL_CHANNEL_IDENTITY_FILE)
+ * - Default path: identity.json in the channel home
+ * - Overridable via HITL_CHANNEL_IDENTITY_FILE
  * - Instance ID is a random UUID (stable across restarts)
  * - Used for multi-instance support
  */
 
 import { mkdir } from "node:fs/promises";
-import { homedir, hostname as osHostname } from "node:os";
-import { dirname } from "node:path";
+import { hostname as osHostname } from "node:os";
+import { dirname, join } from "node:path";
+import { assertTestStatePath, getChannelHome } from "./channel_home.js";
 
 export function getIdentityFilePath(): string {
   const override = process.env.HITL_CHANNEL_IDENTITY_FILE?.trim();
   if (override) {
     return override;
   }
-  const home = process.env.HOME?.trim() || homedir();
-  return `${home}/.hitl/channels/identity.json`;
+  return join(getChannelHome(), "identity.json");
 }
 
 export interface InstanceIdentity {
@@ -43,6 +44,7 @@ async function ensureDir(filePath: string): Promise<void> {
  */
 export async function loadIdentity(): Promise<InstanceIdentity> {
   const filePath = getIdentityFilePath();
+  assertTestStatePath(filePath);
   try {
     const file = Bun.file(filePath);
     if (await file.exists()) {
@@ -55,7 +57,7 @@ export async function loadIdentity(): Promise<InstanceIdentity> {
 
   // Create new identity
   const identity = await createIdentity();
-  await saveIdentity(identity);
+  await saveIdentity(identity, filePath);
   return identity;
 }
 
@@ -78,8 +80,8 @@ async function createIdentity(): Promise<InstanceIdentity> {
 /**
  * Save the instance identity to disk.
  */
-async function saveIdentity(identity: InstanceIdentity): Promise<void> {
-  const filePath = getIdentityFilePath();
+async function saveIdentity(identity: InstanceIdentity, filePath = getIdentityFilePath()): Promise<void> {
+  assertTestStatePath(filePath);
   await ensureDir(filePath);
   const file = Bun.file(filePath);
   await Bun.write(file, JSON.stringify(identity, null, 2));
