@@ -1,17 +1,18 @@
 # hitl-channel
 
-**Claude Code MCP channel plugin for direct mobile-to-agent communication.**
+**Direct mobile-to-agent bridge for Claude Code Channels and ACP host harnesses (`agy`, `codex`, `hermes`).**
 
-hitl-channel is a TypeScript MCP server that enables bidirectional communication between the [HITL mobile app](https://hitlrelay.app) and Claude Code sessions — with no cloud intermediary. Messages travel directly over your LAN or Tailscale network.
+hitl-channel is a TypeScript MCP and ACP bridge that enables bidirectional communication between the [HITL mobile app](https://hitlrelay.app) and coding agents running on your machine — with no cloud intermediary. Messages travel directly over your LAN or Tailscale network.
 
 ## Features
 
 - **Privacy-first**: Direct LAN/Tailscale connection, no relay server
-- **Claude Code Channels**: Native MCP channel protocol (`notifications/claude/channel`)
+- **Claude Code Channels (`:8789`)**: Native MCP channel protocol (`notifications/claude/channel`)
+- **ACP Daemon Mode (`:8790`–`:8792`)**: Long-lived host daemons for Antigravity (`agy`), Codex (`codex`), and Hermes (`hermes`) with native session switching, live streaming, tool progress, mid-turn queueing, correlated approvals, and one-tap turn cancellation
 - **Pairing flow**: Secure 6-digit code pairing with device token allowlist
 - **mDNS discovery**: Auto-discovery on local network (`_hitl-channel._tcp`)
-- **WebSocket bridge**: Real-time bidirectional messaging
-- **Multi-instance**: Support multiple Claude Code sessions with distinct identities
+- **WebSocket bridge**: Real-time bidirectional messaging with `client_hello` capability negotiation
+- **Multi-instance**: Run Claude Code channels and multiple ACP harnesses side by side with distinct identities
 
 ## Quick Start
 
@@ -60,12 +61,12 @@ claude --dangerously-load-development-channels server:hitl-channel
 
 ### Connect from HITL App
 
-1. Open HITL app on your phone
-2. Go to Agents > Claude Code > Add Instance
-3. Enter your machine's IP and port 8789 (or discover via mDNS on same network)
-4. Tap "Pair" — a 6-digit code will appear in your Claude Code session
-5. Enter the code in the app
-6. Start chatting!
+1. Open the HITL app on your phone.
+2. Go to **Agents** → **Connect a remote agent** → **Start Pairing** (opens **Pair Host Agent**).
+3. Select your host under **Discover** (same LAN via mDNS) or tap **Manual Entry** with your machine's LAN/Tailscale IP and port preset (`8789` for Claude Code Channel).
+4. Tap **Connect** — a 6-digit code will appear in your Claude Code session.
+5. Enter the code in the app.
+6. Filter under **Agents** → **Host Agents** and start chatting!
 
 ## Architecture
 
@@ -112,11 +113,11 @@ The channel home contains the following files.
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/health` | GET | No | Health check (status, port, client count) |
-| `/instance` | GET | No | Instance identity (instanceId, hostname) |
-| `/pair/request` | POST | No | Request pairing code (sent to Claude Code via channel) |
+| `/instance` | GET | No | Instance identity and capability metadata (`instanceId`, `hostname`, `mode`, `harness`, `capabilities`) |
+| `/pair/request` | POST | No | Request pairing code (sent via channel notification or printed/notified by daemon) |
 | `/pair/validate` | POST | No | Validate code, returns device token |
-| `/` | POST | Yes | Send message to Claude Code |
-| `/ws` | GET | Yes | WebSocket for receiving replies |
+| `/` | POST | Yes | Send message or structured `choices_id`/`option_id` selection to host agent |
+| `/ws` | GET | Yes | WebSocket for replies, `client_hello` capability negotiation (`sessions`, `choices_settled`, `streaming`), live deltas, tool progress, and turn controls |
 
 ## Development
 
@@ -149,7 +150,7 @@ If an ACP harness does not support HTTP MCP (`mcpCapabilities.http === false`), 
 
 1. Confirm your chosen harness binary is on `PATH` (`which agy`, `which codex-acp` / `npx -y @agentclientprotocol/codex-acp`, or `which hermes`).
 2. Start the daemon for that harness (`bun run src/cli.ts daemon --harness <agy|codex|hermes> --cwd ~/lab/hitl`).
-3. Open the HITL app on your phone, add/discover your host on that harness's port (`8790` `agy`, `8791` `codex`, `8792` `hermes`), and tap **Pair**.
+3. Open the HITL app on your phone, go to **Agents** → **Connect a remote agent** → **Start Pairing**, choose **Discover** or **Manual Entry** with that harness's port preset (`8790` `agy`, `8791` `codex`, `8792` `hermes`), and tap **Connect**.
 4. Enter the 6-digit pairing code shown on daemon `stdout` (`PAIRING CODE: ...`) or in your desktop notification (`osascript` on macOS, `notify-send` on Linux).
 
 ### CLI Options
@@ -162,7 +163,15 @@ If an ACP harness does not support HTTP MCP (`mcpCapabilities.http === false`), 
 | `--cwd <dir>` | current working directory | Default directory for auto-created / `/new` sessions |
 | `--mcp-transport <mode>` | `auto` (or `HITL_MCP_TRANSPORT`) | MCP injection mode: `auto`, `http`, or `stdio` (`mcp-shim`) |
 
+### Using Daemon Mode from the HITL App
+
+- **Native session & folder management:** Tap the chat header's session/folder pill in `hitl-app` (`HostSessionSheet`) to switch host ACP sessions (with bounded recent CLI resume context), launch a **New Session** in any readable directory on your host, or browse read-only archived local chats.
+- **Live streaming & tool progress:** Watch partial output and tool calls stream directly into the reply bubble without flooding local history.
+- **Mid-turn queueing, approvals & cancellation:** Keep typing and sending follow-ups while a turn runs (shown in the composer turn-state strip), respond to persistent correlated permission cards, or tap **Stop host turn** to cancel the active turn and settle parked approvals.
+
 ### Phone Chat Slash Commands
+
+Slash commands remain available both as keyboard shortcuts in daemon mode and for legacy clients without `client_hello` session negotiation:
 
 - `/help` — show supported daemon commands
 - `/new [harness] [cwd]` — create and switch to a new session (default cwd if omitted; run a separate daemon per harness)
