@@ -122,7 +122,9 @@ describe("SPEC-HITL-APP-10827 Milestone 3b AV10: live streaming, tool progress, 
   beforeEach(() => {
     prevHome = process.env.HOME;
     prevApiKey = process.env.HITL_CHANNEL_API_KEY;
-    tempHome = mkdtempSync(join(tmpdir(), "hitl-p3b-stream-"));
+    tempHome = mkdtempSync(
+      join(process.env.HITL_CHANNEL_TEST_ROOT || tmpdir(), "hitl-p3b-stream-"),
+    );
     process.env.HOME = tempHome;
     clients.clear();
     replyBuffer.drain();
@@ -1216,5 +1218,83 @@ describe("SPEC-HITL-APP-10827 Milestone 3b AV10: live streaming, tool progress, 
     wsCh.send(JSON.stringify({ type: "cancel_turn" }));
     await waitFor(() => channelControlCount === 1);
     expect(channelInboundCount).toBe(0);
+  });
+
+  it("ignores stale session-filtered cancel_turn when activeSessionId is still null during session/new", async () => {
+    const streamingWs = makeMockSocket({
+      tokenHash: "stream-stale-cancel",
+      features: ["streaming"],
+    });
+    clients.add(streamingWs);
+
+    let releaseSessionNew!: () => void;
+    let promptSeen = false;
+    const { handlers } = createHarness({
+      streamCoalesceMs: 10,
+      onOutbound: (msg, peer) => {
+        if (msg.method === "initialize") {
+          peer.emit({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { protocolVersion: 1, agentCapabilities: {} },
+          });
+        } else if (msg.method === "session/new") {
+          releaseSessionNew = () => {
+            peer.emit({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: { sessionId: "fresh-sess-1" },
+            });
+          };
+        } else if (msg.method === "session/prompt") {
+          promptSeen = true;
+          peer.emit({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: {
+              sessionId: "fresh-sess-1",
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Completed initial turn" },
+              },
+            },
+          });
+          peer.emit({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { stopReason: "end_turn" },
+          });
+        }
+      },
+    });
+
+    const inboundPromise = handlers.onInbound({
+      text: "hello new session",
+      meta: {},
+    });
+    await waitFor(() => typeof releaseSessionNew === "function");
+
+    // While activeSessionId === null and session/new is still in flight (turnBusy === true),
+    // a stale session-filtered cancel_turn must NOT cancel the starting turn.
+    await handlers.onControlFrame!(streamingWs, {
+      type: "cancel_turn",
+      sessionId: "stale-prior-session",
+    });
+
+    releaseSessionNew();
+    await inboundPromise;
+    await waitFor(() =>
+      streamingWs.frames.some(
+        (f) => f.type === "turn_state" && f.state === "idle",
+      ),
+    );
+
+    expect(promptSeen).toBe(true);
+    const finalReply = streamingWs.frames.find(
+      (f) => f.type === "reply" && f.isTurnFinal === true,
+    ) as unknown as ReplyPayload;
+    expect(finalReply).toBeDefined();
+    expect(finalReply.text).toBe("Completed initial turn");
+    expect(finalReply.text).not.toContain("cancelled");
   });
 });

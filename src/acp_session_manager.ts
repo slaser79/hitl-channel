@@ -2479,7 +2479,6 @@ export class AcpSessionManager {
       this.runningTurn?.sessionId ?? this.activeSessionId;
     if (
       opts.sessionIdFilter &&
-      currentSessionId &&
       opts.sessionIdFilter !== currentSessionId
     ) {
       return { acpSessionId: this.activeSessionId };
