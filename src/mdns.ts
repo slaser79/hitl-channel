@@ -11,10 +11,20 @@ import type { Bonjour, Service } from "bonjour-service";
 let bonjour: Bonjour | null = null;
 let advertisedService: Service | null = null;
 
+export interface MdnsMeta {
+  mode?: string;
+  harness?: string;
+}
+
 /**
  * Start advertising the hitl-channel service via mDNS.
  */
-export function startMDNS(port: number, instanceId?: string, displayName?: string): void {
+export function startMDNS(
+  port: number,
+  instanceId?: string,
+  displayName?: string,
+  meta?: MdnsMeta,
+): void {
   try {
     // Dynamically import bonjour-service
     const { Bonjour } = require("bonjour-service") as { Bonjour: new () => Bonjour };
@@ -26,15 +36,23 @@ export function startMDNS(port: number, instanceId?: string, displayName?: strin
       ? `${baseName}-${instanceId.slice(0, 8)}`
       : baseName;
 
+    const txt: Record<string, string> = {
+      version: "0.0.1",
+      instanceId: instanceId || "unknown",
+      displayName: displayName || "",
+    };
+    if (meta?.mode) {
+      txt.mode = meta.mode;
+    }
+    if (meta?.harness) {
+      txt.harness = meta.harness;
+    }
+
     advertisedService = bonjour.publish({
       name: serviceName,
       type: "_hitl-channel._tcp",
       port,
-      txt: {
-        version: "0.0.1",
-        instanceId: instanceId || "unknown",
-        displayName: displayName || "",
-      },
+      txt,
     });
     
     process.stderr.write(`[hitl-channel] mDNS advertising started: ${serviceName} on port ${port}\n`);

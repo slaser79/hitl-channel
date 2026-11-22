@@ -108,7 +108,13 @@ export interface AcpPromptResult {
 export interface AcpSessionUpdateParams {
   sessionId: string;
   update: {
-    sessionUpdate: string;
+    sessionUpdate:
+      | "user_message_chunk"
+      | "agent_message_chunk"
+      | "tool_call"
+      | "tool_call_update"
+      | "session_info_update"
+      | (string & {});
     content?: { type?: string; text?: string };
     title?: string;
     toolCallId?: string;

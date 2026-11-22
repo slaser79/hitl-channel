@@ -205,21 +205,30 @@ async function isAuthenticated(req: Request): Promise<{ valid: boolean; reason?:
   return { valid: false, reason: "invalid_token" };
 }
 
+export interface BroadcastReplyOptions {
+  acpSessionId?: string | null;
+}
+
 export function broadcastReply(
   text: string,
   messageId?: string,
   agentId?: string,
   attachments?: HitlAttachment[],
-): void {
+  opts?: BroadcastReplyOptions,
+): string {
+  const id = `r${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const payload: ReplyPayload = {
     type: "reply",
     text,
     content: text,
-    id: `r${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    id,
     message_id: messageId,
     agent_id: agentId,
     ts: new Date().toISOString(),
     ...(attachments && attachments.length > 0 ? { attachments } : {}),
+    ...(typeof opts?.acpSessionId === "string" && opts.acpSessionId.length > 0
+      ? { acpSessionId: opts.acpSessionId }
+      : {}),
   };
   
   // Always push to buffer first to guarantee redundancy
@@ -231,6 +240,48 @@ export function broadcastReply(
       wsSendAccepted(ws, rawPayload);
     }
   }
+  return id;
+}
+
+/**
+ * Broadcast an ephemeral Phase-3 control frame ONLY to open sockets that
+ * declared `feature` during `client_hello`. Never touches `replyBuffer` and
+ * never sends to legacy sockets without `client_hello`.
+ */
+export function broadcastToCapable(
+  feature: string,
+  frame: Record<string, unknown>,
+): number {
+  const raw = JSON.stringify(frame);
+  let sent = 0;
+  for (const ws of Array.from(clients)) {
+    if (
+      ws.readyState === 1 &&
+      ws.data?.features instanceof Set &&
+      ws.data.features.has(feature)
+    ) {
+      if (wsSendAccepted(ws, raw)) {
+        sent++;
+      }
+    }
+  }
+  return sent;
+}
+
+/**
+ * Unicast a Phase-3 control frame to a single open socket that completed
+ * `client_hello` (and optionally declared `requiredFeature`). Never touches
+ * `replyBuffer`.
+ */
+export function sendControlToClient(
+  ws: HitlWebSocket,
+  frame: Record<string, unknown>,
+  requiredFeature?: string,
+): boolean {
+  if (ws.readyState !== 1) return false;
+  if (!(ws.data?.features instanceof Set)) return false;
+  if (requiredFeature && !ws.data.features.has(requiredFeature)) return false;
+  return wsSendAccepted(ws, JSON.stringify(frame));
 }
 
 /**
@@ -435,10 +486,21 @@ export interface InboundHandlers {
   onInbound(input: InboundMessage): Promise<{ acpSessionId?: string | null } | void>;
   onPairingCode(code: string): void | Promise<void>;
   onClientOpen?(send: (frame: Record<string, unknown>) => boolean): void;
+  onClientHello?(ws: HitlWebSocket): void | Promise<void>;
+  onControlFrame?(ws: HitlWebSocket, frame: Record<string, unknown>): void | Promise<void>;
+}
+
+export interface InstanceCapabilities {
+  sessions: boolean;
+  streaming: boolean;
+  choicesId: boolean;
 }
 
 export interface HttpBridgeOptions {
   port?: number;
+  mode?: "channel" | "daemon";
+  harness?: string;
+  capabilities?: Partial<InstanceCapabilities>;
 }
 
 export interface NormalizedInbound {
@@ -475,6 +537,21 @@ export function normalizeInboundPayload(body: HitlMessage): NormalizedInbound {
   const clientMessageId =
     typeof body.id === "string" && body.id.length > 0 ? body.id : undefined;
 
+  const choicesId =
+    typeof body.choices_id === "string" && body.choices_id.trim().length > 0
+      ? body.choices_id.trim()
+      : typeof body.metadata?.choices_id === "string" &&
+          body.metadata.choices_id.trim().length > 0
+        ? body.metadata.choices_id.trim()
+        : undefined;
+  const optionId =
+    typeof body.option_id === "string" && body.option_id.trim().length > 0
+      ? body.option_id.trim()
+      : typeof body.metadata?.option_id === "string" &&
+          body.metadata.option_id.trim().length > 0
+        ? body.metadata.option_id.trim()
+        : undefined;
+
   // The phone client flattens response metadata into the top-level
   // envelope. Keep accepting the legacy nested shape while
   // normalising the real wire shape for downstream formatting,
@@ -490,6 +567,8 @@ export function normalizeInboundPayload(body: HitlMessage): NormalizedInbound {
           ...(Array.isArray(body.selections)
             ? { selections: body.selections }
             : {}),
+          ...(choicesId ? { choices_id: choicesId } : {}),
+          ...(optionId ? { option_id: optionId } : {}),
         }
       : undefined);
 
@@ -535,6 +614,8 @@ export function normalizeInboundPayload(body: HitlMessage): NormalizedInbound {
     ...(agentId ? { agent_id: agentId } : {}),
     ...(clientMessageId ? { client_message_id: clientMessageId } : {}),
     ...extraMeta,
+    ...(choicesId ? { choices_id: choicesId } : {}),
+    ...(optionId ? { option_id: optionId } : {}),
   };
 
   return {
@@ -618,6 +699,13 @@ export function startHttpBridge(
       ? opts.port
       : Number(process.env.HITL_CHANNEL_PORT ?? 8789);
   const isDaemon = isInboundHandlers(target);
+  const mode = opts?.mode ?? (isDaemon ? "daemon" : "channel");
+  const harness = opts?.harness ?? (isDaemon ? "agy" : "claude-code");
+  const capabilities: InstanceCapabilities = {
+    sessions: opts?.capabilities?.sessions ?? (mode === "daemon"),
+    streaming: opts?.capabilities?.streaming ?? false,
+    choicesId: opts?.capabilities?.choicesId ?? true,
+  };
   const handlers: InboundHandlers = isDaemon
     ? target
     : {
@@ -665,6 +753,9 @@ export function startHttpBridge(
               instanceId: identity.instanceId,
               hostname: identity.hostname,
               displayName: identity.displayName,
+              mode,
+              harness,
+              capabilities,
             }),
             { headers: { "content-type": "application/json" } }
           );
@@ -879,6 +970,39 @@ export function startHttpBridge(
           // request_id is logged at warn level and dropped (no waiter, no
           // audit double-count) per the idempotency contract.
           const frameType = typeof data.type === "string" ? data.type : undefined;
+          if (frameType === "client_hello") {
+            if (typeof data.proto === "number" && Number.isFinite(data.proto)) {
+              typedWs.data.proto = data.proto;
+            }
+            const rawFeatures = Array.isArray(data.features) ? data.features : [];
+            typedWs.data.features = new Set(
+              rawFeatures.filter(
+                (f): f is string => typeof f === "string" && f.length > 0,
+              ),
+            );
+            if (handlers.onClientHello) {
+              void Promise.resolve(handlers.onClientHello(typedWs)).catch((err) => {
+                process.stderr.write(
+                  `[hitl-channel] onClientHello failed: ${err instanceof Error ? err.message : err}\n`,
+                );
+              });
+            }
+            return;
+          }
+          if (
+            frameType === "session_list_request" ||
+            frameType === "session_new" ||
+            frameType === "session_resume"
+          ) {
+            if (handlers.onControlFrame) {
+              void Promise.resolve(handlers.onControlFrame(typedWs, data)).catch((err) => {
+                process.stderr.write(
+                  `[hitl-channel] onControlFrame failed: ${err instanceof Error ? err.message : err}\n`,
+                );
+              });
+            }
+            return;
+          }
           if (frameType === "ack") {
             const id = typeof data.id === "string" ? data.id : undefined;
             if (!id) {

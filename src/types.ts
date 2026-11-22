@@ -17,6 +17,8 @@ export interface HitlMessage {
   batch_answer?: Record<string, any>;
   cancelled?: boolean;
   id?: string;
+  choices_id?: string;
+  option_id?: string;
   selections?: string[];
   timestamp?: string;
 }
@@ -36,6 +38,7 @@ export interface ReplyPayload {
   id: string;
   message_id?: string;
   agent_id?: string;
+  acpSessionId?: string;
   ts: string;
   attachments?: HitlAttachment[];
 }
@@ -44,6 +47,8 @@ export interface HitlWebSocketData {
   tokenHash?: string;
   connectedAt?: string;
   lastSeen?: string;
+  proto?: number;
+  features?: Set<string>;
   [key: string]: unknown;
 }
 
@@ -125,6 +130,7 @@ export interface QuestionsBatchRequestFrame {
   type: "questions_batch_request";
   request_id: string;
   questions: QuestionSpec[];
+  acpSessionId?: string;
   ts: string;
 }
 
@@ -133,6 +139,92 @@ export interface QuestionsBatchResultFrame {
   request_id: string;
   answers: QuestionAnswer[];
   cancelled: boolean;
+}
+
+// ─── SPEC-HITL-APP-10827 Milestone 3a (SPEC-HC-005 Phase 3a) frame types ──
+// Capability-negotiated session sync, control RPCs, and choice settlement
+// frames. Sent ONLY to sockets declaring matching features via client_hello.
+
+export interface ClientHelloFrame {
+  type: "client_hello";
+  proto: number;
+  features: string[];
+}
+
+export interface SessionListRequestFrame {
+  type: "session_list_request";
+  requestId?: string;
+}
+
+export interface SessionNewFrame {
+  type: "session_new";
+  cwd?: string;
+  requestId?: string;
+}
+
+export interface SessionResumeFrame {
+  type: "session_resume";
+  sessionId: string;
+  cwd?: string;
+  includeRecentTurns?: boolean;
+  requestId?: string;
+}
+
+export interface SessionListEntry {
+  sessionId: string;
+  title?: string;
+  cwd?: string;
+  updatedAt?: string;
+}
+
+export interface SessionListFrame {
+  type: "session_list";
+  sessions: SessionListEntry[];
+  activeSessionId: string | null;
+  defaultCwd: string;
+  recentCwds: string[];
+  requestId?: string;
+}
+
+export interface RecentTurnSummary {
+  role: "user" | "assistant";
+  text: string;
+}
+
+export interface SessionSwitchedFrame {
+  type: "session_switched";
+  sessionId: string | null;
+  title?: string | null;
+  cwd?: string | null;
+  recentTurns?: RecentTurnSummary[];
+  requestId?: string;
+}
+
+export type SessionErrorAction =
+  | "session_new"
+  | "session_resume"
+  | "session_list_request";
+
+export type SessionErrorCode =
+  | "turn_busy"
+  | "invalid_cwd"
+  | "load_timeout"
+  | "load_failed";
+
+export interface SessionErrorFrame {
+  type: "session_error";
+  action: SessionErrorAction;
+  code: SessionErrorCode;
+  message: string;
+  requestId?: string;
+}
+
+export interface ChoicesSettledFrame {
+  type: "choices_settled";
+  frameIds: string[];
+  acpSessionId?: string | null;
+  reason: "cancelled" | "answered";
+  selectedLabel?: string;
 }
 
 // ─── SPEC-HITL-CC-001 Phase 4 AC#26 — ReplyBuffer types ───────────────────
