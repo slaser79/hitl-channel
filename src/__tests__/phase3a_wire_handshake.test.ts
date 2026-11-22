@@ -161,7 +161,7 @@ describe("SPEC-HITL-APP-10827 Milestone 3a AV1: /instance, mDNS, client_hello fe
     expect(daemonInst.harness).toBe("codex");
     expect(daemonInst.capabilities).toEqual({
       sessions: true,
-      streaming: false,
+      streaming: true,
       choicesId: true,
     });
     expect("defaultCwd" in daemonInst).toBe(false);

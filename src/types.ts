@@ -41,6 +41,9 @@ export interface ReplyPayload {
   acpSessionId?: string;
   ts: string;
   attachments?: HitlAttachment[];
+  turnId?: string;
+  isTurnFinal?: boolean;
+  toolSteps?: ToolStepSummary[];
 }
 
 export interface HitlWebSocketData {
@@ -225,6 +228,61 @@ export interface ChoicesSettledFrame {
   acpSessionId?: string | null;
   reason: "cancelled" | "answered";
   selectedLabel?: string;
+}
+
+// ─── SPEC-HITL-APP-10827 Milestone 3b (SPEC-HC-005 Phase 3b) frame types ──
+// Live streaming deltas, tool progress, turn state, and turn cancellation
+// frames. Ephemeral control/stream frames go ONLY to sockets declaring
+// `"streaming"` via `client_hello`.
+
+export type ToolStepStatus = "pending" | "in_progress" | "completed" | "failed";
+
+export interface ToolStepSummary {
+  toolCallId: string;
+  name: string;
+  title: string;
+  kind?: string;
+  status: ToolStepStatus;
+  summary?: string;
+}
+
+export interface CancelTurnFrame {
+  type: "cancel_turn";
+  sessionId?: string;
+  requestId?: string;
+}
+
+export interface StreamDeltaFrame {
+  type: "stream_delta";
+  sessionId: string;
+  turnId: string;
+  seq: number;
+  delta: string;
+  reset?: boolean;
+  truncated?: boolean;
+}
+
+export interface ToolProgressFrame {
+  type: "tool_progress";
+  sessionId: string;
+  turnId: string;
+  toolCallId: string;
+  name: string;
+  title: string;
+  kind?: string;
+  status: ToolStepStatus;
+  summary?: string;
+}
+
+export type TurnStateValue = "idle" | "running" | "waiting_approval";
+
+export interface TurnStateFrame {
+  type: "turn_state";
+  sessionId: string | null;
+  turnId?: string;
+  state: TurnStateValue;
+  queueDepth: number;
+  finalReplyId?: string | null;
 }
 
 // ─── SPEC-HITL-CC-001 Phase 4 AC#26 — ReplyBuffer types ───────────────────
