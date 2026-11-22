@@ -5,7 +5,7 @@ import { createServer } from "node:net";
 import { hostname as osHostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnAcpTransport } from "../acp_client.js";
-import { auditDir, sha256Hex, type AuditEvent } from "../audit.js";
+import { getAuditDir, sha256Hex, type AuditEvent } from "../audit.js";
 import { parseDaemonArgs, startDaemon, type DaemonHandle } from "../daemon.js";
 import { broadcastReply, replyBuffer, startHttpBridge } from "../http_bridge.js";
 import { loadIdentity } from "../identity.js";
@@ -62,21 +62,18 @@ describe("Daemon Mode Integration (AV2, AV3, AV5, AV6, AV7, AV9, AV10, AV11, AV1
   });
 
   function setupIsolatedEnv() {
-    const dir = mkdtempSync(join(tmpdir(), "hitl-daemon-int-"));
+    const dir = mkdtempSync(join(process.env.HOME!, "hitl-daemon-int-"));
     const prevEnv = {
-      HOME: process.env.HOME,
       HITL_CHANNEL_IDENTITY_FILE: process.env.HITL_CHANNEL_IDENTITY_FILE,
       HITL_CHANNEL_NAME: process.env.HITL_CHANNEL_NAME,
       HITL_INSTANCE_ID: process.env.HITL_INSTANCE_ID,
       HITL_CHANNEL_API_KEY: process.env.HITL_CHANNEL_API_KEY,
     };
-    process.env.HOME = dir;
     delete process.env.HITL_CHANNEL_IDENTITY_FILE;
     delete process.env.HITL_CHANNEL_NAME;
     delete process.env.HITL_INSTANCE_ID;
 
     cleanups.push(() => {
-      process.env.HOME = prevEnv.HOME;
       if (prevEnv.HITL_CHANNEL_IDENTITY_FILE !== undefined) {
         process.env.HITL_CHANNEL_IDENTITY_FILE = prevEnv.HITL_CHANNEL_IDENTITY_FILE;
       } else {
@@ -103,6 +100,23 @@ describe("Daemon Mode Integration (AV2, AV3, AV5, AV6, AV7, AV9, AV10, AV11, AV1
 
     return dir;
   }
+
+  it("honors a custom identity file and rejects an override outside the test directory", async () => {
+    const dir = setupIsolatedEnv();
+    const path = join(dir, "custom-identity.json");
+    process.env.HITL_CHANNEL_IDENTITY_FILE = path;
+    const identity = await loadIdentity();
+    expect(await Bun.file(path).json()).toEqual(identity);
+    expect(await loadIdentity()).toEqual(identity);
+
+    const outside = mkdtempSync(join(tmpdir(), "hitl-outside-identity-"));
+    try {
+      process.env.HITL_CHANNEL_IDENTITY_FILE = join(outside, "identity.json");
+      await expect(loadIdentity()).rejects.toThrow("outside the temporary test directory");
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
 
   it("AV2: parseDaemonArgs defaults port 8790, identity-daemon-agy.json differs from identity.json, displayName uses os.hostname(), pairing yields token with 0 ACP RPCs", async () => {
     const dir = setupIsolatedEnv();
@@ -134,8 +148,7 @@ describe("Daemon Mode Integration (AV2, AV3, AV5, AV6, AV7, AV9, AV10, AV11, AV1
     });
     cleanups.push(() => daemon.shutdown());
 
-    // Identity persisted at ~/.hitl/channels/identity-daemon-agy.json, distinct from channel identity.json
-    const daemonIdFile = join(dir, ".hitl", "channels", "identity-daemon-agy.json");
+    const daemonIdFile = join(process.env.HITL_CHANNEL_HOME!, "identity-daemon-agy.json");
     const persisted = JSON.parse(readFileSync(daemonIdFile, "utf8")) as {
       instanceId: string;
       displayName: string;
@@ -431,7 +444,7 @@ describe("Daemon Mode Integration (AV2, AV3, AV5, AV6, AV7, AV9, AV10, AV11, AV1
 
     // AV6 Audit check: acp_session_id populated from _meta["antigravity.google/conversation_id"]
     const todayAuditFile = join(
-      auditDir,
+      getAuditDir(),
       `${new Date().toISOString().slice(0, 10)}.jsonl`,
     );
     await waitFor(() => {

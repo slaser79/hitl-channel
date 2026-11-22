@@ -1,18 +1,17 @@
 /**
  * Append-only JSONL audit log per SPEC-HITL-CC-001 §4.2.
  *
- * - One file per UTC day: `~/.hitl/channels/audit/<YYYY-MM-DD>.jsonl`.
+ * - One file per UTC day under the channel home's `audit/` directory.
  * - Closed schema enforced via the `AuditEvent` type.
  * - 30-day local retention with oldest-first prune at startup. Pruning is
  *   best-effort and non-blocking.
  */
 
-import { homedir } from "node:os";
 import { appendFile, mkdir, readdir, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
+import { assertTestStatePath, getChannelHome } from "./channel_home.js";
 
-const AUDIT_DIR = join(homedir(), ".hitl", "channels", "audit");
 const RETENTION_DAYS = 30;
 
 export type AuditDirection =
@@ -67,8 +66,14 @@ function utcDateStamp(date = new Date()): string {
   return date.toISOString().slice(0, 10);
 }
 
-function fileForDate(date = new Date()): string {
-  return join(AUDIT_DIR, `${utcDateStamp(date)}.jsonl`);
+export function getAuditDir(): string {
+  return join(getChannelHome(), "audit");
+}
+
+function currentAuditFile(): string {
+  const path = join(getAuditDir(), `${utcDateStamp()}.jsonl`);
+  assertTestStatePath(path);
+  return path;
 }
 
 export function sha256Hex(input: string): string {
@@ -150,10 +155,11 @@ export function summariseAttachments(
  * IO must never block the WS path.
  */
 export async function appendAudit(event: AuditEvent): Promise<void> {
+  const path = currentAuditFile();
   try {
-    await mkdir(AUDIT_DIR, { recursive: true });
+    await mkdir(dirname(path), { recursive: true });
     const line = JSON.stringify(event) + "\n";
-    await appendFile(fileForDate(), line, { encoding: "utf8" });
+    await appendFile(path, line, { encoding: "utf8" });
   } catch (err) {
     process.stderr.write(
       `[hitl-channel] audit append failed: ${err instanceof Error ? err.message : err}\n`
@@ -181,10 +187,11 @@ export interface BufferDrainAuditLine {
  * as appendAudit — failures are logged to stderr but never block the WS path.
  */
 export async function appendBufferDrainAudit(line: BufferDrainAuditLine): Promise<void> {
+  const path = currentAuditFile();
   try {
-    await mkdir(AUDIT_DIR, { recursive: true });
+    await mkdir(dirname(path), { recursive: true });
     const raw = JSON.stringify(line) + "\n";
-    await appendFile(fileForDate(), raw, { encoding: "utf8" });
+    await appendFile(path, raw, { encoding: "utf8" });
   } catch (err) {
     process.stderr.write(
       `[hitl-channel] buffer-drain audit append failed: ${err instanceof Error ? err.message : err}\n`
@@ -198,14 +205,16 @@ export async function appendBufferDrainAudit(line: BufferDrainAuditLine): Promis
  * files deleted (useful for tests).
  */
 export async function pruneOldAuditFiles(now = new Date()): Promise<number> {
+  const dir = getAuditDir();
+  assertTestStatePath(dir);
   try {
-    await mkdir(AUDIT_DIR, { recursive: true });
-    const entries = await readdir(AUDIT_DIR);
+    await mkdir(dir, { recursive: true });
+    const entries = await readdir(dir);
     const cutoffMs = now.getTime() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
     let deleted = 0;
     for (const name of entries) {
       if (!name.endsWith(".jsonl")) continue;
-      const filePath = join(AUDIT_DIR, name);
+      const filePath = join(dir, name);
       try {
         const st = await stat(filePath);
         if (st.mtimeMs < cutoffMs) {
@@ -227,6 +236,3 @@ export async function pruneOldAuditFiles(now = new Date()): Promise<number> {
     return 0;
   }
 }
-
-/** Test helper: expose the resolved audit dir. */
-export const auditDir = AUDIT_DIR;

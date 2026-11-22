@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { spawn } from "node:child_process";
-import { homedir } from "node:os";
+import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import {
@@ -11,6 +11,7 @@ import {
   type McpTransportMode,
 } from "./acp_session_manager.js";
 import { pruneOldAuditFiles } from "./audit.js";
+import { getChannelHome } from "./channel_home.js";
 import { startHttpBridge } from "./http_bridge.js";
 import { getHostname, getIdentity } from "./identity.js";
 import { registerHitlTools } from "./mcp_tools.js";
@@ -318,11 +319,10 @@ export async function startDaemon(
     options.mcpTransport ??
     (rawEnvTransport ? parseMcpTransportMode(rawEnvTransport) : "auto");
 
-  const home = process.env.HOME?.trim() || homedir();
   const identityFile =
     options.identityFile ??
     process.env.HITL_CHANNEL_IDENTITY_FILE ??
-    `${home}/.hitl/channels/identity-daemon-${harness}.json`;
+    join(getChannelHome(), `identity-daemon-${harness}.json`);
   process.env.HITL_CHANNEL_IDENTITY_FILE = identityFile;
 
   const host = await getHostname();

@@ -11,12 +11,11 @@ import {
   beforeAll,
   afterAll,
   beforeEach,
-  afterEach,
 } from "bun:test";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir, tmpdir } from "node:os";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { getAuditDir } from "../audit.js";
 import {
   processAttachments,
   sanitizeAttachmentFileName,
@@ -59,20 +58,10 @@ describe("sanitizeAttachmentFileName", () => {
 });
 
 describe("processAttachments (unit — AV1–AV4)", () => {
-  let homeDir: string;
   let inboxDir: string;
-  let prevHome: string | undefined;
 
-  beforeEach(async () => {
-    homeDir = await mkdtemp(join(tmpdir(), "hitl-att-"));
-    prevHome = process.env.HOME;
-    process.env.HOME = homeDir;
-    inboxDir = join(homeDir, ".claude", "channels", "hitl-channel", "inbox");
-  });
-
-  afterEach(async () => {
-    process.env.HOME = prevHome;
-    await rm(homeDir, { recursive: true, force: true });
+  beforeEach(() => {
+    inboxDir = join(process.env.HOME!, ".claude", "channels", "hitl-channel", "inbox");
   });
 
   it("AV1: type:file (application/json) writes decoded bytes and [File: path] marker", async () => {
@@ -233,19 +222,14 @@ describe("POST / + WS chat attachments (integration AV1 + AV5)", () => {
   const TEST_API_KEY = "test-key-attachments-36";
   let server: ReturnType<typeof startHttpBridge>;
   let lastNotification: { params?: { content?: string } } | null = null;
-  let homeDir: string;
-  let prevHome: string | undefined;
   let prevPort: string | undefined;
   let prevKey: string | undefined;
   let prevInstance: string | undefined;
 
-  beforeAll(async () => {
-    homeDir = await mkdtemp(join(tmpdir(), "hitl-att-http-"));
-    prevHome = process.env.HOME;
+  beforeAll(() => {
     prevPort = process.env.HITL_CHANNEL_PORT;
     prevKey = process.env.HITL_CHANNEL_API_KEY;
     prevInstance = process.env.HITL_INSTANCE_ID;
-    process.env.HOME = homeDir;
     process.env.HITL_CHANNEL_PORT = String(TEST_PORT);
     process.env.HITL_CHANNEL_API_KEY = TEST_API_KEY;
     process.env.HITL_INSTANCE_ID = "instance-att-36";
@@ -258,13 +242,11 @@ describe("POST / + WS chat attachments (integration AV1 + AV5)", () => {
     server = startHttpBridge(mcpMock);
   });
 
-  afterAll(async () => {
+  afterAll(() => {
     server.stop(true);
-    process.env.HOME = prevHome;
     process.env.HITL_CHANNEL_PORT = prevPort;
     process.env.HITL_CHANNEL_API_KEY = prevKey;
     process.env.HITL_INSTANCE_ID = prevInstance;
-    await rm(homeDir, { recursive: true, force: true });
   });
 
   it("AV1 via POST /: file attachment lands in inbox and notification content has [File:]", async () => {
@@ -295,7 +277,7 @@ describe("POST / + WS chat attachments (integration AV1 + AV5)", () => {
     expect(content).toContain("[File:");
     expect(content).toContain("from_post.json");
     const inboxPath = join(
-      homeDir,
+      process.env.HOME!,
       ".claude",
       "channels",
       "hitl-channel",
@@ -306,13 +288,8 @@ describe("POST / + WS chat attachments (integration AV1 + AV5)", () => {
   });
 
   it("AV5: WS chat-branch audit row carries real attachment_count/bytes", async () => {
-    // audit.ts captures AUDIT_DIR via os.homedir() at module load — not
-    // process.env.HOME from this suite. Match our row by instance_id.
     const auditFile = join(
-      homedir(),
-      ".hitl",
-      "channels",
-      "audit",
+      getAuditDir(),
       `${new Date().toISOString().slice(0, 10)}.jsonl`,
     );
     const instanceId = "instance-att-36";
