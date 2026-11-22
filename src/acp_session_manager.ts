@@ -38,6 +38,12 @@ import type {
   SessionListEntry,
   SessionListFrame,
   SessionSwitchedFrame,
+  StreamDeltaFrame,
+  ToolProgressFrame,
+  ToolStepStatus,
+  ToolStepSummary,
+  TurnStateFrame,
+  TurnStateValue,
 } from "./types.js";
 
 export type McpTransportMode = "auto" | "http" | "stdio";
@@ -299,6 +305,13 @@ const MAX_RECENT_TURNS_BYTES = 8 * 1024;
 const MAX_SESSION_LIST_SIZE = 50;
 const MAX_RECENT_CWDS = 8;
 const DEFAULT_SESSION_LOAD_TIMEOUT_MS = 10_000;
+const DEFAULT_STREAM_COALESCE_MS = 75;
+const MAX_STREAM_DELTA_FRAME_BYTES = 16 * 1024;
+const MAX_TURN_DELTA_BYTES = 256 * 1024;
+const MAX_RECONNECT_SNAPSHOT_BYTES = 128 * 1024;
+const MAX_TOOL_STEPS = 32;
+const MAX_EPHEMERAL_TOOL_SUMMARY_CHARS = 512;
+const MAX_DURABLE_TOOL_SUMMARY_CHARS = 256;
 
 interface ReplayCaptureBuffer {
   turns: RecentTurnSummary[];
@@ -317,9 +330,10 @@ function truncateChars(text: string, maxChars: number): string {
 }
 
 function truncateUtf8Bytes(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
   let low = 0;
-  let high = text.length;
+  let high = Math.min(text.length, maxBytes);
   while (low < high) {
     const mid = Math.ceil((low + high) / 2);
     const candidate = truncateChars(text, mid);
@@ -330,6 +344,116 @@ function truncateUtf8Bytes(text: string, maxBytes: number): string {
     }
   }
   return truncateChars(text, low);
+}
+
+function splitUtf8ByBytes(text: string, maxBytes: number): string[] {
+  if (text.length === 0 || maxBytes <= 0) return [];
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return [text];
+  const parts: string[] = [];
+  let offset = 0;
+  while (offset < text.length) {
+    const window = text.slice(offset, offset + maxBytes + 1);
+    const piece = truncateUtf8Bytes(window, maxBytes);
+    if (piece.length === 0) {
+      break;
+    }
+    parts.push(piece);
+    offset += piece.length;
+  }
+  return parts;
+}
+
+function mapToolStepStatus(
+  rawStatus: unknown,
+  sessionUpdate: string,
+  existingStatus?: ToolStepStatus,
+): ToolStepStatus {
+  if (typeof rawStatus === "string") {
+    const normalized = rawStatus.trim().toLowerCase();
+    if (normalized === "pending" || normalized === "queued") {
+      return "pending";
+    }
+    if (
+      normalized === "in_progress" ||
+      normalized === "in-progress" ||
+      normalized === "running" ||
+      normalized === "executing" ||
+      normalized === "started"
+    ) {
+      return "in_progress";
+    }
+    if (
+      normalized === "completed" ||
+      normalized === "complete" ||
+      normalized === "done" ||
+      normalized === "success" ||
+      normalized === "succeeded" ||
+      normalized === "finished"
+    ) {
+      return "completed";
+    }
+    if (
+      normalized === "failed" ||
+      normalized === "error" ||
+      normalized === "errored" ||
+      normalized === "cancelled" ||
+      normalized === "canceled" ||
+      normalized === "denied" ||
+      normalized === "rejected"
+    ) {
+      return "failed";
+    }
+  }
+  if (existingStatus) {
+    return existingStatus;
+  }
+  return sessionUpdate === "tool_call" ? "pending" : "in_progress";
+}
+
+function extractToolUpdateSummary(
+  update: AcpSessionUpdateParams["update"],
+): string | undefined {
+  const candidates: unknown[] = [];
+  if (update.summary !== undefined) candidates.push(update.summary);
+  if (update.rawOutput !== undefined) candidates.push(update.rawOutput);
+  if (update.error !== undefined) candidates.push(update.error);
+  if (update.content !== undefined) {
+    if (Array.isArray(update.content)) {
+      const parts: string[] = [];
+      for (const item of update.content) {
+        if (typeof item === "string") {
+          parts.push(item);
+        } else if (item && typeof item === "object") {
+          const obj = item as Record<string, unknown>;
+          if (typeof obj.text === "string") {
+            parts.push(obj.text);
+          } else if (
+            obj.content &&
+            typeof obj.content === "object" &&
+            typeof (obj.content as Record<string, unknown>).text === "string"
+          ) {
+            parts.push(String((obj.content as Record<string, unknown>).text));
+          }
+        }
+      }
+      if (parts.length > 0) candidates.push(parts.join(" "));
+    } else if (
+      typeof update.content === "object" &&
+      update.content !== null &&
+      typeof update.content.text === "string"
+    ) {
+      candidates.push(update.content.text);
+    } else {
+      candidates.push(update.content);
+    }
+  }
+  if (update.rawInput !== undefined) candidates.push(update.rawInput);
+
+  for (const candidate of candidates) {
+    const text = oneLineSummary(candidate);
+    if (text.length > 0) return text;
+  }
+  return undefined;
 }
 
 function appendCapturedTurnChunk(
@@ -391,12 +515,19 @@ interface QueuedTurn {
 }
 
 interface RunningTurn {
+  turnId: string;
   sessionId: string;
   chunks: string[];
   delegationMessageId: string | null;
   clientMessageId: string | null;
   replyToolCalled: boolean;
   cancelledByCommand: boolean;
+  deltaSeq: number;
+  pendingDeltaText: string;
+  deltaTimer: ReturnType<typeof setTimeout> | null;
+  emittedDeltaBytes: number;
+  deltaTruncated: boolean;
+  toolSteps: Map<string, ToolStepSummary>;
 }
 
 export type BroadcastReplyFn = (
@@ -430,6 +561,7 @@ export interface AcpSessionManagerOptions {
   outOfTurnQuietMs?: number;
   crashWindowMs?: number;
   sessionLoadTimeoutMs?: number;
+  streamCoalesceMs?: number;
   nowMs?: () => number;
 }
 
@@ -456,6 +588,7 @@ export class AcpSessionManager {
   private readonly outOfTurnQuietMs: number;
   private readonly crashWindowMs: number;
   private readonly sessionLoadTimeoutMs: number;
+  private readonly streamCoalesceMs: number;
   private readonly nowMs: () => number;
 
   private client: AcpClient | null = null;
@@ -476,6 +609,7 @@ export class AcpSessionManager {
   private readonly openUserChoiceIds = new Set<string>();
   private legacyChoiceSeq = 0;
   private permSeq = 0;
+  private turnSeq = 0;
 
   private outOfTurnChunks: string[] = [];
   private outOfTurnSessionId: string | null = null;
@@ -523,6 +657,10 @@ export class AcpSessionManager {
     this.crashWindowMs = opts.crashWindowMs ?? 60_000;
     this.sessionLoadTimeoutMs =
       opts.sessionLoadTimeoutMs ?? DEFAULT_SESSION_LOAD_TIMEOUT_MS;
+    this.streamCoalesceMs =
+      opts.streamCoalesceMs !== undefined && Number.isFinite(opts.streamCoalesceMs)
+        ? Math.max(0, opts.streamCoalesceMs)
+        : DEFAULT_STREAM_COALESCE_MS;
     this.nowMs = opts.nowMs ?? (() => Date.now());
   }
 
@@ -538,6 +676,10 @@ export class AcpSessionManager {
 
   getAttributionSessionId(): string | null {
     return this.runningTurn?.sessionId ?? this.activeSessionId;
+  }
+
+  getActiveTurnId(): string | null {
+    return this.runningTurn?.turnId ?? null;
   }
 
   effectiveMcpTransport(): "http" | "stdio" {
@@ -755,15 +897,251 @@ export class AcpSessionManager {
     text: string,
     acpSessionId: string | null,
     messageId?: string,
-  ): void {
-    this.broadcastReplyFn(
+    opts?: Omit<BroadcastReplyOptions, "acpSessionId">,
+  ): string | null {
+    const mergedOpts: BroadcastReplyOptions = {
+      ...(acpSessionId ? { acpSessionId } : {}),
+      ...(opts ?? {}),
+    };
+    const rawId = this.broadcastReplyFn(
       text,
       messageId,
       undefined,
       undefined,
-      acpSessionId ? { acpSessionId } : undefined,
+      Object.keys(mergedOpts).length > 0 ? mergedOpts : undefined,
     );
     this.emitReplyAudit(text, acpSessionId);
+    if (typeof rawId === "string" && rawId.length > 0) return rawId;
+    if (typeof rawId === "number") return String(rawId);
+    return null;
+  }
+
+  private computeTurnStateValue(): TurnStateValue {
+    if (this.pendingPermissions.some((p) => !p.resolved)) {
+      return "waiting_approval";
+    }
+    if (this.runningTurn !== null) {
+      return "running";
+    }
+    return "idle";
+  }
+
+  private buildTurnStateFrame(opts?: {
+    sessionId?: string | null;
+    turnId?: string;
+    state?: TurnStateValue;
+    finalReplyId?: string | null;
+  }): TurnStateFrame {
+    const state = opts?.state ?? this.computeTurnStateValue();
+    const sessionId =
+      opts?.sessionId !== undefined
+        ? opts.sessionId
+        : (this.runningTurn?.sessionId ?? this.activeSessionId ?? null);
+    const turnId = opts?.turnId ?? this.runningTurn?.turnId;
+    return {
+      type: "turn_state",
+      sessionId,
+      ...(turnId ? { turnId } : {}),
+      state,
+      queueDepth: this.queue.length,
+      ...(opts?.finalReplyId !== undefined
+        ? { finalReplyId: opts.finalReplyId }
+        : {}),
+    };
+  }
+
+  private emitTurnState(opts?: {
+    sessionId?: string | null;
+    turnId?: string;
+    state?: TurnStateValue;
+    finalReplyId?: string | null;
+  }): void {
+    const frame = this.buildTurnStateFrame(opts);
+    this.broadcastToCapableFn(
+      "streaming",
+      frame as unknown as Record<string, unknown>,
+    );
+  }
+
+  private clearTurnDeltaTimer(turn: RunningTurn): void {
+    if (turn.deltaTimer) {
+      clearTimeout(turn.deltaTimer);
+      turn.deltaTimer = null;
+    }
+  }
+
+  private emitStreamDeltaFrame(
+    turn: RunningTurn,
+    delta: string,
+    opts?: { truncated?: boolean },
+  ): void {
+    const frame: StreamDeltaFrame = {
+      type: "stream_delta",
+      sessionId: turn.sessionId,
+      turnId: turn.turnId,
+      seq: ++turn.deltaSeq,
+      delta,
+      ...(opts?.truncated ? { truncated: true } : {}),
+    };
+    this.broadcastToCapableFn(
+      "streaming",
+      frame as unknown as Record<string, unknown>,
+    );
+  }
+
+  private flushPendingTurnDelta(turn: RunningTurn): void {
+    this.clearTurnDeltaTimer(turn);
+    const pending = turn.pendingDeltaText;
+    turn.pendingDeltaText = "";
+    if (pending.length === 0 || turn.deltaTruncated) return;
+
+    const remainingBytes = Math.max(
+      0,
+      MAX_TURN_DELTA_BYTES - turn.emittedDeltaBytes,
+    );
+    const pendingBytes = Buffer.byteLength(pending, "utf8");
+
+    if (pendingBytes <= remainingBytes) {
+      const slices = splitUtf8ByBytes(pending, MAX_STREAM_DELTA_FRAME_BYTES);
+      for (const slice of slices) {
+        turn.emittedDeltaBytes += Buffer.byteLength(slice, "utf8");
+        this.emitStreamDeltaFrame(turn, slice);
+      }
+      return;
+    }
+
+    const allowed = truncateUtf8Bytes(pending, remainingBytes);
+    const slices = splitUtf8ByBytes(allowed, MAX_STREAM_DELTA_FRAME_BYTES);
+    turn.deltaTruncated = true;
+    if (slices.length === 0) {
+      this.emitStreamDeltaFrame(turn, "", { truncated: true });
+      return;
+    }
+    for (let i = 0; i < slices.length; i++) {
+      const slice = slices[i]!;
+      const isLast = i === slices.length - 1;
+      turn.emittedDeltaBytes += Buffer.byteLength(slice, "utf8");
+      this.emitStreamDeltaFrame(
+        turn,
+        slice,
+        isLast ? { truncated: true } : undefined,
+      );
+    }
+  }
+
+  private queueStreamDelta(turn: RunningTurn, chunkText: string): void {
+    if (chunkText.length === 0 || turn.deltaTruncated) return;
+    turn.pendingDeltaText += chunkText;
+    const totalBytes =
+      turn.emittedDeltaBytes + Buffer.byteLength(turn.pendingDeltaText, "utf8");
+    if (this.streamCoalesceMs <= 0 || totalBytes > MAX_TURN_DELTA_BYTES) {
+      this.flushPendingTurnDelta(turn);
+      return;
+    }
+    if (!turn.deltaTimer) {
+      turn.deltaTimer = setTimeout(() => {
+        turn.deltaTimer = null;
+        if (this.runningTurn === turn) {
+          this.flushPendingTurnDelta(turn);
+        }
+      }, this.streamCoalesceMs);
+    }
+  }
+
+  private handleRunningTurnToolUpdate(
+    turn: RunningTurn,
+    update: AcpSessionUpdateParams["update"],
+  ): void {
+    const toolCallId =
+      typeof update.toolCallId === "string" ? update.toolCallId.trim() : "";
+    if (!toolCallId) return;
+
+    const existing = turn.toolSteps.get(toolCallId);
+    const seen = this.seenToolCalls.get(`${turn.sessionId}:${toolCallId}`);
+
+    const rawName =
+      typeof update.name === "string" && update.name.trim().length > 0
+        ? update.name.trim()
+        : existing?.name;
+    const name = rawName || deriveToolName(update, seen);
+
+    const rawTitle =
+      typeof update.title === "string" && update.title.trim().length > 0
+        ? update.title.trim()
+        : existing?.title;
+    const title = rawTitle || name;
+
+    const kind =
+      typeof update.kind === "string" && update.kind.trim().length > 0
+        ? update.kind.trim()
+        : existing?.kind;
+
+    const status = mapToolStepStatus(
+      update.status,
+      update.sessionUpdate,
+      existing?.status,
+    );
+
+    const extractedSummary = extractToolUpdateSummary(update);
+    const rawSummary = extractedSummary ?? existing?.summary;
+    const ephemeralSummary = rawSummary
+      ? truncateChars(rawSummary, MAX_EPHEMERAL_TOOL_SUMMARY_CHARS)
+      : undefined;
+    const durableSummary = rawSummary
+      ? truncateChars(rawSummary, MAX_DURABLE_TOOL_SUMMARY_CHARS)
+      : undefined;
+
+    const durableStep: ToolStepSummary = {
+      toolCallId,
+      name,
+      title,
+      ...(kind ? { kind } : {}),
+      status,
+      ...(durableSummary ? { summary: durableSummary } : {}),
+    };
+
+    if (!turn.toolSteps.has(toolCallId) && turn.toolSteps.size >= MAX_TOOL_STEPS) {
+      const oldestKey = turn.toolSteps.keys().next().value;
+      if (oldestKey !== undefined) {
+        turn.toolSteps.delete(oldestKey);
+      }
+    }
+    turn.toolSteps.set(toolCallId, durableStep);
+
+    const frame: ToolProgressFrame = {
+      type: "tool_progress",
+      sessionId: turn.sessionId,
+      turnId: turn.turnId,
+      toolCallId,
+      name,
+      title,
+      ...(kind ? { kind } : {}),
+      status,
+      ...(ephemeralSummary ? { summary: ephemeralSummary } : {}),
+    };
+    this.broadcastToCapableFn(
+      "streaming",
+      frame as unknown as Record<string, unknown>,
+    );
+  }
+
+  private finalizeToolSteps(
+    turn: RunningTurn,
+    cancelled: boolean,
+  ): ToolStepSummary[] {
+    const out: ToolStepSummary[] = [];
+    for (const step of turn.toolSteps.values()) {
+      if (step.status === "pending" || step.status === "in_progress") {
+        out.push({
+          ...step,
+          status: "failed",
+          summary: cancelled ? "Cancelled" : "Interrupted",
+        });
+      } else {
+        out.push({ ...step });
+      }
+    }
+    return out;
   }
 
   private emitChoicesSettled(params: {
@@ -954,6 +1332,68 @@ export class AcpSessionManager {
         "sessions",
       );
     }
+    if (ws.data?.features?.has("streaming")) {
+      const turn = this.runningTurn;
+      if (turn) {
+        // Flush buffered deltas to already-connected clients before reading
+        // deltaSeq, without sending a duplicate non-reset delta to this ws.
+        const features = ws.data.features;
+        features.delete("streaming");
+        try {
+          this.flushPendingTurnDelta(turn);
+        } finally {
+          features.add("streaming");
+        }
+      }
+
+      this.sendControlToClientFn(
+        ws,
+        this.buildTurnStateFrame() as unknown as Record<string, unknown>,
+        "streaming",
+      );
+
+      if (turn) {
+        const accumulated = turn.chunks.join("");
+        const totalBytes = Buffer.byteLength(accumulated, "utf8");
+        const truncated = totalBytes > MAX_RECONNECT_SNAPSHOT_BYTES;
+        const snapshot = truncated
+          ? truncateUtf8Bytes(accumulated, MAX_RECONNECT_SNAPSHOT_BYTES)
+          : accumulated;
+        const snapshotFrame: StreamDeltaFrame = {
+          type: "stream_delta",
+          sessionId: turn.sessionId,
+          turnId: turn.turnId,
+          seq: turn.deltaSeq,
+          delta: snapshot,
+          reset: true,
+          ...(truncated ? { truncated: true } : {}),
+        };
+        this.sendControlToClientFn(
+          ws,
+          snapshotFrame as unknown as Record<string, unknown>,
+          "streaming",
+        );
+
+        for (const step of turn.toolSteps.values()) {
+          const progressFrame: ToolProgressFrame = {
+            type: "tool_progress",
+            sessionId: turn.sessionId,
+            turnId: turn.turnId,
+            toolCallId: step.toolCallId,
+            name: step.name,
+            title: step.title,
+            ...(step.kind ? { kind: step.kind } : {}),
+            status: step.status,
+            ...(step.summary ? { summary: step.summary } : {}),
+          };
+          this.sendControlToClientFn(
+            ws,
+            progressFrame as unknown as Record<string, unknown>,
+            "streaming",
+          );
+        }
+      }
+    }
   }
 
   private async handleControlFrame(
@@ -1012,6 +1452,18 @@ export class AcpSessionManager {
 
     if (frameType === "session_resume") {
       await this.handleWsSessionResume(ws, frame, requestId);
+      return;
+    }
+
+    if (frameType === "cancel_turn") {
+      const requestedSessionId =
+        typeof frame.sessionId === "string" && frame.sessionId.trim().length > 0
+          ? frame.sessionId.trim()
+          : undefined;
+      this.cancelActiveTurn({
+        notifyWhenIdle: false,
+        sessionIdFilter: requestedSessionId,
+      });
       return;
     }
   }
@@ -1468,6 +1920,12 @@ export class AcpSessionManager {
       update.toolCallId.length > 0
     ) {
       this.recordSeenToolCall(params.sessionId, update.toolCallId, update);
+      if (
+        this.runningTurn &&
+        this.runningTurn.sessionId === params.sessionId
+      ) {
+        this.handleRunningTurnToolUpdate(this.runningTurn, update);
+      }
       return;
     }
 
@@ -1496,6 +1954,7 @@ export class AcpSessionManager {
         this.runningTurn.sessionId === params.sessionId
       ) {
         this.runningTurn.chunks.push(chunkText);
+        this.queueStreamDelta(this.runningTurn, chunkText);
       } else {
         if (
           this.outOfTurnSessionId &&
@@ -1586,11 +2045,17 @@ export class AcpSessionManager {
     const choices = options.map((o) => o.name || o.optionId);
     const frameId = `perm-${Date.now()}-${++this.permSeq}-${Math.random().toString(36).slice(2, 6)}`;
     const acpSessionId = sessionId || this.activeSessionId || null;
+    const activeTurnId =
+      this.runningTurn &&
+      (!sessionId || this.runningTurn.sessionId === sessionId)
+        ? this.runningTurn.turnId
+        : null;
     const frame: Record<string, unknown> = {
       type: "choices",
       category: "permission",
       toolName,
       ...(acpSessionId ? { acpSessionId } : {}),
+      ...(activeTurnId ? { turnId: activeTurnId } : {}),
       options: options.map((o) => ({
         optionId: o.optionId,
         name: o.name,
@@ -1615,6 +2080,11 @@ export class AcpSessionManager {
     };
     this.pendingPermissions.push(pending);
     this.unicastFrameFn(frame);
+    this.emitTurnState({
+      sessionId: acpSessionId,
+      ...(activeTurnId ? { turnId: activeTurnId } : {}),
+      state: "waiting_approval",
+    });
   }
 
   private cancelAllPendingPermissions(respondToClient: boolean): number {
@@ -1667,6 +2137,12 @@ export class AcpSessionManager {
     }
     if (this.shuttingDown) return;
 
+    const abortedTurn = this.runningTurn;
+    if (abortedTurn) {
+      this.flushPendingTurnDelta(abortedTurn);
+      this.clearTurnDeltaTimer(abortedTurn);
+    }
+
     this.cancelAllPendingPermissions(false);
     this.flushOutOfTurnBuffer();
 
@@ -1704,6 +2180,12 @@ export class AcpSessionManager {
         `⚠ Harness ${this.harness.name} crashed repeatedly (${exitDetail}) within 60s; automatic restart stopped.`,
         prevSessionId,
       );
+      this.emitTurnState({
+        sessionId: this.activeSessionId,
+        ...(abortedTurn ? { turnId: abortedTurn.turnId } : {}),
+        state: "idle",
+        finalReplyId: null,
+      });
       return;
     }
 
@@ -1711,6 +2193,12 @@ export class AcpSessionManager {
       `⚠ Harness ${this.harness.name} exited unexpectedly (${exitDetail}). Restarting automatically — use /sessions and /resume to continue.`,
       prevSessionId,
     );
+    this.emitTurnState({
+      sessionId: this.activeSessionId,
+      ...(abortedTurn ? { turnId: abortedTurn.turnId } : {}),
+      state: "idle",
+      finalReplyId: null,
+    });
 
     void this.ensureClient()
       .then(() => {
@@ -1807,6 +2295,21 @@ export class AcpSessionManager {
       reason: "answered",
       selectedLabel: matchedOpt.name || matchedOpt.optionId,
     });
+    if (this.pendingPermissions.length === 0) {
+      if (this.runningTurn && !this.runningTurn.cancelledByCommand) {
+        this.emitTurnState({
+          sessionId: this.runningTurn.sessionId,
+          turnId: this.runningTurn.turnId,
+          state: "running",
+        });
+      } else if (!this.runningTurn && !this.turnBusy && !this.sessionOpInFlight) {
+        this.emitTurnState({
+          sessionId: permSessionId ?? this.activeSessionId,
+          state: "idle",
+          finalReplyId: null,
+        });
+      }
+    }
     if (
       !this.turnBusy &&
       !this.sessionOpInFlight &&
@@ -1910,6 +2413,7 @@ export class AcpSessionManager {
           "⚠ waiting for your approval above (queued)",
           this.activeSessionId,
         );
+        this.emitTurnState();
         return { acpSessionId: this.activeSessionId };
       }
 
@@ -1937,7 +2441,10 @@ export class AcpSessionManager {
       this.sendStandaloneReply(
         `⏳ queued (${this.queue.length} ahead)`,
         this.activeSessionId,
+        undefined,
+        { excludeFeature: "streaming" },
       );
+      this.emitTurnState();
       return { acpSessionId: this.activeSessionId };
     }
 
@@ -1962,6 +2469,45 @@ export class AcpSessionManager {
       return true;
     }
     return false;
+  }
+
+  private cancelActiveTurn(opts: {
+    notifyWhenIdle: boolean;
+    sessionIdFilter?: string;
+  }): { acpSessionId: string | null } {
+    const currentSessionId =
+      this.runningTurn?.sessionId ?? this.activeSessionId;
+    if (
+      opts.sessionIdFilter &&
+      opts.sessionIdFilter !== currentSessionId
+    ) {
+      return { acpSessionId: this.activeSessionId };
+    }
+
+    if (this.runningTurn && this.client && !this.client.isClosed) {
+      this.runningTurn.cancelledByCommand = true;
+      this.cancelAllPendingPermissions(true);
+      this.client.sessionCancel(this.runningTurn.sessionId);
+      return { acpSessionId: this.runningTurn.sessionId };
+    }
+
+    const cancelledPerms = this.cancelAllPendingPermissions(true);
+    if (this.turnBusy) {
+      this.cancelRequestedBeforeTurn = true;
+      return { acpSessionId: this.activeSessionId };
+    }
+
+    if (cancelledPerms > 0) {
+      this.sendStandaloneReply("⏹ cancelled", this.activeSessionId);
+      this.emitTurnState({
+        sessionId: this.activeSessionId,
+        state: "idle",
+        finalReplyId: null,
+      });
+    } else if (opts.notifyWhenIdle) {
+      this.sendStandaloneReply("nothing running", this.activeSessionId);
+    }
+    return { acpSessionId: this.activeSessionId };
   }
 
   private async handleSlashCommand(
@@ -1998,22 +2544,7 @@ export class AcpSessionManager {
     }
 
     if (cmd === "/cancel") {
-      const cancelledPerms = this.cancelAllPendingPermissions(true);
-      if (this.runningTurn && this.client && !this.client.isClosed) {
-        this.runningTurn.cancelledByCommand = true;
-        this.client.sessionCancel(this.runningTurn.sessionId);
-        return { acpSessionId: this.runningTurn.sessionId };
-      }
-      if (this.turnBusy) {
-        this.cancelRequestedBeforeTurn = true;
-        return { acpSessionId: this.activeSessionId };
-      }
-      if (cancelledPerms > 0) {
-        this.sendStandaloneReply("⏹ cancelled", this.activeSessionId);
-      } else {
-        this.sendStandaloneReply("nothing running", this.activeSessionId);
-      }
-      return { acpSessionId: this.activeSessionId };
+      return this.cancelActiveTurn({ notifyWhenIdle: true });
     }
 
     if (cmd === "/new") {
@@ -2285,6 +2816,13 @@ export class AcpSessionManager {
         if (this.shuttingDown || client.isClosed || this.activeSessionId !== sessionId) {
           this.turnBusy = false;
           this.cancelRequestedBeforeTurn = false;
+          if (!this.shuttingDown && !client.isClosed) {
+            this.emitTurnState({
+              sessionId: this.activeSessionId,
+              state: "idle",
+              finalReplyId: null,
+            });
+          }
           return { acpSessionId: this.activeSessionId };
         }
       }
@@ -2297,6 +2835,11 @@ export class AcpSessionManager {
         }`,
         this.activeSessionId,
       );
+      this.emitTurnState({
+        sessionId: this.activeSessionId,
+        state: "idle",
+        finalReplyId: null,
+      });
       void this.drainQueue();
       return { acpSessionId: this.activeSessionId };
     }
@@ -2311,12 +2854,19 @@ export class AcpSessionManager {
         : null;
 
     const turn: RunningTurn = {
+      turnId: `turn-${this.nowMs()}-${++this.turnSeq}`,
       sessionId,
       chunks: [],
       delegationMessageId,
       clientMessageId,
       replyToolCalled: false,
       cancelledByCommand: this.cancelRequestedBeforeTurn,
+      deltaSeq: 0,
+      pendingDeltaText: "",
+      deltaTimer: null,
+      emittedDeltaBytes: 0,
+      deltaTruncated: false,
+      toolSteps: new Map(),
     };
     this.cancelRequestedBeforeTurn = false;
     this.runningTurn = turn;
@@ -2325,11 +2875,27 @@ export class AcpSessionManager {
       this.runningTurn = null;
       this.turnBusy = false;
       const targetMsgId = turn.delegationMessageId ?? turn.clientMessageId ?? undefined;
-      this.sendStandaloneReply("⏹ cancelled", sessionId, targetMsgId);
+      const finalReplyId = this.sendStandaloneReply(
+        "⏹ cancelled",
+        sessionId,
+        targetMsgId,
+        { turnId: turn.turnId, isTurnFinal: true },
+      );
+      this.emitTurnState({
+        sessionId,
+        turnId: turn.turnId,
+        state: "idle",
+        finalReplyId,
+      });
       void this.drainQueue();
       return { acpSessionId: sessionId };
     }
 
+    this.emitTurnState({
+      sessionId: turn.sessionId,
+      turnId: turn.turnId,
+      state: "running",
+    });
     void this.executeTurn(client, turn, item.input);
     return { acpSessionId: sessionId };
   }
@@ -2339,12 +2905,29 @@ export class AcpSessionManager {
     turn: RunningTurn,
     input: InboundMessage,
   ): Promise<void> {
+    let finalReplyId: string | null = null;
     try {
       let promptBlocks = await this.buildPromptBlocks(input);
+      if (client.isClosed || this.shuttingDown || this.runningTurn !== turn) {
+        return;
+      }
       if (turn.cancelledByCommand) {
+        this.flushPendingTurnDelta(turn);
+        const finalizedToolSteps = this.finalizeToolSteps(turn, true);
         const targetMsgId =
           turn.delegationMessageId ?? turn.clientMessageId ?? undefined;
-        this.sendStandaloneReply("⏹ cancelled", turn.sessionId, targetMsgId);
+        finalReplyId = this.sendStandaloneReply(
+          "⏹ cancelled",
+          turn.sessionId,
+          targetMsgId,
+          {
+            turnId: turn.turnId,
+            isTurnFinal: true,
+            ...(finalizedToolSteps.length > 0
+              ? { toolSteps: finalizedToolSteps }
+              : {}),
+          },
+        );
         return;
       }
 
@@ -2364,35 +2947,91 @@ export class AcpSessionManager {
       });
       this.instructionsDeliveredSessions.add(turn.sessionId);
 
+      // Flush any coalesced deltas BEFORE emitting terminal reply or turn_state(idle).
+      this.flushPendingTurnDelta(turn);
+
       const targetMsgId =
         turn.delegationMessageId ?? turn.clientMessageId ?? undefined;
       const collected = turn.chunks.join("");
+      const isCancelled =
+        turn.cancelledByCommand || result.stopReason === "cancelled";
+      const finalizedToolSteps = this.finalizeToolSteps(turn, isCancelled);
+      const finalReplyOpts = {
+        turnId: turn.turnId,
+        isTurnFinal: true as const,
+        ...(finalizedToolSteps.length > 0
+          ? { toolSteps: finalizedToolSteps }
+          : {}),
+      };
 
       if (turn.cancelledByCommand) {
-        this.sendStandaloneReply("⏹ cancelled", turn.sessionId, targetMsgId);
+        this.cancelAllPendingPermissions(true);
+        finalReplyId = this.sendStandaloneReply(
+          "⏹ cancelled",
+          turn.sessionId,
+          targetMsgId,
+          finalReplyOpts,
+        );
       } else if (collected.length > 0) {
-        this.sendStandaloneReply(collected, turn.sessionId, targetMsgId);
+        finalReplyId = this.sendStandaloneReply(
+          collected,
+          turn.sessionId,
+          targetMsgId,
+          finalReplyOpts,
+        );
       } else if (
         turn.delegationMessageId !== null ||
         result.stopReason !== "end_turn" ||
         !turn.replyToolCalled
       ) {
         const fallbackText = `(no text output — stopReason: ${result.stopReason})`;
-        this.sendStandaloneReply(fallbackText, turn.sessionId, targetMsgId);
+        finalReplyId = this.sendStandaloneReply(
+          fallbackText,
+          turn.sessionId,
+          targetMsgId,
+          finalReplyOpts,
+        );
       }
       // Else: non-delegation end_turn where agent already called reply_to_hitl; emit no extra reply.
     } catch (err) {
+      this.flushPendingTurnDelta(turn);
       // If client closed due to crash/shutdown, handleHarnessExit / shutdown already notified cleanly.
       if (!client.isClosed && !this.shuttingDown) {
         const targetMsgId =
           turn.delegationMessageId ?? turn.clientMessageId ?? undefined;
         const msg = err instanceof Error ? err.message : String(err);
-        this.sendStandaloneReply(`⚠ Turn error: ${msg}`, turn.sessionId, targetMsgId);
+        const finalizedToolSteps = this.finalizeToolSteps(
+          turn,
+          turn.cancelledByCommand,
+        );
+        finalReplyId = this.sendStandaloneReply(
+          `⚠ Turn error: ${msg}`,
+          turn.sessionId,
+          targetMsgId,
+          {
+            turnId: turn.turnId,
+            isTurnFinal: true,
+            ...(finalizedToolSteps.length > 0
+              ? { toolSteps: finalizedToolSteps }
+              : {}),
+          },
+        );
       }
     } finally {
+      this.clearTurnDeltaTimer(turn);
       if (this.runningTurn === turn) {
         this.runningTurn = null;
         this.turnBusy = false;
+      }
+      if (!client.isClosed && !this.shuttingDown) {
+        this.emitTurnState({
+          sessionId: turn.sessionId,
+          turnId: turn.turnId,
+          state: this.pendingPermissions.some((p) => !p.resolved)
+            ? "waiting_approval"
+            : "idle",
+          finalReplyId,
+        });
       }
       if (!this.shuttingDown && this.client && !this.client.isClosed) {
         void this.drainQueue();
@@ -2467,6 +3106,18 @@ export class AcpSessionManager {
       this.outOfTurnTimer = null;
     }
 
+    const abortedTurn = this.runningTurn;
+    const hadActiveWork =
+      abortedTurn !== null ||
+      this.pendingPermissions.length > 0 ||
+      this.queue.length > 0;
+    if (abortedTurn) {
+      this.flushPendingTurnDelta(abortedTurn);
+      this.clearTurnDeltaTimer(abortedTurn);
+    }
+    this.runningTurn = null;
+    this.turnBusy = false;
+
     this.cancelAllPendingPermissions(true);
     this.queue.length = 0;
     this.openUserChoiceIds.clear();
@@ -2475,6 +3126,15 @@ export class AcpSessionManager {
     this.loadingSessionIds.clear();
     this.seenToolCalls.clear();
     this.instructionsDeliveredSessions.clear();
+
+    if (hadActiveWork) {
+      this.emitTurnState({
+        sessionId: abortedTurn?.sessionId ?? this.activeSessionId,
+        ...(abortedTurn ? { turnId: abortedTurn.turnId } : {}),
+        state: "idle",
+        finalReplyId: null,
+      });
+    }
 
     const toClose = this.client ?? this.pendingClient;
     if (toClose) {

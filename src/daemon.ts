@@ -130,6 +130,7 @@ function constantTimeBearerMatch(
 export interface LoopbackMcpServerOptions {
   token?: string;
   getFallbackAcpSessionId?: () => string | null;
+  getFallbackTurnId?: () => string | null;
   onChoicesPresented?: (choiceId: string) => void;
   onReplySent?: (acpSessionId?: string | null) => void;
 }
@@ -221,6 +222,7 @@ export function startLoopbackMcpServer(
         mode: "daemon",
         requestAcpSessionId,
         getFallbackAcpSessionId: opts.getFallbackAcpSessionId,
+        getFallbackTurnId: opts.getFallbackTurnId,
         onChoicesPresented: opts.onChoicesPresented,
         onReplySent: opts.onReplySent,
       });
@@ -287,6 +289,7 @@ export interface StartDaemonOptions {
   onPairingCode?: (code: string) => void | Promise<void>;
   outOfTurnQuietMs?: number;
   sessionLoadTimeoutMs?: number;
+  streamCoalesceMs?: number;
 }
 
 export interface DaemonHandle {
@@ -341,6 +344,7 @@ export async function startDaemon(
 
   const mcpHandle = startLoopbackMcpServer({
     getFallbackAcpSessionId: () => manager.getAttributionSessionId(),
+    getFallbackTurnId: () => manager.getActiveTurnId(),
     onChoicesPresented: (choiceId) => manager.onChoicesPresented(choiceId),
     onReplySent: (sid) => manager.onReplySent(sid),
   });
@@ -355,6 +359,7 @@ export async function startDaemon(
     transportFactory: options.transportFactory,
     outOfTurnQuietMs: options.outOfTurnQuietMs,
     sessionLoadTimeoutMs: options.sessionLoadTimeoutMs,
+    streamCoalesceMs: options.streamCoalesceMs,
     onPairingCode: async (code) => {
       process.stdout.write(`PAIRING CODE: ${code}\n`);
       if (options.enableDesktopNotifications !== false) {
@@ -370,7 +375,7 @@ export async function startDaemon(
     harness,
     capabilities: {
       sessions: true,
-      streaming: false,
+      streaming: true,
       choicesId: true,
     },
   });

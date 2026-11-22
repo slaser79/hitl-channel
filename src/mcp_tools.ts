@@ -38,9 +38,12 @@ export interface RegisterHitlToolsOptions {
   mode: HitlToolsMode;
   requestAcpSessionId?: string | null;
   getFallbackAcpSessionId?: () => string | null;
+  getFallbackTurnId?: () => string | null;
   onChoicesPresented?: (choiceId: string) => void;
   onReplySent?: (acpSessionId?: string | null) => void;
 }
+
+export type HitlToolsOptions = RegisterHitlToolsOptions;
 
 function resolveDaemonAcpSessionId(
   rawConvId: unknown,
@@ -463,6 +466,10 @@ export function registerHitlTools(
       options.mode === "daemon"
         ? resolveDaemonAcpSessionId(rawConvId, options)
         : undefined;
+    const rawTurnId =
+      options.mode === "daemon" ? options.getFallbackTurnId?.() : undefined;
+    const turnId: string | null =
+      typeof rawTurnId === "string" && rawTurnId.length > 0 ? rawTurnId : null;
     const acpAuditField =
       acpSessionId !== undefined ? { acp_session_id: acpSessionId } : {};
 
@@ -488,6 +495,7 @@ export function registerHitlTools(
 
       broadcastReply(text, messageId, agentId, attachments, {
         acpSessionId: options.mode === "daemon" ? acpSessionId : undefined,
+        ...(options.mode === "daemon" && turnId ? { turnId } : {}),
       });
       options.onReplySent?.(acpSessionId);
       const identity = await getIdentity();
@@ -572,6 +580,7 @@ export function registerHitlTools(
         acpSessionId.length > 0
           ? { acpSessionId }
           : {}),
+        ...(options.mode === "daemon" && turnId ? { turnId } : {}),
       };
 
       const unicastResult = unicastFrame(frame, targetDevice);

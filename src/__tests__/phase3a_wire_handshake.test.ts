@@ -57,7 +57,9 @@ describe("SPEC-HITL-APP-10827 Milestone 3a AV1: /instance, mDNS, client_hello fe
   });
 
   function setupIsolatedEnv() {
-    const dir = mkdtempSync(join(tmpdir(), "hitl-p3a-wire-"));
+    const dir = mkdtempSync(
+      join(process.env.HITL_CHANNEL_TEST_ROOT || tmpdir(), "hitl-p3a-wire-"),
+    );
     const prev = {
       HOME: process.env.HOME,
       HITL_CHANNEL_IDENTITY_FILE: process.env.HITL_CHANNEL_IDENTITY_FILE,
@@ -161,7 +163,7 @@ describe("SPEC-HITL-APP-10827 Milestone 3a AV1: /instance, mDNS, client_hello fe
     expect(daemonInst.harness).toBe("codex");
     expect(daemonInst.capabilities).toEqual({
       sessions: true,
-      streaming: false,
+      streaming: true,
       choicesId: true,
     });
     expect("defaultCwd" in daemonInst).toBe(false);

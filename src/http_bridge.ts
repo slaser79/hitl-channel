@@ -1,7 +1,7 @@
 import { basename, join, resolve } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { sendChannelNotification } from "./notification.js";
-import { HitlAttachment, HitlMessage, HitlWebSocket, HitlWebSocketData, ReplyPayload } from "./types.js";
+import { HitlAttachment, HitlMessage, HitlWebSocket, HitlWebSocketData, ReplyPayload, ToolStepSummary } from "./types.js";
 import { createPairingRequest, consumePairingCode, validatePairingCode } from "./pairing.js";
 import { addToAllowlist, isTokenAllowed, hashToken } from "./allowlist.js";
 import { getIdentity } from "./identity.js";
@@ -207,6 +207,10 @@ async function isAuthenticated(req: Request): Promise<{ valid: boolean; reason?:
 
 export interface BroadcastReplyOptions {
   acpSessionId?: string | null;
+  turnId?: string | null;
+  isTurnFinal?: boolean;
+  toolSteps?: ToolStepSummary[];
+  excludeFeature?: string;
 }
 
 export function broadcastReply(
@@ -229,14 +233,51 @@ export function broadcastReply(
     ...(typeof opts?.acpSessionId === "string" && opts.acpSessionId.length > 0
       ? { acpSessionId: opts.acpSessionId }
       : {}),
+    ...(typeof opts?.turnId === "string" && opts.turnId.length > 0
+      ? { turnId: opts.turnId }
+      : {}),
+    ...(typeof opts?.isTurnFinal === "boolean"
+      ? { isTurnFinal: opts.isTurnFinal }
+      : {}),
+    ...(Array.isArray(opts?.toolSteps) && opts.toolSteps.length > 0
+      ? { toolSteps: opts.toolSteps }
+      : {}),
   };
-  
-  // Always push to buffer first to guarantee redundancy
-  replyBuffer.push(payload);
+
+  const excludeFeature = opts?.excludeFeature;
+  let shouldBuffer = true;
+  if (excludeFeature) {
+    const openClients = Array.from(clients).filter((ws) => ws.readyState === 1);
+    const hasExcludedClient = openClients.some(
+      (ws) =>
+        ws.data?.features instanceof Set && ws.data.features.has(excludeFeature),
+    );
+    const hasLegacyOpenClient = openClients.some(
+      (ws) =>
+        !(
+          ws.data?.features instanceof Set &&
+          ws.data.features.has(excludeFeature)
+        ),
+    );
+    shouldBuffer = !hasExcludedClient || hasLegacyOpenClient;
+  }
+
+  // Always push to buffer first to guarantee redundancy (unless suppressed for
+  // excluded-only streaming clients).
+  if (shouldBuffer) {
+    replyBuffer.push(payload);
+  }
 
   const rawPayload = JSON.stringify(payload);
   for (const ws of clients) {
     if (ws.readyState === 1) {
+      if (
+        excludeFeature &&
+        ws.data?.features instanceof Set &&
+        ws.data.features.has(excludeFeature)
+      ) {
+        continue;
+      }
       wsSendAccepted(ws, rawPayload);
     }
   }
@@ -992,7 +1033,8 @@ export function startHttpBridge(
           if (
             frameType === "session_list_request" ||
             frameType === "session_new" ||
-            frameType === "session_resume"
+            frameType === "session_resume" ||
+            frameType === "cancel_turn"
           ) {
             if (handlers.onControlFrame) {
               void Promise.resolve(handlers.onControlFrame(typedWs, data)).catch((err) => {
