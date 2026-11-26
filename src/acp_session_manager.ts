@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access, stat } from "node:fs/promises";
+import { access, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -220,6 +220,24 @@ export function extractWorkflowDelegationMessageId(text: string): string | null 
   );
   if (!match) return null;
   return match[1] ?? match[2] ?? match[3] ?? null;
+}
+
+/**
+ * Returns true when an ACP RPC error definitively indicates a missing session or
+ * trajectory (as opposed to an unsupported RPC/method error that should fall
+ * back to `session/resume`).
+ */
+export function isSessionNotFoundError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  if (msg.includes("method not found")) {
+    return false;
+  }
+  return (
+    msg.includes("not_found") ||
+    msg.includes("not found") ||
+    msg.includes("does not exist") ||
+    msg.includes("enoent")
+  );
 }
 
 function deriveToolName(
@@ -563,6 +581,7 @@ export interface AcpSessionManagerOptions {
   sessionLoadTimeoutMs?: number;
   streamCoalesceMs?: number;
   nowMs?: () => number;
+  agyConversationsDir?: string | null;
 }
 
 export class AcpSessionManager {
@@ -590,6 +609,7 @@ export class AcpSessionManager {
   private readonly sessionLoadTimeoutMs: number;
   private readonly streamCoalesceMs: number;
   private readonly nowMs: () => number;
+  private readonly agyConversationsDir: string | null;
 
   private client: AcpClient | null = null;
   private pendingClient: AcpClient | null = null;
@@ -623,6 +643,7 @@ export class AcpSessionManager {
   private readonly inFlightSessionLoads = new Map<string, Promise<void>>();
   private readonly replayCaptureBuffers = new Map<string, ReplayCaptureBuffer>();
   private readonly instructionsDeliveredSessions = new Set<string>();
+  private readonly createdSessionIds = new Set<string>();
   private readonly seenToolCalls = new Map<string, AcpPermissionToolCall>();
   private static readonly MAX_SEEN_TOOL_CALLS = 500;
 
@@ -662,6 +683,20 @@ export class AcpSessionManager {
         ? Math.max(0, opts.streamCoalesceMs)
         : DEFAULT_STREAM_COALESCE_MS;
     this.nowMs = opts.nowMs ?? (() => Date.now());
+    if (this.harness.name !== "agy") {
+      this.agyConversationsDir = null;
+    } else if (opts.agyConversationsDir !== undefined) {
+      this.agyConversationsDir = opts.agyConversationsDir || null;
+    } else if (opts.transportFactory) {
+      this.agyConversationsDir = null;
+    } else {
+      this.agyConversationsDir = join(
+        process.env.HOME?.trim() || homedir(),
+        ".gemini",
+        "antigravity-cli",
+        "conversations",
+      );
+    }
   }
 
   getInboundHandlers(): InboundHandlers {
@@ -1194,6 +1229,67 @@ export class AcpSessionManager {
     });
   }
 
+  private async readLocalAgySessionIds(): Promise<Set<string> | null> {
+    if (!this.agyConversationsDir) {
+      return null;
+    }
+    try {
+      const entries = await readdir(this.agyConversationsDir);
+      const ids = new Set<string>();
+      for (const entry of entries) {
+        if (entry.endsWith(".db") || entry.endsWith(".pb")) {
+          const id = entry.slice(0, -3);
+          if (id.length > 0) {
+            ids.add(id);
+          }
+        }
+      }
+      return ids;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT" || code === "ENOTDIR") {
+        return null;
+      }
+      process.stderr.write(
+        `[hitl-channel] failed to read agy conversations dir '${this.agyConversationsDir}': ${
+          err instanceof Error ? err.message : String(err)
+        }\n`,
+      );
+      return null;
+    }
+  }
+
+  private isKnownLocalSession(
+    sessionId: string,
+    localIds: Set<string>,
+  ): boolean {
+    return (
+      localIds.has(sessionId) ||
+      sessionId === this.activeSessionId ||
+      this.createdSessionIds.has(sessionId)
+    );
+  }
+
+  private async filterResumableSessions(
+    sessions: AcpSessionInfo[],
+  ): Promise<AcpSessionInfo[]> {
+    const localIds = await this.readLocalAgySessionIds();
+    if (localIds === null) {
+      return sessions;
+    }
+    return sessions.filter((s) => this.isKnownLocalSession(s.sessionId, localIds));
+  }
+
+  private async isLocallyResumableAgySession(
+    sessionId: string,
+  ): Promise<boolean> {
+    const localIds = await this.readLocalAgySessionIds();
+    if (localIds === null) {
+      return true;
+    }
+    return this.isKnownLocalSession(sessionId, localIds);
+  }
+
   private updateCatalogFromList(sessions: AcpSessionInfo[]): AcpSessionInfo[] {
     const sorted = this.sortSessionsDesc(sessions);
     this.sessionCatalog = sorted;
@@ -1413,6 +1509,9 @@ export class AcpSessionManager {
           const client = await this.ensureClient();
           try {
             const res = await client.sessionList({});
+            const filtered = await this.filterResumableSessions(
+              res.sessions ?? [],
+            );
             // Skip overwriting if a concurrent session_new/session_resume
             // updated the catalog while session/list was in flight.
             if (
@@ -1420,7 +1519,7 @@ export class AcpSessionManager {
               !this.turnBusy &&
               !this.sessionOpInFlight
             ) {
-              this.updateCatalogFromList(res.sessions ?? []);
+              this.updateCatalogFromList(filtered);
             }
           } catch {
             // Gracefully reuse cached listing when session/list is unsupported or fails
@@ -1524,6 +1623,7 @@ export class AcpSessionManager {
         mcpServers: [this.buildMcpServer()],
         ...this.buildSessionInitExtensions(),
       });
+      this.createdSessionIds.add(res.sessionId);
       this.activeSessionId = res.sessionId;
       this.activeSessionCwd = absCwd;
       this.activeSessionTitle = null;
@@ -1695,6 +1795,16 @@ export class AcpSessionManager {
 
     this.sessionOpInFlight = true;
     try {
+      if (!(await this.isLocallyResumableAgySession(sessionId))) {
+        this.sendSessionError(ws, {
+          action: "session_resume",
+          code: "load_failed",
+          message: `Cannot resume session '${sessionId}': it is not in agy CLI's local trajectory store and may belong to Antigravity IDE.`,
+          requestId,
+        });
+        return;
+      }
+
       const client = await this.ensureClient();
       const supportsResume = Boolean(
         this.agentCapabilities.sessionCapabilities?.resume,
@@ -1736,7 +1846,7 @@ export class AcpSessionManager {
           return;
         }
 
-        if (!supportsResume) {
+        if (!supportsResume || isSessionNotFoundError(outcome.error)) {
           this.sendSessionError(ws, {
             action: "session_resume",
             code: "load_failed",
@@ -2602,6 +2712,7 @@ export class AcpSessionManager {
           mcpServers: [this.buildMcpServer()],
           ...this.buildSessionInitExtensions(),
         });
+        this.createdSessionIds.add(res.sessionId);
         this.activeSessionId = res.sessionId;
         this.activeSessionCwd = absCwd;
         this.activeSessionTitle = null;
@@ -2634,7 +2745,8 @@ export class AcpSessionManager {
       try {
         const client = await this.ensureClient();
         const res = await client.sessionList({});
-        const sorted = this.updateCatalogFromList(res.sessions ?? []);
+        const filtered = await this.filterResumableSessions(res.sessions ?? []);
+        const sorted = this.updateCatalogFromList(filtered);
 
         const top = sorted.slice(0, 10);
         if (
@@ -2710,10 +2822,20 @@ export class AcpSessionManager {
         const client = await this.ensureClient();
         if (!resolved) {
           const listRes = await client.sessionList({});
-          resolved = listRes.sessions?.find((s) => s.sessionId === target);
+          const filtered = await this.filterResumableSessions(
+            listRes.sessions ?? [],
+          );
+          resolved = filtered.find((s) => s.sessionId === target);
         }
 
         const sessionId = resolved?.sessionId ?? target;
+        if (!(await this.isLocallyResumableAgySession(sessionId))) {
+          this.sendStandaloneReply(
+            `Failed to resume session: '${sessionId}' is not in agy CLI's local store (it may belong to Antigravity IDE).`,
+            this.activeSessionId,
+          );
+          return { acpSessionId: this.activeSessionId };
+        }
         if (this.inFlightSessionLoads.has(sessionId)) {
           this.sendStandaloneReply(
             `Failed to resume session: '${sessionId}' still has a load in flight.`,
@@ -2793,6 +2915,7 @@ export class AcpSessionManager {
           mcpServers: [this.buildMcpServer()],
           ...this.buildSessionInitExtensions(),
         });
+        this.createdSessionIds.add(res.sessionId);
         this.activeSessionId = res.sessionId;
         this.activeSessionCwd = this.defaultCwd;
         this.activeSessionTitle = null;
