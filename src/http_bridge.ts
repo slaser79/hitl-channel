@@ -535,6 +535,8 @@ export interface InstanceCapabilities {
   sessions: boolean;
   streaming: boolean;
   choicesId: boolean;
+  models?: boolean;
+  commands?: boolean;
 }
 
 export interface HttpBridgeOptions {
@@ -746,6 +748,8 @@ export function startHttpBridge(
     sessions: opts?.capabilities?.sessions ?? (mode === "daemon"),
     streaming: opts?.capabilities?.streaming ?? false,
     choicesId: opts?.capabilities?.choicesId ?? true,
+    models: opts?.capabilities?.models ?? false,
+    commands: opts?.capabilities?.commands ?? false,
   };
   const handlers: InboundHandlers = isDaemon
     ? target
@@ -1034,7 +1038,8 @@ export function startHttpBridge(
             frameType === "session_list_request" ||
             frameType === "session_new" ||
             frameType === "session_resume" ||
-            frameType === "cancel_turn"
+            frameType === "cancel_turn" ||
+            frameType === "session_set_model"
           ) {
             if (handlers.onControlFrame) {
               void Promise.resolve(handlers.onControlFrame(typedWs, data)).catch((err) => {

@@ -206,13 +206,15 @@ export interface SessionSwitchedFrame {
 export type SessionErrorAction =
   | "session_new"
   | "session_resume"
-  | "session_list_request";
+  | "session_list_request"
+  | "session_set_model";
 
 export type SessionErrorCode =
   | "turn_busy"
   | "invalid_cwd"
   | "load_timeout"
-  | "load_failed";
+  | "load_failed"
+  | "invalid_model";
 
 export interface SessionErrorFrame {
   type: "session_error";
@@ -220,6 +222,54 @@ export interface SessionErrorFrame {
   code: SessionErrorCode;
   message: string;
   requestId?: string;
+}
+
+// ─── SPEC-HITL-APP-10831 Phase 2 frame types ───────────────────────────────
+// Capability-negotiated model visibility/switching ("models") and host slash
+// command discovery ("commands"). Sent ONLY to sockets declaring matching
+// features via client_hello.
+
+export interface AcpModelInfo {
+  modelId: string;
+  name: string;
+  description?: string | null;
+  [key: string]: unknown;
+}
+
+export interface ChannelModelInfo {
+  modelId: string;
+  name: string;
+  description?: string;
+}
+
+export interface ModelsStateFrame {
+  type: "models_state";
+  sessionId: string | null;
+  currentModelId: string | null;
+  availableModels: ChannelModelInfo[];
+  requestId?: string;
+}
+
+export interface SessionSetModelFrame {
+  type: "session_set_model";
+  sessionId?: string;
+  modelId: string;
+  requestId?: string;
+}
+
+export type ChannelSlashCommandSource = "host" | "daemon";
+
+export interface ChannelSlashCommand {
+  name: string;
+  description?: string;
+  inputHint?: string;
+  source: ChannelSlashCommandSource;
+}
+
+export interface CommandsListFrame {
+  type: "commands_list";
+  sessionId: string | null;
+  commands: ChannelSlashCommand[];
 }
 
 export interface ChoicesSettledFrame {
