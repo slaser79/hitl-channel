@@ -430,7 +430,10 @@ function normalizeModelEntries(
     if (typeof rawId !== "string") continue;
     const trimmedId = rawId.trim();
     if (!trimmedId) continue;
-    const modelId = truncateChars(trimmedId, MAX_MODEL_ID_CHARS);
+    // Preserve exact ACP modelId for session_set_model matching; skip over-limit IDs
+    // rather than truncating into an unselectable identifier.
+    if (trimmedId.length > MAX_MODEL_ID_CHARS) continue;
+    const modelId = trimmedId;
     if (seen.has(modelId)) continue;
     seen.add(modelId);
     const nameStr =
@@ -2505,10 +2508,9 @@ export class AcpSessionManager {
         typeof tierOpt?.currentValue === "string"
           ? tierOpt.currentValue.trim()
           : "";
-      const candidates = [baseVal];
-      if (tierVal) {
-        candidates.push(`${baseVal}-${tierVal}`, `${baseVal}[${tierVal}]`);
-      }
+      const candidates = tierVal
+        ? [`${baseVal}-${tierVal}`, `${baseVal}[${tierVal}]`, baseVal]
+        : [baseVal];
       const matched = candidates
         .map((cand) =>
           state.allAvailableModels.find((m) => m.modelId === cand),
@@ -2535,32 +2537,41 @@ export class AcpSessionManager {
 
     if (state && state.selectionMethod === "set_config_option") {
       if (!modelOpt) return;
+      let candidateModels = state.allAvailableModels;
+      let candidateKnownIds = state.knownModelIds;
       if (Array.isArray(modelOpt.options) && modelOpt.options.length > 0) {
         const normalized = normalizeConfigOptionModels(modelOpt.options);
         if (normalized.length > 0) {
-          state.allAvailableModels = normalized;
-          state.knownModelIds = new Set(normalized.map((m) => m.modelId));
+          candidateModels = normalized;
+          candidateKnownIds = new Set(normalized.map((m) => m.modelId));
         }
-      }
-      if (typeof modelOpt.id === "string" && modelOpt.id.trim().length > 0) {
-        state.configOptionId = modelOpt.id.trim();
       }
       const nextRaw =
         typeof modelOpt.currentValue === "string"
           ? modelOpt.currentValue.trim()
           : "";
       if (nextRaw) {
-        const nextId = truncateChars(nextRaw, MAX_MODEL_ID_CHARS);
-        if (
-          state.allAvailableModels.length > 0 &&
-          !state.knownModelIds.has(nextId)
-        ) {
+        if (nextRaw.length > MAX_MODEL_ID_CHARS) {
           process.stderr.write(
-            `[hitl-channel] WARN config_option_update model '${nextId}' not in configOptions.options for session ${sessionId}; keeping '${state.currentModelId ?? "null"}'\n`,
+            `[hitl-channel] WARN config_option_update model id exceeds max length (${nextRaw.length}) for session ${sessionId}; keeping '${state.currentModelId ?? "null"}'\n`,
           );
           return;
         }
-        state.currentModelId = nextId;
+        if (
+          candidateModels.length > 0 &&
+          !candidateKnownIds.has(nextRaw)
+        ) {
+          process.stderr.write(
+            `[hitl-channel] WARN config_option_update model '${nextRaw}' not in configOptions.options for session ${sessionId}; keeping '${state.currentModelId ?? "null"}'\n`,
+          );
+          return;
+        }
+        state.currentModelId = nextRaw;
+      }
+      state.allAvailableModels = candidateModels;
+      state.knownModelIds = candidateKnownIds;
+      if (typeof modelOpt.id === "string" && modelOpt.id.trim().length > 0) {
+        state.configOptionId = modelOpt.id.trim();
       }
       state.availableModels = capAvailableModels(
         state.allAvailableModels,
@@ -2867,8 +2878,6 @@ export class AcpSessionManager {
     this.loadingSessionIds.clear();
     this.seenToolCalls.clear();
     this.instructionsDeliveredSessions.clear();
-    this.sessionModelsMap.clear();
-    this.sessionCommandsMap.clear();
     this.sessionModelsMap.clear();
     this.sessionCommandsMap.clear();
 

@@ -800,14 +800,20 @@ describe("SPEC-HITL-APP-10831 Phase 2 AV5 & AV6: models, session_set_model, comm
     await waitFor(() => !manager.getStateSnapshot().turnBusy);
   });
 
-  it("AV5/AV6: enforces models_state (<=100 preserving current) and commands_list (<=200, truncation, whitespace drop, slash strip, daemon dedupe)", async () => {
-    const manyModels = Array.from({ length: 125 }, (_, i) => ({
-      modelId: `model-${i}-${"x".repeat(130)}`,
-      name: `Name ${i} ${"n".repeat(130)}`,
-      description: `Desc ${i} ${"d".repeat(220)}`,
-    }));
-    const currentRawId = manyModels[120]!.modelId;
-    const expectedCurrentId = currentRawId.slice(0, 128);
+  it("AV5/AV6: enforces models_state (<=100 preserving current, skips >128-char IDs) and commands_list (<=200, truncation, whitespace drop, slash strip, daemon dedupe)", async () => {
+    const manyModels = [
+      {
+        modelId: `too-long-${"z".repeat(130)}`,
+        name: "Too Long ID Should Be Omitted",
+      },
+      ...Array.from({ length: 125 }, (_, i) => ({
+        modelId: `model-${i}-${"x".repeat(40)}`,
+        name: `Name ${i} ${"n".repeat(130)}`,
+        description: `Desc ${i} ${"d".repeat(220)}`,
+      })),
+    ];
+    const currentRawId = manyModels[121]!.modelId;
+    const expectedCurrentId = currentRawId;
 
     const manyCommands = [
       { name: "help", description: "Host help collision" },
