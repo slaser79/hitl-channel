@@ -413,6 +413,13 @@ function truncateChars(text: string, maxChars: number): string {
   return text.slice(0, end);
 }
 
+function normalizeModelId(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > MAX_MODEL_ID_CHARS) return null;
+  return trimmed;
+}
+
 function normalizeModelEntries(
   rawList: unknown,
   extract: (entry: Record<string, unknown>) => {
@@ -1620,11 +1627,7 @@ export class AcpSessionManager {
       : [];
 
     if (normalizedFromModels.length > 0) {
-      const currentModelId =
-        typeof rawModels?.currentModelId === "string" &&
-        rawModels.currentModelId.trim().length > 0
-          ? truncateChars(rawModels.currentModelId.trim(), MAX_MODEL_ID_CHARS)
-          : null;
+      const currentModelId = normalizeModelId(rawModels?.currentModelId);
       this.sessionModelsMap.set(sessionId, {
         selectionMethod: "set_model",
         currentModelId,
@@ -1643,11 +1646,7 @@ export class AcpSessionManager {
       if (modelOpt && Array.isArray(modelOpt.options)) {
         const normalizedFromConfig = normalizeConfigOptionModels(modelOpt.options);
         if (normalizedFromConfig.length > 0) {
-          const currentModelId =
-            typeof modelOpt.currentValue === "string" &&
-            modelOpt.currentValue.trim().length > 0
-              ? truncateChars(modelOpt.currentValue.trim(), MAX_MODEL_ID_CHARS)
-              : null;
+          const currentModelId = normalizeModelId(modelOpt.currentValue);
           const configOptionId =
             typeof modelOpt.id === "string" && modelOpt.id.trim().length > 0
               ? modelOpt.id.trim()
@@ -1936,11 +1935,13 @@ export class AcpSessionManager {
 
     const rawModelId =
       typeof frame.modelId === "string" ? frame.modelId.trim() : "";
-    if (!rawModelId) {
+    if (!rawModelId || rawModelId.length > MAX_MODEL_ID_CHARS) {
       this.sendSessionError(ws, {
         action: "session_set_model",
         code: "invalid_model",
-        message: "modelId is required.",
+        message: !rawModelId
+          ? "modelId is required."
+          : `modelId exceeds ${MAX_MODEL_ID_CHARS} characters.`,
         requestId,
       });
       return;
@@ -2001,7 +2002,7 @@ export class AcpSessionManager {
         });
       }
 
-      const confirmedModelId = truncateChars(rawModelId, MAX_MODEL_ID_CHARS);
+      const confirmedModelId = rawModelId;
       if (state) {
         state.currentModelId = confirmedModelId;
         state.availableModels = capAvailableModels(
