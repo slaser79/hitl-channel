@@ -1046,12 +1046,20 @@ describe("SPEC-HITL-APP-10827 Milestone 3b AV10: live streaming, tool progress, 
     const instRes = await fetch(`http://127.0.0.1:${daemon.port}/instance`);
     expect(instRes.status).toBe(200);
     const instJson = (await instRes.json()) as {
-      capabilities: { sessions: boolean; streaming: boolean; choicesId: boolean };
+      capabilities: {
+        sessions: boolean;
+        streaming: boolean;
+        choicesId: boolean;
+        models?: boolean;
+        commands?: boolean;
+      };
     };
     expect(instJson.capabilities).toEqual({
       sessions: true,
       streaming: true,
       choicesId: true,
+      models: true,
+      commands: true,
     });
 
     // 2. Connect streaming WS and legacy WS

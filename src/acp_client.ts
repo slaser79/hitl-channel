@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import type { AcpModelInfo } from "./types.js";
 
 export interface AcpMcpHttpHeader {
   name: string;
@@ -105,6 +106,37 @@ export interface AcpPromptResult {
   [key: string]: unknown;
 }
 
+export interface AcpConfigOptionValue {
+  value: string;
+  name?: string;
+  description?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AcpConfigOption {
+  id: string;
+  name?: string;
+  description?: string | null;
+  category?: string;
+  type?: string;
+  currentValue?: string;
+  options?: AcpConfigOptionValue[];
+  [key: string]: unknown;
+}
+
+export interface AcpSessionModels {
+  currentModelId?: string;
+  availableModels?: AcpModelInfo[];
+  [key: string]: unknown;
+}
+
+export interface AcpAvailableCommand {
+  name?: string;
+  description?: string;
+  input?: { hint?: string } | null;
+  [key: string]: unknown;
+}
+
 export interface AcpSessionUpdateParams {
   sessionId: string;
   update: {
@@ -114,6 +146,8 @@ export interface AcpSessionUpdateParams {
       | "tool_call"
       | "tool_call_update"
       | "session_info_update"
+      | "available_commands_update"
+      | "config_option_update"
       | (string & {});
     content?: { type?: string; text?: string };
     title?: string;
@@ -122,6 +156,8 @@ export interface AcpSessionUpdateParams {
     kind?: string;
     rawInput?: unknown;
     status?: string;
+    availableCommands?: AcpAvailableCommand[];
+    configOptions?: AcpConfigOption[];
     [key: string]: unknown;
   };
   [key: string]: unknown;
@@ -536,7 +572,12 @@ export class AcpClient {
     mcpServers: AcpMcpServer[];
     systemPrompt?: AcpSystemPrompt;
     _meta?: Record<string, unknown>;
-  }): Promise<{ sessionId: string; [key: string]: unknown }> {
+  }): Promise<{
+    sessionId: string;
+    models?: AcpSessionModels;
+    configOptions?: AcpConfigOption[];
+    [key: string]: unknown;
+  }> {
     return this.request("session/new", this.buildSessionLifecyclePayload(params));
   }
 
@@ -570,7 +611,11 @@ export class AcpClient {
     mcpServers: AcpMcpServer[];
     systemPrompt?: AcpSystemPrompt;
     _meta?: Record<string, unknown>;
-  }): Promise<{ [key: string]: unknown }> {
+  }): Promise<{
+    models?: AcpSessionModels;
+    configOptions?: AcpConfigOption[];
+    [key: string]: unknown;
+  }> {
     return this.request("session/resume", this.buildSessionLifecyclePayload(params));
   }
 
@@ -580,8 +625,27 @@ export class AcpClient {
     mcpServers: AcpMcpServer[];
     systemPrompt?: AcpSystemPrompt;
     _meta?: Record<string, unknown>;
-  }): Promise<{ [key: string]: unknown }> {
+  }): Promise<{
+    models?: AcpSessionModels;
+    configOptions?: AcpConfigOption[];
+    [key: string]: unknown;
+  }> {
     return this.request("session/load", this.buildSessionLifecyclePayload(params));
+  }
+
+  async sessionSetModel(params: {
+    sessionId: string;
+    modelId: string;
+  }): Promise<Record<string, unknown>> {
+    return this.request("session/set_model", params);
+  }
+
+  async sessionSetConfigOption(params: {
+    sessionId: string;
+    configId: string;
+    value: string;
+  }): Promise<Record<string, unknown>> {
+    return this.request("session/set_config_option", params);
   }
 
   async sessionPrompt(params: {

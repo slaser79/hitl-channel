@@ -118,6 +118,8 @@ if (process.env.BUN_ENV !== "test" && process.env.NODE_ENV !== "test") {
       sessions: false,
       streaming: false,
       choicesId: true,
+      models: false,
+      commands: false,
     },
   });
 

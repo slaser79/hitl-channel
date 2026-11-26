@@ -377,6 +377,8 @@ export async function startDaemon(
       sessions: true,
       streaming: true,
       choicesId: true,
+      models: true,
+      commands: true,
     },
   });
   const actualPort = httpServer.port ?? requestedPort;

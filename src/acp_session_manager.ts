@@ -5,14 +5,18 @@ import { join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   AcpClient,
+  AcpRpcError,
   spawnAcpTransport,
   type AcpAgentCapabilities,
+  type AcpAvailableCommand,
+  type AcpConfigOption,
   type AcpContentBlock,
   type AcpMcpServer,
   type AcpPermissionOption,
   type AcpPermissionRequestParams,
   type AcpPermissionToolCall,
   type AcpSessionInfo,
+  type AcpSessionModels,
   type AcpSessionUpdateParams,
   type AcpSystemPrompt,
   type AcpTransport,
@@ -30,9 +34,13 @@ import {
 } from "./http_bridge.js";
 import { DAEMON_INSTRUCTIONS } from "./mcp_instructions.js";
 import type {
+  ChannelModelInfo,
+  ChannelSlashCommand,
   ChoicesSettledFrame,
+  CommandsListFrame,
   HitlAttachment,
   HitlWebSocket,
+  ModelsStateFrame,
   RecentTurnSummary,
   SessionErrorFrame,
   SessionListEntry,
@@ -330,6 +338,64 @@ const MAX_RECONNECT_SNAPSHOT_BYTES = 128 * 1024;
 const MAX_TOOL_STEPS = 32;
 const MAX_EPHEMERAL_TOOL_SUMMARY_CHARS = 512;
 const MAX_DURABLE_TOOL_SUMMARY_CHARS = 256;
+const MAX_MODELS_COUNT = 100;
+const MAX_MODEL_ID_CHARS = 128;
+const MAX_MODEL_NAME_CHARS = 128;
+const MAX_MODEL_DESC_CHARS = 200;
+const MAX_COMMANDS_COUNT = 200;
+const MAX_CMD_NAME_CHARS = 64;
+const MAX_CMD_DESC_CHARS = 200;
+const MAX_CMD_HINT_CHARS = 80;
+
+const DAEMON_SLASH_COMMANDS: ReadonlyArray<ChannelSlashCommand> = [
+  {
+    name: "help",
+    description: "Show available daemon commands",
+    source: "daemon",
+  },
+  {
+    name: "new",
+    description: "Start a new session",
+    inputHint: "[harness] [cwd]",
+    source: "daemon",
+  },
+  {
+    name: "sessions",
+    description: "List recent sessions",
+    source: "daemon",
+  },
+  {
+    name: "resume",
+    description: "Switch to and resume a session",
+    inputHint: "<n|id>",
+    source: "daemon",
+  },
+  {
+    name: "cancel",
+    description: "Cancel pending approvals and stop the running turn",
+    source: "daemon",
+  },
+  {
+    name: "status",
+    description: "Show harness, active session, turn, queue, and approvals",
+    source: "daemon",
+  },
+];
+
+const RESERVED_DAEMON_COMMAND_NAMES = new Set(
+  DAEMON_SLASH_COMMANDS.map((cmd) => cmd.name),
+);
+
+type ModelSelectionMethod = "set_model" | "set_config_option";
+
+interface SessionModelState {
+  selectionMethod: ModelSelectionMethod;
+  configOptionId?: string;
+  currentModelId: string | null;
+  allAvailableModels: ChannelModelInfo[];
+  availableModels: ChannelModelInfo[];
+  knownModelIds: Set<string>;
+}
 
 interface ReplayCaptureBuffer {
   turns: RecentTurnSummary[];
@@ -345,6 +411,147 @@ function truncateChars(text: string, maxChars: number): string {
     end--;
   }
   return text.slice(0, end);
+}
+
+function normalizeModelEntries(
+  rawList: unknown,
+  extract: (entry: Record<string, unknown>) => {
+    rawId: unknown;
+    rawName: unknown;
+    rawDesc: unknown;
+  },
+): ChannelModelInfo[] {
+  if (!Array.isArray(rawList)) return [];
+  const seen = new Set<string>();
+  const out: ChannelModelInfo[] = [];
+  for (const item of rawList) {
+    if (!item || typeof item !== "object") continue;
+    const { rawId, rawName, rawDesc } = extract(item as Record<string, unknown>);
+    if (typeof rawId !== "string") continue;
+    const trimmedId = rawId.trim();
+    if (!trimmedId) continue;
+    const modelId = truncateChars(trimmedId, MAX_MODEL_ID_CHARS);
+    if (seen.has(modelId)) continue;
+    seen.add(modelId);
+    const nameStr =
+      typeof rawName === "string" && rawName.trim().length > 0
+        ? rawName.trim()
+        : modelId;
+    const name = truncateChars(nameStr, MAX_MODEL_NAME_CHARS);
+    const description =
+      typeof rawDesc === "string" && rawDesc.trim().length > 0
+        ? truncateChars(rawDesc.trim(), MAX_MODEL_DESC_CHARS)
+        : undefined;
+    out.push({
+      modelId,
+      name,
+      ...(description !== undefined ? { description } : {}),
+    });
+  }
+  return out;
+}
+
+function normalizeChannelModels(rawList: unknown[]): ChannelModelInfo[] {
+  return normalizeModelEntries(rawList, (entry) => ({
+    rawId: entry.modelId,
+    rawName: entry.name,
+    rawDesc: entry.description,
+  }));
+}
+
+function normalizeConfigOptionModels(
+  options: AcpConfigOption["options"],
+): ChannelModelInfo[] {
+  return normalizeModelEntries(options, (entry) => ({
+    rawId: entry.value,
+    rawName: entry.name,
+    rawDesc: entry.description,
+  }));
+}
+
+function capAvailableModels(
+  allModels: ChannelModelInfo[],
+  currentModelId: string | null,
+): ChannelModelInfo[] {
+  const capped = allModels.slice(0, MAX_MODELS_COUNT);
+  if (
+    currentModelId &&
+    capped.length === MAX_MODELS_COUNT &&
+    !capped.some((m) => m.modelId === currentModelId)
+  ) {
+    const currentEntry = allModels.find((m) => m.modelId === currentModelId);
+    if (currentEntry) {
+      capped[MAX_MODELS_COUNT - 1] = currentEntry;
+    }
+  }
+  return capped;
+}
+
+function findModelConfigOption(
+  configOptions: AcpConfigOption[],
+): AcpConfigOption | undefined {
+  return (
+    configOptions.find(
+      (opt) => opt && typeof opt === "object" && opt.category === "model",
+    ) ??
+    configOptions.find(
+      (opt) => opt && typeof opt === "object" && opt.id === "model",
+    )
+  );
+}
+
+function findTierConfigOption(
+  configOptions: AcpConfigOption[],
+): AcpConfigOption | undefined {
+  return (
+    configOptions.find(
+      (opt) =>
+        opt &&
+        typeof opt === "object" &&
+        (opt.category === "thought_level" ||
+          opt.category === "reasoning_effort"),
+    ) ??
+    configOptions.find(
+      (opt) =>
+        opt &&
+        typeof opt === "object" &&
+        (opt.id === "thought_level" || opt.id === "reasoning_effort"),
+    )
+  );
+}
+
+function normalizeHostCommands(rawCommands: unknown): ChannelSlashCommand[] {
+  if (!Array.isArray(rawCommands)) return [];
+  const seen = new Set<string>();
+  const out: ChannelSlashCommand[] = [];
+  for (const item of rawCommands) {
+    if (!item || typeof item !== "object") continue;
+    const raw = item as AcpAvailableCommand;
+    if (typeof raw.name !== "string") continue;
+    if (raw.name.trim().length === 0 || /\s/.test(raw.name)) continue;
+    const stripped = raw.name.replace(/^\/+/, "");
+    if (stripped.length === 0) continue;
+    const name = truncateChars(stripped, MAX_CMD_NAME_CHARS);
+    if (RESERVED_DAEMON_COMMAND_NAMES.has(name) || seen.has(name)) continue;
+    seen.add(name);
+    const description =
+      typeof raw.description === "string" && raw.description.trim().length > 0
+        ? truncateChars(raw.description.trim(), MAX_CMD_DESC_CHARS)
+        : undefined;
+    const hintRaw =
+      raw.input && typeof raw.input === "object" && typeof raw.input.hint === "string"
+        ? raw.input.hint.trim()
+        : "";
+    const inputHint =
+      hintRaw.length > 0 ? truncateChars(hintRaw, MAX_CMD_HINT_CHARS) : undefined;
+    out.push({
+      name,
+      ...(description !== undefined ? { description } : {}),
+      ...(inputHint !== undefined ? { inputHint } : {}),
+      source: "host",
+    });
+  }
+  return out;
 }
 
 function truncateUtf8Bytes(text: string, maxBytes: number): string {
@@ -645,6 +852,8 @@ export class AcpSessionManager {
   private readonly instructionsDeliveredSessions = new Set<string>();
   private readonly createdSessionIds = new Set<string>();
   private readonly seenToolCalls = new Map<string, AcpPermissionToolCall>();
+  private readonly sessionModelsMap = new Map<string, SessionModelState>();
+  private readonly sessionCommandsMap = new Map<string, ChannelSlashCommand[]>();
   private static readonly MAX_SEEN_TOOL_CALLS = 500;
 
   private crashTimestamps: number[] = [];
@@ -1351,6 +1560,111 @@ export class AcpSessionManager {
     };
   }
 
+  private buildModelsStateFrame(
+    sessionId: string | null,
+    requestId?: string,
+  ): ModelsStateFrame {
+    const state = sessionId ? this.sessionModelsMap.get(sessionId) : undefined;
+    return {
+      type: "models_state",
+      sessionId,
+      currentModelId: state?.currentModelId ?? null,
+      availableModels: state ? [...state.availableModels] : [],
+      ...(requestId ? { requestId } : {}),
+    };
+  }
+
+  private buildCommandsListFrame(sessionId: string | null): CommandsListFrame {
+    const hostCommands = sessionId
+      ? (this.sessionCommandsMap.get(sessionId) ?? [])
+      : [];
+    const maxHost = Math.max(0, MAX_COMMANDS_COUNT - DAEMON_SLASH_COMMANDS.length);
+    return {
+      type: "commands_list",
+      sessionId,
+      commands: [...hostCommands.slice(0, maxHost), ...DAEMON_SLASH_COMMANDS],
+    };
+  }
+
+  private broadcastModelsState(sessionId: string | null, requestId?: string): void {
+    this.broadcastToCapableFn(
+      "models",
+      this.buildModelsStateFrame(sessionId, requestId) as unknown as Record<
+        string,
+        unknown
+      >,
+    );
+  }
+
+  private broadcastCommandsList(sessionId: string | null): void {
+    this.broadcastToCapableFn(
+      "commands",
+      this.buildCommandsListFrame(sessionId) as unknown as Record<string, unknown>,
+    );
+  }
+
+  private recordSessionMetadata(sessionId: string, res: unknown): void {
+    if (!sessionId || !res || typeof res !== "object") return;
+    const obj = res as {
+      models?: AcpSessionModels;
+      configOptions?: AcpConfigOption[];
+    };
+
+    const rawModels =
+      obj.models && typeof obj.models === "object" ? obj.models : undefined;
+    const normalizedFromModels = Array.isArray(rawModels?.availableModels)
+      ? normalizeChannelModels(rawModels.availableModels)
+      : [];
+
+    if (normalizedFromModels.length > 0) {
+      const currentModelId =
+        typeof rawModels?.currentModelId === "string" &&
+        rawModels.currentModelId.trim().length > 0
+          ? truncateChars(rawModels.currentModelId.trim(), MAX_MODEL_ID_CHARS)
+          : null;
+      this.sessionModelsMap.set(sessionId, {
+        selectionMethod: "set_model",
+        currentModelId,
+        allAvailableModels: normalizedFromModels,
+        availableModels: capAvailableModels(normalizedFromModels, currentModelId),
+        knownModelIds: new Set(normalizedFromModels.map((m) => m.modelId)),
+      });
+      return;
+    }
+
+    const configOptions = Array.isArray(obj.configOptions)
+      ? obj.configOptions
+      : undefined;
+    if (configOptions) {
+      const modelOpt = findModelConfigOption(configOptions);
+      if (modelOpt && Array.isArray(modelOpt.options)) {
+        const normalizedFromConfig = normalizeConfigOptionModels(modelOpt.options);
+        if (normalizedFromConfig.length > 0) {
+          const currentModelId =
+            typeof modelOpt.currentValue === "string" &&
+            modelOpt.currentValue.trim().length > 0
+              ? truncateChars(modelOpt.currentValue.trim(), MAX_MODEL_ID_CHARS)
+              : null;
+          const configOptionId =
+            typeof modelOpt.id === "string" && modelOpt.id.trim().length > 0
+              ? modelOpt.id.trim()
+              : "model";
+          this.sessionModelsMap.set(sessionId, {
+            selectionMethod: "set_config_option",
+            configOptionId,
+            currentModelId,
+            allAvailableModels: normalizedFromConfig,
+            availableModels: capAvailableModels(
+              normalizedFromConfig,
+              currentModelId,
+            ),
+            knownModelIds: new Set(normalizedFromConfig.map((m) => m.modelId)),
+          });
+        }
+      }
+    }
+  }
+
   private broadcastSessionChange(opts?: {
     recentTurns?: RecentTurnSummary[];
     requestId?: string;
@@ -1373,6 +1687,8 @@ export class AcpSessionManager {
       "sessions",
       this.buildSessionListFrame() as unknown as Record<string, unknown>,
     );
+    this.broadcastModelsState(this.activeSessionId);
+    this.broadcastCommandsList(this.activeSessionId);
   }
 
   private commitActiveSessionSwitch(params: {
@@ -1413,10 +1729,12 @@ export class AcpSessionManager {
       message: err.message,
       ...(err.requestId ? { requestId: err.requestId } : {}),
     };
+    const requiredFeature =
+      err.action === "session_set_model" ? "models" : "sessions";
     this.sendControlToClientFn(
       ws,
       frame as unknown as Record<string, unknown>,
-      "sessions",
+      requiredFeature,
     );
   }
 
@@ -1426,6 +1744,30 @@ export class AcpSessionManager {
         ws,
         this.buildSessionListFrame() as unknown as Record<string, unknown>,
         "sessions",
+      );
+    }
+    if (
+      ws.data?.features?.has("models") &&
+      this.activeSessionId &&
+      this.sessionModelsMap.has(this.activeSessionId)
+    ) {
+      this.sendControlToClientFn(
+        ws,
+        this.buildModelsStateFrame(this.activeSessionId) as unknown as Record<
+          string,
+          unknown
+        >,
+        "models",
+      );
+    }
+    if (ws.data?.features?.has("commands")) {
+      this.sendControlToClientFn(
+        ws,
+        this.buildCommandsListFrame(this.activeSessionId) as unknown as Record<
+          string,
+          unknown
+        >,
+        "commands",
       );
     }
     if (ws.data?.features?.has("streaming")) {
@@ -1565,6 +1907,129 @@ export class AcpSessionManager {
       });
       return;
     }
+
+    if (frameType === "session_set_model") {
+      await this.handleWsSessionSetModel(ws, frame, requestId);
+      return;
+    }
+  }
+
+  private async handleWsSessionSetModel(
+    ws: HitlWebSocket,
+    frame: Record<string, unknown>,
+    requestId?: string,
+  ): Promise<void> {
+    if (this.turnBusy || this.sessionOpInFlight) {
+      this.sendSessionError(ws, {
+        action: "session_set_model",
+        code: "turn_busy",
+        message: this.turnBusy
+          ? "Cannot switch models while a turn is running."
+          : "Another session operation is currently in progress.",
+        requestId,
+      });
+      return;
+    }
+
+    const rawModelId =
+      typeof frame.modelId === "string" ? frame.modelId.trim() : "";
+    if (!rawModelId) {
+      this.sendSessionError(ws, {
+        action: "session_set_model",
+        code: "invalid_model",
+        message: "modelId is required.",
+        requestId,
+      });
+      return;
+    }
+
+    const requestedSessionId =
+      typeof frame.sessionId === "string" && frame.sessionId.trim().length > 0
+        ? frame.sessionId.trim()
+        : undefined;
+    if (!this.activeSessionId) {
+      this.sendSessionError(ws, {
+        action: "session_set_model",
+        code: "load_failed",
+        message: "No active session to switch model on.",
+        requestId,
+      });
+      return;
+    }
+    if (requestedSessionId && requestedSessionId !== this.activeSessionId) {
+      this.sendSessionError(ws, {
+        action: "session_set_model",
+        code: "load_failed",
+        message: `Session mismatch: active session is '${this.activeSessionId}', requested '${requestedSessionId}'.`,
+        requestId,
+      });
+      return;
+    }
+
+    const targetSessionId = this.activeSessionId;
+    const state = this.sessionModelsMap.get(targetSessionId);
+    if (
+      state &&
+      state.availableModels.length > 0 &&
+      !state.knownModelIds.has(rawModelId)
+    ) {
+      this.sendSessionError(ws, {
+        action: "session_set_model",
+        code: "invalid_model",
+        message: `Unknown model '${rawModelId}' for active session '${targetSessionId}'.`,
+        requestId,
+      });
+      return;
+    }
+
+    this.sessionOpInFlight = true;
+    try {
+      const client = await this.ensureClient();
+      if (state?.selectionMethod === "set_config_option" && state.configOptionId) {
+        await client.sessionSetConfigOption({
+          sessionId: targetSessionId,
+          configId: state.configOptionId,
+          value: rawModelId,
+        });
+      } else {
+        await client.sessionSetModel({
+          sessionId: targetSessionId,
+          modelId: rawModelId,
+        });
+      }
+
+      const confirmedModelId = truncateChars(rawModelId, MAX_MODEL_ID_CHARS);
+      if (state) {
+        state.currentModelId = confirmedModelId;
+        state.availableModels = capAvailableModels(
+          state.allAvailableModels,
+          confirmedModelId,
+        );
+      } else {
+        this.sessionModelsMap.set(targetSessionId, {
+          selectionMethod: "set_model",
+          currentModelId: confirmedModelId,
+          allAvailableModels: [],
+          availableModels: [],
+          knownModelIds: new Set([confirmedModelId]),
+        });
+      }
+      this.broadcastModelsState(targetSessionId, requestId);
+    } catch (err) {
+      const isInvalidModel =
+        err instanceof AcpRpcError && (err.code === -32601 || err.code === -32602);
+      this.sendSessionError(ws, {
+        action: "session_set_model",
+        code: isInvalidModel ? "invalid_model" : "load_failed",
+        message: `Failed to switch model to '${rawModelId}': ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        requestId,
+      });
+    } finally {
+      this.sessionOpInFlight = false;
+      void this.drainQueue();
+    }
   }
 
   private async handleWsSessionNew(
@@ -1634,6 +2099,7 @@ export class AcpSessionManager {
         cwd: absCwd,
         updatedAt: new Date(this.nowMs()).toISOString(),
       });
+      this.recordSessionMetadata(res.sessionId, res);
       this.broadcastSessionChange({ requestId });
     } catch (err) {
       this.sendSessionError(ws, {
@@ -1662,7 +2128,10 @@ export class AcpSessionManager {
     },
     requestId: string | undefined,
     capture?: ReplayCaptureBuffer,
-  ): Promise<{ ok: true } | { ok: false; timedOut: boolean; error: unknown }> {
+  ): Promise<
+    | { ok: true; result: Record<string, unknown> }
+    | { ok: false; timedOut: boolean; error: unknown }
+  > {
     if (capture) {
       this.replayCaptureBuffers.set(sessionId, capture);
     }
@@ -1691,7 +2160,7 @@ export class AcpSessionManager {
     this.inFlightSessionLoads.set(sessionId, trackedPromise);
 
     try {
-      await new Promise<void>((resolve, reject) => {
+      const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
         timer = setTimeout(() => {
           timedOut = true;
           reject(
@@ -1701,9 +2170,9 @@ export class AcpSessionManager {
           );
         }, this.sessionLoadTimeoutMs);
         loadPromise.then(
-          () => {
+          (res) => {
             if (timer) clearTimeout(timer);
-            resolve();
+            resolve(res ?? {});
           },
           (err) => {
             if (timer) clearTimeout(timer);
@@ -1714,7 +2183,7 @@ export class AcpSessionManager {
       if (!settled) {
         await trackedPromise;
       }
-      return { ok: true };
+      return { ok: true, result };
     } catch (err) {
       if (timedOut) {
         if (capture) {
@@ -1833,6 +2302,7 @@ export class AcpSessionManager {
           capture,
         );
         if (outcome.ok) {
+          this.recordSessionMetadata(sessionId, outcome.result);
           this.commitActiveSessionSwitch({
             sessionId,
             cwd,
@@ -1861,8 +2331,9 @@ export class AcpSessionManager {
         }
 
         this.loadingSessionIds.add(sessionId);
+        let fallbackResumeRes: Record<string, unknown>;
         try {
-          await client.sessionResume(resumeParams);
+          fallbackResumeRes = await client.sessionResume(resumeParams);
         } catch (resumeErr) {
           this.sendSessionError(ws, {
             action: "session_resume",
@@ -1879,6 +2350,7 @@ export class AcpSessionManager {
           this.loadingSessionIds.delete(sessionId);
         }
 
+        this.recordSessionMetadata(sessionId, fallbackResumeRes);
         this.commitActiveSessionSwitch({
           sessionId,
           cwd,
@@ -1897,13 +2369,15 @@ export class AcpSessionManager {
           this.replayCaptureBuffers.set(sessionId, capture);
         }
         this.loadingSessionIds.add(sessionId);
+        let resumeRes: Record<string, unknown>;
         try {
-          await client.sessionResume(resumeParams);
+          resumeRes = await client.sessionResume(resumeParams);
         } finally {
           if (capture) capture.detached = true;
           this.replayCaptureBuffers.delete(sessionId);
           this.loadingSessionIds.delete(sessionId);
         }
+        this.recordSessionMetadata(sessionId, resumeRes);
       } else if (supportsLoad) {
         const outcome = await this.performSessionLoadWithTimeout(
           ws,
@@ -1928,6 +2402,7 @@ export class AcpSessionManager {
           }
           return;
         }
+        this.recordSessionMetadata(sessionId, outcome.result);
       } else {
         throw new Error(
           "Harness does not support session/resume or session/load",
@@ -1998,9 +2473,132 @@ export class AcpSessionManager {
     this.seenToolCalls.set(key, merged);
   }
 
+  private handleAvailableCommandsUpdate(
+    sessionId: string,
+    rawCommands: unknown,
+  ): void {
+    if (!sessionId) return;
+    const normalized = normalizeHostCommands(rawCommands);
+    this.sessionCommandsMap.set(sessionId, normalized);
+    if (sessionId === this.activeSessionId) {
+      this.broadcastCommandsList(sessionId);
+    }
+  }
+
+  private handleConfigOptionUpdate(
+    sessionId: string,
+    rawConfigOptions: unknown,
+  ): void {
+    if (!sessionId || !Array.isArray(rawConfigOptions)) return;
+    const configOptions = rawConfigOptions as AcpConfigOption[];
+    const modelOpt = findModelConfigOption(configOptions);
+    const tierOpt = findTierConfigOption(configOptions);
+    const state = this.sessionModelsMap.get(sessionId);
+
+    if (state && state.selectionMethod === "set_model") {
+      const baseVal =
+        typeof modelOpt?.currentValue === "string"
+          ? modelOpt.currentValue.trim()
+          : "";
+      if (!baseVal) return;
+      const tierVal =
+        typeof tierOpt?.currentValue === "string"
+          ? tierOpt.currentValue.trim()
+          : "";
+      const candidates = [baseVal];
+      if (tierVal) {
+        candidates.push(`${baseVal}-${tierVal}`, `${baseVal}[${tierVal}]`);
+      }
+      const matched = candidates
+        .map((cand) =>
+          state.allAvailableModels.find((m) => m.modelId === cand),
+        )
+        .find((m): m is ChannelModelInfo => m !== undefined);
+
+      if (!matched) {
+        process.stderr.write(
+          `[hitl-channel] WARN config_option_update model '${baseVal}' (tier='${tierVal}') did not match any cached availableModels for session ${sessionId}; keeping '${state.currentModelId ?? "null"}'\n`,
+        );
+        return;
+      }
+
+      state.currentModelId = matched.modelId;
+      state.availableModels = capAvailableModels(
+        state.allAvailableModels,
+        matched.modelId,
+      );
+      if (sessionId === this.activeSessionId) {
+        this.broadcastModelsState(sessionId);
+      }
+      return;
+    }
+
+    if (state && state.selectionMethod === "set_config_option") {
+      if (!modelOpt) return;
+      if (Array.isArray(modelOpt.options) && modelOpt.options.length > 0) {
+        const normalized = normalizeConfigOptionModels(modelOpt.options);
+        if (normalized.length > 0) {
+          state.allAvailableModels = normalized;
+          state.knownModelIds = new Set(normalized.map((m) => m.modelId));
+        }
+      }
+      if (typeof modelOpt.id === "string" && modelOpt.id.trim().length > 0) {
+        state.configOptionId = modelOpt.id.trim();
+      }
+      const nextRaw =
+        typeof modelOpt.currentValue === "string"
+          ? modelOpt.currentValue.trim()
+          : "";
+      if (nextRaw) {
+        const nextId = truncateChars(nextRaw, MAX_MODEL_ID_CHARS);
+        if (
+          state.allAvailableModels.length > 0 &&
+          !state.knownModelIds.has(nextId)
+        ) {
+          process.stderr.write(
+            `[hitl-channel] WARN config_option_update model '${nextId}' not in configOptions.options for session ${sessionId}; keeping '${state.currentModelId ?? "null"}'\n`,
+          );
+          return;
+        }
+        state.currentModelId = nextId;
+      }
+      state.availableModels = capAvailableModels(
+        state.allAvailableModels,
+        state.currentModelId,
+      );
+      if (sessionId === this.activeSessionId) {
+        this.broadcastModelsState(sessionId);
+      }
+      return;
+    }
+
+    if (!state && modelOpt && Array.isArray(modelOpt.options)) {
+      this.recordSessionMetadata(sessionId, { configOptions });
+      if (
+        sessionId === this.activeSessionId &&
+        this.sessionModelsMap.has(sessionId)
+      ) {
+        this.broadcastModelsState(sessionId);
+      }
+    }
+  }
+
   private handleSessionUpdate(params: AcpSessionUpdateParams): void {
     const update = params.update;
     if (!update || typeof update !== "object") return;
+
+    if (update.sessionUpdate === "available_commands_update") {
+      this.handleAvailableCommandsUpdate(
+        params.sessionId,
+        update.availableCommands,
+      );
+      return;
+    }
+
+    if (update.sessionUpdate === "config_option_update") {
+      this.handleConfigOptionUpdate(params.sessionId, update.configOptions);
+      return;
+    }
 
     if (this.loadingSessionIds.has(params.sessionId)) {
       const capture = this.replayCaptureBuffers.get(params.sessionId);
@@ -2269,6 +2867,10 @@ export class AcpSessionManager {
     this.loadingSessionIds.clear();
     this.seenToolCalls.clear();
     this.instructionsDeliveredSessions.clear();
+    this.sessionModelsMap.clear();
+    this.sessionCommandsMap.clear();
+    this.sessionModelsMap.clear();
+    this.sessionCommandsMap.clear();
 
     if (prevSessionId !== null) {
       this.broadcastSessionChange();
@@ -2723,6 +3325,7 @@ export class AcpSessionManager {
           cwd: absCwd,
           updatedAt: new Date(this.nowMs()).toISOString(),
         });
+        this.recordSessionMetadata(res.sessionId, res);
         this.broadcastSessionChange();
         this.sendStandaloneReply(
           `▶ New ${this.harness.name} session in \`${absCwd}\` (id ${res.sessionId})`,
@@ -2859,11 +3462,12 @@ export class AcpSessionManager {
         // Suppress history replay notifications emitted synchronously during both
         // session/load and session/resume (Hermes streams replay inside resume_session).
         this.loadingSessionIds.add(sessionId);
+        let resumeOrLoadRes: Record<string, unknown>;
         try {
           if (supportsResume) {
-            await client.sessionResume(resumeParams);
+            resumeOrLoadRes = await client.sessionResume(resumeParams);
           } else {
-            await client.sessionLoad(resumeParams);
+            resumeOrLoadRes = await client.sessionLoad(resumeParams);
           }
         } finally {
           this.loadingSessionIds.delete(sessionId);
@@ -2880,6 +3484,7 @@ export class AcpSessionManager {
           ...(resolved?.title ? { title: resolved.title } : {}),
           updatedAt: new Date(this.nowMs()).toISOString(),
         });
+        this.recordSessionMetadata(sessionId, resumeOrLoadRes);
         this.broadcastSessionChange();
         this.sendStandaloneReply(`▶ Resumed \`${title}\``, sessionId);
         return { acpSessionId: sessionId };
@@ -2926,6 +3531,7 @@ export class AcpSessionManager {
           cwd: this.defaultCwd,
           updatedAt: new Date(this.nowMs()).toISOString(),
         });
+        this.recordSessionMetadata(res.sessionId, res);
         this.broadcastSessionChange();
         this.sendStandaloneReply(
           `▶ Auto-created ${this.harness.name} session in \`${this.defaultCwd}\` (id ${res.sessionId})`,
@@ -3249,6 +3855,8 @@ export class AcpSessionManager {
     this.loadingSessionIds.clear();
     this.seenToolCalls.clear();
     this.instructionsDeliveredSessions.clear();
+    this.sessionModelsMap.clear();
+    this.sessionCommandsMap.clear();
 
     if (hadActiveWork) {
       this.emitTurnState({
