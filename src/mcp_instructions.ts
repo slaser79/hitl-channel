@@ -37,9 +37,19 @@ export const DAEMON_REPLY_ORDERS = [
   "Do not use `human-in-the-loop` or cloud relay tools to talk to this user, because this chat is already the channel.",
 ].join(" ");
 
+export const DAEMON_PEER_ORCHESTRATION_ORDERS = [
+  "To collaborate with phone agents, use the five typed peer tools instead of `call_phone_tool('dispatch_agent' | 'message_agent')`:",
+  "`list_phone_agents` discovers available phone specialists;",
+  "`run_phone_agent` runs a phone specialist synchronously;",
+  "`dispatch_phone_agent` starts an async phone run (completions wake your session automatically);",
+  "`message_phone_agent` sends a mid-run message to `to: 'parent'` or a sibling `run_id`;",
+  "`get_phone_run` inspects a dispatched run's status and output.",
+].join(" ");
+
 export const DAEMON_INSTRUCTIONS = [
   PHONE_TOOL_STANDING_ORDERS,
   DAEMON_REPLY_ORDERS,
+  DAEMON_PEER_ORCHESTRATION_ORDERS,
 ].join(" ");
 
 // Phase 3 (issue slaser79/hitl-app#4010) — final-reply ceremony for

@@ -93,12 +93,28 @@ async function verifyChannelBoot(entryRelPath: string): Promise<void> {
   }
 }
 
+const PEER_TOOL_NAMES = [
+  "list_phone_agents",
+  "run_phone_agent",
+  "dispatch_phone_agent",
+  "message_phone_agent",
+  "get_phone_run",
+];
+
 describe("AV1 & AV7 — Channel mode snapshot parity and daemon tool/instruction contract", () => {
-  it("AV1: channel mode tools/list output is byte-identical to pre-refactor snapshot", async () => {
+  it("AV1: channel mode original 7 tools/list output is byte-identical to pre-refactor snapshot plus 5 O(1) peer tools", async () => {
     const handler = (mcp as any)._requestHandlers.get("tools/list");
     expect(handler).toBeDefined();
     const res = await handler({ method: "tools/list", params: {} });
-    expect(JSON.stringify(res.tools)).toBe(JSON.stringify(snapshot.tools));
+    expect(res.tools.length).toBe(snapshot.tools.length + PEER_TOOL_NAMES.length);
+    expect(JSON.stringify(res.tools.slice(0, snapshot.tools.length))).toBe(
+      JSON.stringify(snapshot.tools),
+    );
+    expect(
+      (res.tools as Array<{ name: string }>)
+        .slice(snapshot.tools.length)
+        .map((t) => t.name),
+    ).toEqual(PEER_TOOL_NAMES);
   });
 
   it("AV1: channel mode MCP_INSTRUCTIONS and STANDING_ORDERS are byte-identical to snapshot", () => {
@@ -106,7 +122,7 @@ describe("AV1 & AV7 — Channel mode snapshot parity and daemon tool/instruction
     expect(STANDING_ORDERS).toBe(snapshot.standingOrders);
   });
 
-  it("AV7: daemon mode registers exact 7 tools with matching descriptions except reply_to_hitl daemon suffix", async () => {
+  it("AV7: daemon mode registers original 7 tools + 5 typed peer tools with matching descriptions except reply_to_hitl daemon suffix", async () => {
     const daemonMcp = new Server(
       { name: "hitl-channel", version: "0.1.0" },
       { capabilities: { tools: {} } },
@@ -124,8 +140,9 @@ describe("AV1 & AV7 — Channel mode snapshot parity and daemon tool/instruction
       "call_phone_tool",
       "push_file",
       "present_questions_to_hitl",
+      ...PEER_TOOL_NAMES,
     ]);
-    expect(daemonTools.length).toBe(snapshot.tools.length);
+    expect(daemonTools.length).toBe(snapshot.tools.length + PEER_TOOL_NAMES.length);
 
     for (let i = 0; i < snapshot.tools.length; i++) {
       const ch = snapshot.tools[i]!;
@@ -141,7 +158,9 @@ describe("AV1 & AV7 — Channel mode snapshot parity and daemon tool/instruction
       }
     }
 
-    expect(getHitlToolDefinitions("channel") as unknown[]).toEqual(snapshot.tools);
+    expect(
+      (getHitlToolDefinitions("channel") as unknown[]).slice(0, snapshot.tools.length),
+    ).toEqual(snapshot.tools);
   });
 
   it("AV7: DAEMON_INSTRUCTIONS omits inbound message_id reply instruction and Claude Code version requirement", () => {

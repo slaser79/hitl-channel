@@ -98,10 +98,21 @@ if (process.env.BUN_ENV !== "test" && process.env.NODE_ENV !== "test") {
   // SPEC-HITL-CC-001 §4.2 — best-effort audit retention prune at startup.
   void pruneOldAuditFiles();
 
+  const channelCapabilities = {
+    sessions: false,
+    streaming: false,
+    choicesId: true,
+    models: false,
+    commands: false,
+    peerOrchestration: false,
+    concurrentSessions: false,
+  };
+
   // Start mDNS advertising
   startMDNS(PORT, identity.instanceId, identity.displayName, {
     mode: "channel",
     harness: "claude-code",
+    capabilities: channelCapabilities,
   });
 
   // Start periodic cleanup of expired pairing codes (every minute)
@@ -114,13 +125,7 @@ if (process.env.BUN_ENV !== "test" && process.env.NODE_ENV !== "test") {
   httpServer = startHttpBridge(mcp, {
     mode: "channel",
     harness: "claude-code",
-    capabilities: {
-      sessions: false,
-      streaming: false,
-      choicesId: true,
-      models: false,
-      commands: false,
-    },
+    capabilities: channelCapabilities,
   });
 
   // Belt-and-braces: if stdin already reached end while we were awaiting the

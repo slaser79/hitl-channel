@@ -25,7 +25,9 @@ import {
 import type {
   HitlAttachment,
   ListToolsResultFrame,
+  ToolCallOrigin,
   ToolCallResultFrame,
+  WorkerSessionContext,
 } from "./types.js";
 import {
   PRESENT_QUESTIONS_TOOL_DEFINITION,
@@ -39,6 +41,22 @@ export interface RegisterHitlToolsOptions {
   requestAcpSessionId?: string | null;
   getFallbackAcpSessionId?: () => string | null;
   getFallbackTurnId?: () => string | null;
+  getWorkerContext?: (acpSessionId: string) => WorkerSessionContext | null;
+  onWorkerReply?: (
+    acpSessionId: string,
+    text: string,
+    attachments?: HitlAttachment[],
+  ) => boolean;
+  onWorkerChoices?: (
+    acpSessionId: string,
+    prompt: string,
+    choices: string[],
+    multiSelect: boolean,
+  ) => { handled: boolean; frameId?: string };
+  onWorkerQuestions?: (
+    acpSessionId: string,
+    args: Record<string, unknown>,
+  ) => { handled: boolean; requestId?: string; error?: string };
   onChoicesPresented?: (choiceId: string) => void;
   onReplySent?: (acpSessionId?: string | null) => void;
 }
@@ -445,6 +463,139 @@ export function getHitlToolDefinitions(mode: HitlToolsMode) {
     },
     // ─── SPEC-HC-004 ─────────────────────────────────────────────────────
     PRESENT_QUESTIONS_TOOL_DEFINITION,
+    // ─── SPEC-HITL-APP-10832 Phase 1a (O(1) typed peer MCP tools) ───────
+    {
+      name: "list_phone_agents",
+      description:
+        "List installed phone agents available on the paired HITL phone " +
+        "(researchers, coordinators, specialists) along with capability metadata. " +
+        "Use this before calling run_phone_agent or dispatch_phone_agent.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Optional substring filter on agent id, name, or description.",
+          },
+          limit: {
+            type: "number",
+            description: "Optional max number of agents to return.",
+          },
+          device: {
+            type: "string",
+            description: "Optional device token hash or device ID to target a specific connected phone.",
+          },
+        },
+      },
+    },
+    {
+      name: "run_phone_agent",
+      description:
+        "Run an installed phone agent synchronously on the paired HITL phone " +
+        "and wait for its final output.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          agent_id: {
+            type: "string",
+            description: "Target phone agent ID or slug (from list_phone_agents).",
+          },
+          input: {
+            type: "string",
+            description: "Task prompt or instruction for the phone agent.",
+          },
+          timeout_seconds: {
+            type: "number",
+            description: "Round-trip timeout in seconds. Default 120, hard cap 300.",
+          },
+          device: {
+            type: "string",
+            description: "Optional device token hash or device ID to target a specific connected phone.",
+          },
+        },
+        required: ["agent_id", "input"],
+      },
+    },
+    {
+      name: "dispatch_phone_agent",
+      description:
+        "Dispatch an installed phone agent asynchronously in the background. " +
+        "Returns immediately with { run_id, status: 'queued' }. In daemon mode, " +
+        "completion wakes this session automatically; in channel mode, poll with get_phone_run(run_id).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          agent_id: {
+            type: "string",
+            description: "Target phone agent ID or slug (from list_phone_agents).",
+          },
+          input: {
+            type: "string",
+            description: "Task prompt or instruction for the phone agent.",
+          },
+          label: {
+            type: "string",
+            description: "Optional short display label shown in Live Work.",
+          },
+          share_data_scope: {
+            type: "boolean",
+            description: "Optional flag to inherit caller data scope.",
+          },
+          device: {
+            type: "string",
+            description: "Optional device token hash or device ID to target a specific connected phone.",
+          },
+        },
+        required: ["agent_id", "input"],
+      },
+    },
+    {
+      name: "message_phone_agent",
+      description:
+        "Send a non-blocking message to your dispatching phone supervisor ('parent') " +
+        "or an in-tree sibling run_id. Supported only in ACP daemon mode.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          to: {
+            type: "string",
+            description: "Recipient: 'parent' for dispatching supervisor, or a sibling run_id.",
+          },
+          text: {
+            type: "string",
+            description: "Non-empty message body.",
+          },
+          device: {
+            type: "string",
+            description: "Optional device token hash or device ID to target a specific connected phone.",
+          },
+        },
+        required: ["to", "text"],
+      },
+    },
+    {
+      name: "get_phone_run",
+      description:
+        "Inspect the current status and output of a dispatched phone agent run by run_id.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          run_id: {
+            type: "string",
+            description: "Dispatched run_id returned by dispatch_phone_agent.",
+          },
+          all_agents: {
+            type: "boolean",
+            description: "Optional flag to inspect runs across agents if authorized.",
+          },
+          device: {
+            type: "string",
+            description: "Optional device token hash or device ID to target a specific connected phone.",
+          },
+        },
+        required: ["run_id"],
+      },
+    },
   ];
 }
 
@@ -493,10 +644,18 @@ export function registerHitlTools(
         `[hitl-channel] Reply: ${text} (msg: ${messageId}, agent: ${agentId}, attachments: ${attachmentCount})\n`
       );
 
-      broadcastReply(text, messageId, agentId, attachments, {
-        acpSessionId: options.mode === "daemon" ? acpSessionId : undefined,
-        ...(options.mode === "daemon" && turnId ? { turnId } : {}),
-      });
+      const handledByWorker =
+        options.mode === "daemon" &&
+        typeof acpSessionId === "string" &&
+        acpSessionId.length > 0 &&
+        options.onWorkerReply?.(acpSessionId, text, attachments) === true;
+
+      if (!handledByWorker) {
+        broadcastReply(text, messageId, agentId, attachments, {
+          acpSessionId: options.mode === "daemon" ? acpSessionId : undefined,
+          ...(options.mode === "daemon" && turnId ? { turnId } : {}),
+        });
+      }
       options.onReplySent?.(acpSessionId);
       const identity = await getIdentity();
       appendAudit({
@@ -565,6 +724,48 @@ export function registerHitlTools(
       process.stderr.write(
         `[hitl-channel] Choices: ${prompt} [${choices.join(", ")}] (multi: ${multiSelect ?? false})\n`
       );
+
+      if (
+        options.mode === "daemon" &&
+        typeof acpSessionId === "string" &&
+        acpSessionId.length > 0
+      ) {
+        const workerChoiceResult = options.onWorkerChoices?.(
+          acpSessionId,
+          prompt,
+          choices,
+          multiSelect ?? false,
+        );
+        if (workerChoiceResult?.handled) {
+          const identity = await getIdentity();
+          appendAudit({
+            ts: new Date().toISOString(),
+            instance_id: identity.instanceId,
+            direction: "cc_to_phone",
+            kind: "choices",
+            tool_name: null,
+            approval: null,
+            prompt_hash: sha256Hex(prompt ?? ""),
+            duration_ms: null,
+            attachment_count: 0,
+            attachment_bytes: 0,
+            device_id: null,
+            ...acpAuditField,
+          }).catch((err) =>
+            process.stderr.write(
+              `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
+            )
+          );
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Choices presented to user: ${choices.join(", ")}`,
+              },
+            ],
+          };
+        }
+      }
 
       const frameId = `c${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const frame: Record<string, unknown> = {
@@ -695,6 +896,26 @@ export function registerHitlTools(
     }
 
     if (req.params.name === "call_phone_tool") {
+      const name = args.name as string | undefined;
+      if (name === "dispatch_agent" || name === "message_agent") {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  success: false,
+                  error: "use_typed_peer_tool",
+                  message: `Raw call_phone_tool('${name}') is disabled. Use '${name === "dispatch_agent" ? "dispatch_phone_agent" : "message_phone_agent"}' instead.`,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
       if (clients.size === 0) {
         return {
           isError: true,
@@ -706,7 +927,6 @@ export function registerHitlTools(
           ],
         };
       }
-      const name = args.name as string | undefined;
       if (!name || typeof name !== "string") {
         return {
           isError: true,
@@ -1240,6 +1460,50 @@ export function registerHitlTools(
 
     if (req.params.name === "present_questions_to_hitl") {
       const identity = await getIdentity();
+      if (
+        options.mode === "daemon" &&
+        typeof acpSessionId === "string" &&
+        acpSessionId.length > 0
+      ) {
+        const workerQResult = options.onWorkerQuestions?.(acpSessionId, args);
+        if (workerQResult?.handled) {
+          if (workerQResult.error) {
+            return {
+              isError: true,
+              content: [{ type: "text" as const, text: workerQResult.error }],
+            };
+          }
+          appendAudit({
+            ts: new Date().toISOString(),
+            instance_id: identity.instanceId,
+            direction: "cc_to_phone",
+            kind: "questions_batch",
+            tool_name: null,
+            approval: null,
+            prompt_hash: sha256Hex(stableStringify(args.questions ?? null)),
+            duration_ms: null,
+            attachment_count: 0,
+            attachment_bytes: 0,
+            device_id: null,
+            ...acpAuditField,
+          }).catch((err) =>
+            process.stderr.write(
+              `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`
+            )
+          );
+          const qCount = Array.isArray(args.questions) ? args.questions.length : 0;
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `Survey presented to user (${qCount} question${qCount === 1 ? "" : "s"}, ` +
+                  `request_id=${workerQResult.requestId ?? "unknown"}).`,
+              },
+            ],
+          };
+        }
+      }
       return presentQuestionsToHitl(args, {
         correlator,
         unicastFrame,
@@ -1248,6 +1512,390 @@ export function registerHitlTools(
         generateRequestId,
         ...(acpSessionId !== undefined ? { acpSessionId } : {}),
       });
+    }
+
+    if (
+      req.params.name === "list_phone_agents" ||
+      req.params.name === "run_phone_agent" ||
+      req.params.name === "dispatch_phone_agent" ||
+      req.params.name === "message_phone_agent" ||
+      req.params.name === "get_phone_run"
+    ) {
+      const toolName = req.params.name;
+      let origin: ToolCallOrigin;
+
+      if (options.mode === "channel") {
+        if (toolName === "message_phone_agent") {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    error: "unsupported_in_channel_mode",
+                    message:
+                      "message_phone_agent is only supported in ACP daemon mode.",
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        origin = {
+          acp_session_id: null,
+          mode: "channel",
+        };
+      } else {
+        const boundSessionId =
+          typeof options.requestAcpSessionId === "string" &&
+          options.requestAcpSessionId.length > 0
+            ? options.requestAcpSessionId
+            : null;
+        if (!boundSessionId) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    error: "missing_session_binding",
+                    message:
+                      "Daemon peer tool call is missing a valid bound ACP session (mcpBindingId).",
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        const workerCtx = options.getWorkerContext?.(boundSessionId) ?? null;
+        origin = {
+          acp_session_id: boundSessionId,
+          mode: "daemon",
+          ...(workerCtx
+            ? {
+                run_id: workerCtx.runId,
+                parent_run_id: workerCtx.parentRunId ?? null,
+                episode_root_run_id: workerCtx.episodeRootRunId ?? null,
+                dispatch_depth: workerCtx.dispatchDepth,
+                message_hop: workerCtx.messageHop,
+              }
+            : {}),
+        };
+      }
+
+      let toolArgs: Record<string, unknown> = {};
+      let defaultTimeout = 60;
+      if (toolName === "list_phone_agents") {
+        defaultTimeout = 30;
+        if (typeof args.query === "string" && args.query.trim().length > 0) {
+          toolArgs.query = args.query.trim();
+        }
+        if (typeof args.limit === "number" && Number.isFinite(args.limit)) {
+          toolArgs.limit = args.limit;
+        }
+      } else if (toolName === "run_phone_agent") {
+        defaultTimeout = 120;
+        const agentId =
+          typeof args.agent_id === "string" ? args.agent_id.trim() : "";
+        const rawInput =
+          typeof args.input === "string"
+            ? args.input
+            : typeof args.prompt === "string"
+              ? args.prompt
+              : "";
+        if (!agentId || !rawInput.trim()) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    error: "missing_parameter",
+                    message: "run_phone_agent requires `agent_id` and `input`.",
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        toolArgs = { agent_id: agentId, input: rawInput };
+      } else if (toolName === "dispatch_phone_agent") {
+        defaultTimeout = 60;
+        const agentId =
+          typeof args.agent_id === "string" ? args.agent_id.trim() : "";
+        const rawInput =
+          typeof args.input === "string"
+            ? args.input
+            : typeof args.prompt === "string"
+              ? args.prompt
+              : "";
+        if (!agentId || !rawInput.trim()) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    error: "missing_parameter",
+                    message:
+                      "dispatch_phone_agent requires `agent_id` and `input`.",
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        toolArgs = {
+          agent_id: agentId,
+          input: rawInput,
+          ...(typeof args.label === "string" && args.label.trim().length > 0
+            ? { label: args.label.trim() }
+            : {}),
+          ...(typeof args.share_data_scope === "boolean"
+            ? { share_data_scope: args.share_data_scope }
+            : {}),
+        };
+      } else if (toolName === "message_phone_agent") {
+        defaultTimeout = 60;
+        const to = typeof args.to === "string" ? args.to.trim() : "";
+        const rawText =
+          typeof args.text === "string"
+            ? args.text
+            : typeof args.message === "string"
+              ? args.message
+              : "";
+        if (!to || !rawText.trim()) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    error: "missing_parameter",
+                    message: "message_phone_agent requires `to` and `text`.",
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        toolArgs = { to, text: rawText };
+      } else if (toolName === "get_phone_run") {
+        defaultTimeout = 30;
+        const runId = typeof args.run_id === "string" ? args.run_id.trim() : "";
+        if (!runId) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    error: "missing_parameter",
+                    message: "get_phone_run requires `run_id`.",
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        toolArgs = {
+          run_id: runId,
+          ...(typeof args.all_agents === "boolean"
+            ? { all_agents: args.all_agents }
+            : {}),
+        };
+      }
+
+      if (clients.size === 0) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: "No paired HITL phone is currently connected.",
+            },
+          ],
+        };
+      }
+
+      const rawTimeout = Number(args.timeout_seconds ?? defaultTimeout);
+      const timeoutSeconds = Math.min(
+        300,
+        Math.max(1, Number.isFinite(rawTimeout) ? rawTimeout : defaultTimeout),
+      );
+      const targetDevice = args.device as string | undefined;
+      const identity = await getIdentity();
+      const requestId = generateRequestId();
+      const frame = {
+        type: "tool_call_request" as const,
+        request_id: requestId,
+        name: toolName,
+        arguments: toolArgs,
+        timeout_seconds: timeoutSeconds,
+        cc_instance_id: identity.instanceId,
+        origin,
+      };
+      const startedAt = Date.now();
+      const peerAuditField =
+        origin.acp_session_id !== null
+          ? { acp_session_id: origin.acp_session_id }
+          : {};
+
+      const unicastResult = unicastCorrelatedFrame<ToolCallResultFrame>(
+        frame,
+        requestId,
+        timeoutSeconds * 1000,
+        targetDevice,
+      );
+      if (!unicastResult.delivered) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `${toolName} failed: ${unicastResult.error ?? "no_phone_connected"}`,
+            },
+          ],
+        };
+      }
+
+      appendAudit({
+        ts: new Date(startedAt).toISOString(),
+        instance_id: identity.instanceId,
+        direction: "cc_calls_phone",
+        kind: "tool_call",
+        tool_name: toolName,
+        approval: null,
+        prompt_hash: sha256Hex(stableStringify(toolArgs)),
+        duration_ms: null,
+        attachment_count: 0,
+        attachment_bytes: 0,
+        device_id: unicastResult.targetDevice ?? null,
+        ...peerAuditField,
+      }).catch((err) =>
+        process.stderr.write(
+          `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`,
+        ),
+      );
+
+      try {
+        const result = await unicastResult.waiter;
+        const duration = Date.now() - startedAt;
+        const { count: attachmentCount, bytes: attachmentBytes } =
+          summariseAttachments((result as { attachments?: unknown }).attachments);
+        appendAudit({
+          ts: new Date().toISOString(),
+          instance_id: identity.instanceId,
+          direction: "phone_returns_to_cc",
+          kind: "tool_result",
+          tool_name: toolName,
+          approval: result.approval ?? null,
+          prompt_hash: sha256Hex(stableStringify(result.output ?? null)),
+          duration_ms: duration,
+          attachment_count: attachmentCount,
+          attachment_bytes: attachmentBytes,
+          device_id: unicastResult.targetDevice ?? null,
+          ...peerAuditField,
+        }).catch((err) =>
+          process.stderr.write(
+            `[hitl-channel] audit failed: ${err instanceof Error ? err.message : err}\n`,
+          ),
+        );
+
+        if (result.success === false) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    data: result.data ?? null,
+                    error: result.error ?? "unknown_error",
+                    approval: result.approval ?? null,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  success: true,
+                  output: result.output ?? null,
+                  data: result.data ?? null,
+                  approval: result.approval ?? null,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        const duration = Date.now() - startedAt;
+        const msg = err instanceof Error ? err.message : String(err);
+        appendAudit({
+          ts: new Date().toISOString(),
+          instance_id: identity.instanceId,
+          direction: "phone_returns_to_cc",
+          kind: "tool_result",
+          tool_name: toolName,
+          approval: msg.includes("timeout") ? "timeout" : null,
+          prompt_hash: sha256Hex(stableStringify(toolArgs)),
+          duration_ms: duration,
+          attachment_count: 0,
+          attachment_bytes: 0,
+          device_id: unicastResult.targetDevice ?? null,
+          ...peerAuditField,
+        }).catch((auditErr) =>
+          process.stderr.write(
+            `[hitl-channel] audit failed: ${auditErr instanceof Error ? auditErr.message : auditErr}\n`,
+          ),
+        );
+
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `${toolName} failed: ${msg}`,
+            },
+          ],
+        };
+      }
     }
 
     throw new Error(`Unknown tool: ${req.params.name}`);

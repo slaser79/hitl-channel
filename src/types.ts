@@ -66,6 +66,26 @@ export interface HitlWebSocket {
 // are JSON text frames on the existing `/ws` endpoint and co-exist with the
 // pre-existing `reply` / `choices` shapes.
 
+export interface InstanceCapabilities {
+  sessions: boolean;
+  streaming: boolean;
+  choicesId: boolean;
+  models?: boolean;
+  commands?: boolean;
+  peerOrchestration?: boolean;
+  concurrentSessions?: boolean;
+}
+
+export interface ToolCallOrigin {
+  acp_session_id: string | null;
+  run_id?: string | null;
+  parent_run_id?: string | null;
+  episode_root_run_id?: string | null;
+  dispatch_depth?: number;
+  message_hop?: number;
+  mode: "daemon" | "channel";
+}
+
 export interface ToolCallRequestFrame {
   type: "tool_call_request";
   request_id: string;
@@ -73,6 +93,7 @@ export interface ToolCallRequestFrame {
   arguments: Record<string, unknown>;
   timeout_seconds: number;
   cc_instance_id: string;
+  origin?: ToolCallOrigin;
 }
 
 export interface ToolCallResultFrame {
@@ -349,4 +370,108 @@ export interface BufferedReply {
   raw: string;
   /** Wall-clock ms epoch when push() was called. Used for TTL + drain age. */
   queuedAt: number;
+}
+
+// ─── SPEC-HITL-APP-10832 Phase 1a — Two-Way Peer Orchestration frames ─────
+
+export interface HostRunStartFrame {
+  type: "host_run_start";
+  run_id: string;
+  prompt: string;
+  cwd?: string;
+  acp_session_id?: string;
+  external_session_key?: string;
+  parent_run_id?: string | null;
+  episode_root_run_id?: string | null;
+  dispatch_depth: number;
+  message_hop: number;
+  request_id?: string;
+}
+
+export interface HostRunMessageFrame {
+  type: "host_run_message";
+  run_id: string;
+  acp_session_id?: string;
+  event_id: string;
+  kind: "agent_message" | "permission_response";
+  text?: string;
+  sender_agent_id?: string;
+  sender_name?: string;
+  message_hop?: number;
+  choices_id?: string;
+  option_id?: string;
+}
+
+export interface HostRunCancelFrame {
+  type: "host_run_cancel";
+  run_id: string;
+  acp_session_id?: string;
+  reason?: string;
+}
+
+export interface HostRunAckFrame {
+  type: "host_run_ack";
+  event_id?: string;
+  run_id?: string;
+  acp_session_id?: string;
+}
+
+export interface PhoneRunWakeFrame {
+  type: "phone_run_wake";
+  event_id: string;
+  run_id: string;
+  acp_session_id: string;
+  status: "completed" | "failed" | "paused" | "agent_message";
+  output?: string;
+  error?: string;
+  sender_agent_id?: string;
+  sender_name?: string;
+  message_hop?: number;
+}
+
+export type HostRunEventKind =
+  | "started"
+  | "agent_message"
+  | "permission_request"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "outbox_compacted";
+
+export interface HostRunEventOption {
+  optionId: string;
+  name: string;
+  kind: string;
+}
+
+export interface HostRunEventFrame {
+  type: "host_run_event";
+  event_id: string;
+  run_id: string;
+  acp_session_id: string;
+  kind: HostRunEventKind;
+  pinned?: boolean;
+  text?: string;
+  output?: string;
+  output_truncated?: boolean;
+  original_bytes?: number;
+  error?: string;
+  reason?: string;
+  dropped_count?: number;
+  choices_id?: string;
+  tool_name?: string;
+  prompt?: string;
+  options?: HostRunEventOption[];
+  ts: string;
+}
+
+export interface WorkerSessionContext {
+  runId: string;
+  acpSessionId: string;
+  parentRunId: string | null;
+  episodeRootRunId: string | null;
+  dispatchDepth: number;
+  messageHop: number;
+  externalSessionKey?: string;
+  cwd: string;
 }
