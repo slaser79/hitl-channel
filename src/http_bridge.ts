@@ -1,7 +1,7 @@
 import { basename, join, resolve } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { sendChannelNotification } from "./notification.js";
-import { HitlAttachment, HitlMessage, HitlWebSocket, HitlWebSocketData, ReplyPayload, ToolStepSummary } from "./types.js";
+import { HitlAttachment, HitlMessage, HitlWebSocket, HitlWebSocketData, InstanceCapabilities, ReplyPayload, ToolStepSummary } from "./types.js";
 import { createPairingRequest, consumePairingCode, validatePairingCode } from "./pairing.js";
 import { addToAllowlist, isTokenAllowed, hashToken } from "./allowlist.js";
 import { getIdentity } from "./identity.js";
@@ -531,13 +531,7 @@ export interface InboundHandlers {
   onControlFrame?(ws: HitlWebSocket, frame: Record<string, unknown>): void | Promise<void>;
 }
 
-export interface InstanceCapabilities {
-  sessions: boolean;
-  streaming: boolean;
-  choicesId: boolean;
-  models?: boolean;
-  commands?: boolean;
-}
+export type { InstanceCapabilities };
 
 export interface HttpBridgeOptions {
   port?: number;
@@ -750,6 +744,8 @@ export function startHttpBridge(
     choicesId: opts?.capabilities?.choicesId ?? true,
     models: opts?.capabilities?.models ?? false,
     commands: opts?.capabilities?.commands ?? false,
+    peerOrchestration: opts?.capabilities?.peerOrchestration ?? (mode === "daemon"),
+    concurrentSessions: opts?.capabilities?.concurrentSessions ?? false,
   };
   const handlers: InboundHandlers = isDaemon
     ? target
@@ -1039,7 +1035,12 @@ export function startHttpBridge(
             frameType === "session_new" ||
             frameType === "session_resume" ||
             frameType === "cancel_turn" ||
-            frameType === "session_set_model"
+            frameType === "session_set_model" ||
+            frameType === "host_run_start" ||
+            frameType === "host_run_message" ||
+            frameType === "host_run_cancel" ||
+            frameType === "host_run_ack" ||
+            frameType === "phone_run_wake"
           ) {
             if (handlers.onControlFrame) {
               void Promise.resolve(handlers.onControlFrame(typedWs, data)).catch((err) => {

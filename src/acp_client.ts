@@ -648,6 +648,10 @@ export class AcpClient {
     return this.request("session/set_config_option", params);
   }
 
+  async closeSession(sessionId: string): Promise<Record<string, unknown>> {
+    return this.request("session/close", { sessionId });
+  }
+
   async sessionPrompt(params: {
     sessionId: string;
     prompt: AcpContentBlock[];

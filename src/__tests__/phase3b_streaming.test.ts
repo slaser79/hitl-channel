@@ -1052,6 +1052,8 @@ describe("SPEC-HITL-APP-10827 Milestone 3b AV10: live streaming, tool progress, 
         choicesId: boolean;
         models?: boolean;
         commands?: boolean;
+        peerOrchestration?: boolean;
+        concurrentSessions?: boolean;
       };
     };
     expect(instJson.capabilities).toEqual({
@@ -1060,6 +1062,8 @@ describe("SPEC-HITL-APP-10827 Milestone 3b AV10: live streaming, tool progress, 
       choicesId: true,
       models: true,
       commands: true,
+      peerOrchestration: true,
+      concurrentSessions: true,
     });
 
     // 2. Connect streaming WS and legacy WS

@@ -7,6 +7,7 @@
  */
 
 import type { Bonjour, Service } from "bonjour-service";
+import type { InstanceCapabilities } from "./types.js";
 
 let bonjour: Bonjour | null = null;
 let advertisedService: Service | null = null;
@@ -14,6 +15,7 @@ let advertisedService: Service | null = null;
 export interface MdnsMeta {
   mode?: string;
   harness?: string;
+  capabilities?: Partial<InstanceCapabilities>;
 }
 
 /**
@@ -46,6 +48,15 @@ export function startMDNS(
     }
     if (meta?.harness) {
       txt.harness = meta.harness;
+    }
+    if (meta?.capabilities) {
+      const caps: Record<string, boolean> = {};
+      for (const [k, v] of Object.entries(meta.capabilities)) {
+        if (typeof v === "boolean") {
+          caps[k] = v;
+        }
+      }
+      txt.capabilities = JSON.stringify(caps);
     }
 
     advertisedService = bonjour.publish({

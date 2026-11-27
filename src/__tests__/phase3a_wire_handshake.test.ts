@@ -140,6 +140,8 @@ describe("SPEC-HITL-APP-10827 Milestone 3a AV1: /instance, mDNS, client_hello fe
       choicesId: true,
       models: false,
       commands: false,
+      peerOrchestration: false,
+      concurrentSessions: false,
     });
     expect("defaultCwd" in channelInst!).toBe(false);
 
@@ -169,6 +171,8 @@ describe("SPEC-HITL-APP-10827 Milestone 3a AV1: /instance, mDNS, client_hello fe
       choicesId: true,
       models: true,
       commands: true,
+      peerOrchestration: true,
+      concurrentSessions: true,
     });
     expect("defaultCwd" in daemonInst).toBe(false);
     expect(JSON.stringify(daemonInst)).not.toContain(dir);
@@ -188,6 +192,8 @@ describe("SPEC-HITL-APP-10827 Milestone 3a AV1: /instance, mDNS, client_hello fe
       choicesId: true,
       models: false,
       commands: false,
+      peerOrchestration: false,
+      concurrentSessions: false,
     });
     expect("defaultCwd" in bridgeInst).toBe(false);
   });

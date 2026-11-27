@@ -17,6 +17,7 @@ import { getHostname, getIdentity } from "./identity.js";
 import { registerHitlTools } from "./mcp_tools.js";
 import { startMDNS, stopMDNS } from "./mdns.js";
 import { cleanupExpiredPairings } from "./pairing.js";
+import type { HitlAttachment, WorkerSessionContext } from "./types.js";
 
 export interface DaemonCliArgs {
   harness: string;
@@ -131,6 +132,23 @@ export interface LoopbackMcpServerOptions {
   token?: string;
   getFallbackAcpSessionId?: () => string | null;
   getFallbackTurnId?: () => string | null;
+  resolveBoundAcpSessionId?: (bindingId: string) => string | null;
+  getWorkerContext?: (acpSessionId: string) => WorkerSessionContext | null;
+  onWorkerReply?: (
+    acpSessionId: string,
+    text: string,
+    attachments?: HitlAttachment[],
+  ) => boolean;
+  onWorkerChoices?: (
+    acpSessionId: string,
+    prompt: string,
+    choices: string[],
+    multiSelect: boolean,
+  ) => { handled: boolean; frameId?: string };
+  onWorkerQuestions?: (
+    acpSessionId: string,
+    args: Record<string, unknown>,
+  ) => { handled: boolean; requestId?: string; error?: string };
   onChoicesPresented?: (choiceId: string) => void;
   onReplySent?: (acpSessionId?: string | null) => void;
 }
@@ -212,8 +230,13 @@ export function startLoopbackMcpServer(
               })(),
             });
 
-      const requestAcpSessionId =
+      const rawBindingHeader =
         req.headers.get("x-hitl-acp-session-id")?.trim() || null;
+      const requestAcpSessionId = rawBindingHeader
+        ? opts.resolveBoundAcpSessionId
+          ? opts.resolveBoundAcpSessionId(rawBindingHeader)
+          : rawBindingHeader
+        : null;
       const mcpServer = new Server(
         { name: "hitl-channel", version: "0.1.0" },
         { capabilities: { tools: {} } },
@@ -223,6 +246,10 @@ export function startLoopbackMcpServer(
         requestAcpSessionId,
         getFallbackAcpSessionId: opts.getFallbackAcpSessionId,
         getFallbackTurnId: opts.getFallbackTurnId,
+        getWorkerContext: opts.getWorkerContext,
+        onWorkerReply: opts.onWorkerReply,
+        onWorkerChoices: opts.onWorkerChoices,
+        onWorkerQuestions: opts.onWorkerQuestions,
         onChoicesPresented: opts.onChoicesPresented,
         onReplySent: opts.onReplySent,
       });
@@ -290,6 +317,10 @@ export interface StartDaemonOptions {
   outOfTurnQuietMs?: number;
   sessionLoadTimeoutMs?: number;
   streamCoalesceMs?: number;
+  concurrentSessions?: boolean;
+  maxWorkerSessions?: number;
+  workerIdleTtlMs?: number;
+  maxWorkerProcesses?: number;
 }
 
 export interface DaemonHandle {
@@ -345,9 +376,21 @@ export async function startDaemon(
   const mcpHandle = startLoopbackMcpServer({
     getFallbackAcpSessionId: () => manager.getAttributionSessionId(),
     getFallbackTurnId: () => manager.getActiveTurnId(),
+    resolveBoundAcpSessionId: (bindingId) =>
+      manager.resolveBoundAcpSessionId(bindingId),
+    getWorkerContext: (sid) => manager.getWorkerContext(sid),
+    onWorkerReply: (sid, text, atts) =>
+      manager.handleWorkerReplyTool(sid, text, atts),
+    onWorkerChoices: (sid, prompt, choices, multiSelect) =>
+      manager.handleWorkerChoicesTool(sid, prompt, choices, multiSelect),
+    onWorkerQuestions: (sid, args) =>
+      manager.handleWorkerQuestionsTool(sid, args),
     onChoicesPresented: (choiceId) => manager.onChoicesPresented(choiceId),
     onReplySent: (sid) => manager.onReplySent(sid),
   });
+
+  const concurrentSessions =
+    options.concurrentSessions ?? harnessDef.concurrentSessions;
 
   manager = new AcpSessionManager({
     harness,
@@ -360,6 +403,10 @@ export async function startDaemon(
     outOfTurnQuietMs: options.outOfTurnQuietMs,
     sessionLoadTimeoutMs: options.sessionLoadTimeoutMs,
     streamCoalesceMs: options.streamCoalesceMs,
+    concurrentSessions,
+    maxWorkerSessions: options.maxWorkerSessions,
+    workerIdleTtlMs: options.workerIdleTtlMs,
+    maxWorkerProcesses: options.maxWorkerProcesses,
     onPairingCode: async (code) => {
       process.stdout.write(`PAIRING CODE: ${code}\n`);
       if (options.enableDesktopNotifications !== false) {
@@ -369,17 +416,21 @@ export async function startDaemon(
     },
   });
 
+  const daemonCapabilities = {
+    sessions: true,
+    streaming: true,
+    choicesId: true,
+    models: true,
+    commands: true,
+    peerOrchestration: true,
+    concurrentSessions,
+  };
+
   const httpServer = startHttpBridge(manager.getInboundHandlers(), {
     port: requestedPort,
     mode: "daemon",
     harness,
-    capabilities: {
-      sessions: true,
-      streaming: true,
-      choicesId: true,
-      models: true,
-      commands: true,
-    },
+    capabilities: daemonCapabilities,
   });
   const actualPort = httpServer.port ?? requestedPort;
 
@@ -388,6 +439,7 @@ export async function startDaemon(
     startMDNS(actualPort, identity.instanceId, identity.displayName, {
       mode: "daemon",
       harness,
+      capabilities: daemonCapabilities,
     });
   }
 

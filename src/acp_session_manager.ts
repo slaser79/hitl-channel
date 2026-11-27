@@ -33,6 +33,7 @@ import {
   type InboundMessage,
 } from "./http_bridge.js";
 import { DAEMON_INSTRUCTIONS } from "./mcp_instructions.js";
+import { WorkerOutbox } from "./reply_buffer.js";
 import type {
   ChannelModelInfo,
   ChannelSlashCommand,
@@ -40,7 +41,13 @@ import type {
   CommandsListFrame,
   HitlAttachment,
   HitlWebSocket,
+  HostRunAckFrame,
+  HostRunCancelFrame,
+  HostRunEventFrame,
+  HostRunMessageFrame,
+  HostRunStartFrame,
   ModelsStateFrame,
+  PhoneRunWakeFrame,
   RecentTurnSummary,
   SessionErrorFrame,
   SessionListEntry,
@@ -52,6 +59,7 @@ import type {
   ToolStepSummary,
   TurnStateFrame,
   TurnStateValue,
+  WorkerSessionContext,
 } from "./types.js";
 
 export type McpTransportMode = "auto" | "http" | "stdio";
@@ -72,6 +80,7 @@ export interface HarnessDefinition {
   mcpServerName: string;
   autoAllowPrefixes: string[];
   matchBareTitlePrefix: boolean;
+  concurrentSessions: boolean;
   systemPromptStrategy: SystemPromptStrategy;
   buildSystemPromptMeta?: (instructions: string) => Record<string, unknown>;
 }
@@ -87,6 +96,7 @@ export const HARNESS_REGISTRY: Record<string, HarnessDefinition> = {
     mcpServerName: "hitl-channel",
     autoAllowPrefixes: ["mcp_hitl-channel_"],
     matchBareTitlePrefix: false,
+    concurrentSessions: true,
     systemPromptStrategy: "agy_meta",
     buildSystemPromptMeta(instructions: string) {
       return {
@@ -110,6 +120,7 @@ export const HARNESS_REGISTRY: Record<string, HarnessDefinition> = {
     mcpServerName: "hitl-channel",
     autoAllowPrefixes: ["mcp.hitl-channel."],
     matchBareTitlePrefix: true,
+    concurrentSessions: true,
     systemPromptStrategy: "acp_system_prompt",
   },
   hermes: {
@@ -122,6 +133,7 @@ export const HARNESS_REGISTRY: Record<string, HarnessDefinition> = {
     mcpServerName: "hitl-channel",
     autoAllowPrefixes: ["mcp__hitl_channel__"],
     matchBareTitlePrefix: true,
+    concurrentSessions: false,
     systemPromptStrategy: "first_prompt_prefix",
   },
 };
@@ -735,6 +747,7 @@ function appendCapturedTurnChunk(
 
 interface PendingPermission {
   rpcId: string | number;
+  client: AcpClient;
   sessionId: string;
   acpSessionId: string | null;
   toolName: string;
@@ -742,6 +755,16 @@ interface PendingPermission {
   frame: Record<string, unknown>;
   options: AcpPermissionOption[];
   resolved: boolean;
+  isWorker: boolean;
+  workerRunId?: string;
+  choicesId?: string;
+}
+
+interface PendingWorkerMcpChoice {
+  choicesId: string;
+  runId: string;
+  acpSessionId: string;
+  options: Array<{ optionId: string; name: string; kind: string }>;
 }
 
 interface QueuedTurn {
@@ -749,9 +772,70 @@ interface QueuedTurn {
   isChoiceResponse: boolean;
 }
 
+interface QueuedSessionTurn {
+  prompt: string;
+  runId?: string;
+  isFollowUp?: boolean;
+}
+
+interface WorkerRunState {
+  runId: string;
+  acpSessionId: string;
+  parentRunId: string | null;
+  episodeRootRunId: string | null;
+  dispatchDepth: number;
+  messageHop: number;
+  externalSessionKey?: string;
+  cwd: string;
+  cancelled: boolean;
+  cancelReason?: string;
+  terminalEmitted: boolean;
+  ws?: HitlWebSocket;
+}
+
+interface WorkerSessionEntry {
+  sessionId: string;
+  client: AcpClient;
+  capabilities: AcpAgentCapabilities;
+  cwd: string;
+  externalSessionKey?: string;
+  createdAt: number;
+  lastActiveAt: number;
+  activeRunId: string | null;
+}
+
+interface WorkerProcessEntry {
+  id: string;
+  client: AcpClient;
+  capabilities: AcpAgentCapabilities;
+  busySessionIds: Set<string>;
+  sessionIds: Set<string>;
+  lastUsedAt: number;
+}
+
+const DEFAULT_MAX_WORKER_SESSIONS = 8;
+const DEFAULT_WORKER_IDLE_TTL_MS = 30 * 60 * 1000;
+const DEFAULT_MAX_WORKER_PROCESSES = 2;
+
+function isConcurrencyBusyError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  if (msg.includes("cancelled") || msg.includes("canceled")) return false;
+  return (
+    msg.includes("turn_busy") ||
+    msg.includes("busy") ||
+    msg.includes("concurrent") ||
+    msg.includes("already running") ||
+    msg.includes("already active") ||
+    msg.includes("in progress") ||
+    msg.includes("single turn")
+  );
+}
+
 interface RunningTurn {
   turnId: string;
   sessionId: string;
+  isWorker?: boolean;
+  workerRunId?: string;
   chunks: string[];
   delegationMessageId: string | null;
   clientMessageId: string | null;
@@ -799,6 +883,12 @@ export interface AcpSessionManagerOptions {
   streamCoalesceMs?: number;
   nowMs?: () => number;
   agyConversationsDir?: string | null;
+  concurrentSessions?: boolean;
+  maxWorkerSessions?: number;
+  workerIdleTtlMs?: number;
+  maxWorkerProcesses?: number;
+  workerOutboxPath?: string;
+  workerGcIntervalMs?: number;
 }
 
 export class AcpSessionManager {
@@ -827,6 +917,10 @@ export class AcpSessionManager {
   private readonly streamCoalesceMs: number;
   private readonly nowMs: () => number;
   private readonly agyConversationsDir: string | null;
+  private readonly concurrentSessions: boolean;
+  private readonly maxWorkerSessions: number;
+  private readonly workerIdleTtlMs: number;
+  private readonly maxWorkerProcesses: number;
 
   private client: AcpClient | null = null;
   private pendingClient: AcpClient | null = null;
@@ -840,13 +934,31 @@ export class AcpSessionManager {
   private turnBusy = false;
   private sessionOpInFlight = false;
   private runningTurn: RunningTurn | null = null;
+  private readonly runningTurns = new Map<string, RunningTurn>();
   private cancelRequestedBeforeTurn = false;
   private readonly queue: QueuedTurn[] = [];
+  private readonly sessionQueues = new Map<string, QueuedSessionTurn[]>();
   private readonly pendingPermissions: PendingPermission[] = [];
+  private readonly pendingPermissionsBySession = new Map<string, PendingPermission[]>();
+  private readonly pendingWorkerMcpChoices = new Map<string, PendingWorkerMcpChoice>();
   private readonly openUserChoiceIds = new Set<string>();
   private legacyChoiceSeq = 0;
   private permSeq = 0;
   private turnSeq = 0;
+  private workerProcessSeq = 0;
+
+  private readonly workerOutbox: WorkerOutbox;
+  private readonly mcpBindings = new Map<string, string>();
+  private readonly workerContextBySessionId = new Map<string, WorkerSessionContext>();
+  private readonly workerSessions = new Map<string, WorkerSessionEntry>();
+  private readonly workerRunsById = new Map<string, WorkerRunState>();
+  private readonly workerCreatedSessionIds = new Set<string>();
+  private readonly evictedWorkerSessionIds = new Set<string>();
+  private readonly workerProcesses: WorkerProcessEntry[] = [];
+  private readonly workerProcessWaiters: Array<() => void> = [];
+  private readonly processedInboundEventIds = new Set<string>();
+  private primarySerializesTurns = false;
+  private workerGcTimer: ReturnType<typeof setInterval> | null = null;
 
   private outOfTurnChunks: string[] = [];
   private outOfTurnSessionId: string | null = null;
@@ -865,6 +977,7 @@ export class AcpSessionManager {
   private readonly sessionModelsMap = new Map<string, SessionModelState>();
   private readonly sessionCommandsMap = new Map<string, ChannelSlashCommand[]>();
   private static readonly MAX_SEEN_TOOL_CALLS = 500;
+  private static readonly MAX_PROCESSED_INBOUND_EVENTS = 1000;
 
   private crashTimestamps: number[] = [];
   private restartStopped = false;
@@ -902,6 +1015,24 @@ export class AcpSessionManager {
         ? Math.max(0, opts.streamCoalesceMs)
         : DEFAULT_STREAM_COALESCE_MS;
     this.nowMs = opts.nowMs ?? (() => Date.now());
+    this.concurrentSessions = opts.concurrentSessions ?? def.concurrentSessions;
+    this.maxWorkerSessions = opts.maxWorkerSessions ?? DEFAULT_MAX_WORKER_SESSIONS;
+    this.workerIdleTtlMs = opts.workerIdleTtlMs ?? DEFAULT_WORKER_IDLE_TTL_MS;
+    this.maxWorkerProcesses = opts.maxWorkerProcesses ?? DEFAULT_MAX_WORKER_PROCESSES;
+    this.workerOutbox = new WorkerOutbox({
+      instanceId: this.instanceId,
+      filePath: opts.workerOutboxPath,
+      now: this.nowMs,
+    });
+    if (this.workerIdleTtlMs > 0) {
+      const intervalMs =
+        opts.workerGcIntervalMs ??
+        Math.min(60_000, Math.max(100, Math.floor(this.workerIdleTtlMs / 2)));
+      this.workerGcTimer = setInterval(() => {
+        void this.runWorkerGc();
+      }, intervalMs);
+      this.workerGcTimer.unref?.();
+    }
     if (this.harness.name !== "agy") {
       this.agyConversationsDir = null;
     } else if (opts.agyConversationsDir !== undefined) {
@@ -975,7 +1106,184 @@ export class AcpSessionManager {
       outOfTurnBufferedLength: this.outOfTurnChunks.join("").length,
       lastListingCount: this.lastListing.length,
       restartStopped: this.restartStopped,
+      workerSessionCount: this.workerSessions.size,
+      workerOutboxSize: this.workerOutbox.size(),
+      workerProcessCount: this.workerProcesses.length,
     };
+  }
+
+  private preMintMcpBindingId(): string {
+    return globalThis.crypto.randomUUID();
+  }
+
+  private bindMcpSession(mcpBindingId: string, actualAcpSessionId: string): void {
+    if (!mcpBindingId || !actualAcpSessionId) return;
+    this.mcpBindings.set(mcpBindingId, actualAcpSessionId);
+  }
+
+  resolveBoundAcpSessionId(bindingId: string): string | null {
+    return this.mcpBindings.get(bindingId) ?? null;
+  }
+
+  getWorkerContext(acpSessionId: string): WorkerSessionContext | null {
+    return this.workerContextBySessionId.get(acpSessionId) ?? null;
+  }
+
+  getWorkerOutbox(): WorkerOutbox {
+    return this.workerOutbox;
+  }
+
+  private isWorkerSession(sessionId: string): boolean {
+    return (
+      this.workerContextBySessionId.has(sessionId) ||
+      this.workerSessions.has(sessionId) ||
+      this.workerCreatedSessionIds.has(sessionId)
+    );
+  }
+
+  private emitWorkerEvent(frame: HostRunEventFrame): HostRunEventFrame {
+    const stored = this.workerOutbox.push(frame);
+    this.broadcastToCapableFn(
+      "peer_orchestration",
+      stored as unknown as Record<string, unknown>,
+    );
+    return stored;
+  }
+
+  private drainWorkerOutboxToClient(ws: HitlWebSocket): number {
+    if (!ws.data?.features?.has("peer_orchestration")) return 0;
+    const entries = this.workerOutbox.peek();
+    let sent = 0;
+    for (const entry of entries) {
+      if (ws.readyState !== 1) break;
+      try {
+        const res = ws.send(entry.raw);
+        if (typeof res === "number" && res <= 0) break;
+        sent++;
+      } catch {
+        break;
+      }
+    }
+    return sent;
+  }
+
+  handleWorkerReplyTool(
+    acpSessionId: string,
+    text: string,
+    attachments?: HitlAttachment[],
+  ): boolean {
+    const ctx = this.workerContextBySessionId.get(acpSessionId);
+    if (!ctx) return false;
+    const attSuffix =
+      attachments && attachments.length > 0
+        ? ` (${attachments.length} attachment${attachments.length === 1 ? "" : "s"}: ${attachments.map((a) => a.fileName ?? a.type).join(", ")})`
+        : "";
+    this.emitWorkerEvent({
+      type: "host_run_event",
+      event_id: globalThis.crypto.randomUUID(),
+      run_id: ctx.runId,
+      acp_session_id: acpSessionId,
+      kind: "agent_message",
+      pinned: false,
+      text: `${text}${attSuffix}`,
+      ts: new Date(this.nowMs()).toISOString(),
+    });
+    return true;
+  }
+
+  handleWorkerChoicesTool(
+    acpSessionId: string,
+    prompt: string,
+    choices: string[],
+    multiSelect: boolean,
+  ): { handled: boolean; frameId?: string } {
+    const ctx = this.workerContextBySessionId.get(acpSessionId);
+    if (!ctx) return { handled: false };
+    void multiSelect;
+    const choicesId = `perm-${Date.now()}-${++this.permSeq}-${Math.random()
+      .toString(36)
+      .slice(2, 6)}`;
+    const options = choices.map((label) => ({
+      optionId: label,
+      name: label,
+      kind: "choice",
+    }));
+    this.pendingWorkerMcpChoices.set(choicesId, {
+      choicesId,
+      runId: ctx.runId,
+      acpSessionId,
+      options,
+    });
+    this.emitWorkerEvent({
+      type: "host_run_event",
+      event_id: globalThis.crypto.randomUUID(),
+      run_id: ctx.runId,
+      acp_session_id: acpSessionId,
+      kind: "permission_request",
+      pinned: true,
+      choices_id: choicesId,
+      tool_name: "present_choices_to_hitl",
+      prompt,
+      options,
+      ts: new Date(this.nowMs()).toISOString(),
+    });
+    return { handled: true, frameId: choicesId };
+  }
+
+  handleWorkerQuestionsTool(
+    acpSessionId: string,
+    args: Record<string, unknown>,
+  ): { handled: boolean; requestId?: string; error?: string } {
+    const ctx = this.workerContextBySessionId.get(acpSessionId);
+    if (!ctx) return { handled: false };
+    const rawQuestions = args.questions;
+    if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
+      return {
+        handled: true,
+        error: "`questions` must be a non-empty array",
+      };
+    }
+    const firstQ = rawQuestions[0] as Record<string, unknown> | undefined;
+    const firstChoices = Array.isArray(firstQ?.choices)
+      ? firstQ.choices.filter((c): c is string => typeof c === "string")
+      : [];
+    const promptLines = rawQuestions
+      .map((q) => {
+        if (!q || typeof q !== "object") return "";
+        const obj = q as Record<string, unknown>;
+        const hdr = typeof obj.header === "string" ? obj.header : "Question";
+        const text = typeof obj.question === "string" ? obj.question : "";
+        return `${hdr}: ${text}`;
+      })
+      .filter(Boolean);
+    const requestId = globalThis.crypto.randomUUID();
+    const options = (firstChoices.length > 0 ? firstChoices : ["Approve", "Reject"]).map(
+      (label) => ({
+        optionId: label,
+        name: label,
+        kind: "choice",
+      }),
+    );
+    this.pendingWorkerMcpChoices.set(requestId, {
+      choicesId: requestId,
+      runId: ctx.runId,
+      acpSessionId,
+      options,
+    });
+    this.emitWorkerEvent({
+      type: "host_run_event",
+      event_id: globalThis.crypto.randomUUID(),
+      run_id: ctx.runId,
+      acp_session_id: acpSessionId,
+      kind: "permission_request",
+      pinned: true,
+      choices_id: requestId,
+      tool_name: "present_questions_to_hitl",
+      prompt: promptLines.join("\n"),
+      options,
+      ts: new Date(this.nowMs()).toISOString(),
+    });
+    return { handled: true, requestId };
   }
 
   private buildMcpServer(sessionIdHint?: string): AcpMcpServer {
@@ -1492,11 +1800,12 @@ export class AcpSessionManager {
   private async filterResumableSessions(
     sessions: AcpSessionInfo[],
   ): Promise<AcpSessionInfo[]> {
+    const nonWorker = sessions.filter((s) => !this.isWorkerSession(s.sessionId));
     const localIds = await this.readLocalAgySessionIds();
     if (localIds === null) {
-      return sessions;
+      return nonWorker;
     }
-    return sessions.filter((s) => this.isKnownLocalSession(s.sessionId, localIds));
+    return nonWorker.filter((s) => this.isKnownLocalSession(s.sessionId, localIds));
   }
 
   private async isLocallyResumableAgySession(
@@ -1526,7 +1835,9 @@ export class AcpSessionManager {
   }
 
   private buildSessionListFrame(requestId?: string): SessionListFrame {
-    const sorted = this.sortSessionsDesc(this.sessionCatalog);
+    const sorted = this.sortSessionsDesc(
+      this.sessionCatalog.filter((s) => !this.isWorkerSession(s.sessionId)),
+    );
     let capped = sorted.slice(0, MAX_SESSION_LIST_SIZE);
     if (
       this.activeSessionId &&
@@ -1834,6 +2145,9 @@ export class AcpSessionManager {
         }
       }
     }
+    if (ws.data?.features?.has("peer_orchestration")) {
+      this.drainWorkerOutboxToClient(ws);
+    }
   }
 
   private async handleControlFrame(
@@ -1912,6 +2226,31 @@ export class AcpSessionManager {
 
     if (frameType === "session_set_model") {
       await this.handleWsSessionSetModel(ws, frame, requestId);
+      return;
+    }
+
+    if (frameType === "host_run_start") {
+      await this.handleHostRunStart(ws, frame as unknown as HostRunStartFrame);
+      return;
+    }
+
+    if (frameType === "host_run_message") {
+      await this.handleHostRunMessage(ws, frame as unknown as HostRunMessageFrame);
+      return;
+    }
+
+    if (frameType === "host_run_cancel") {
+      await this.handleHostRunCancel(ws, frame as unknown as HostRunCancelFrame);
+      return;
+    }
+
+    if (frameType === "host_run_ack") {
+      this.handleHostRunAck(frame as unknown as HostRunAckFrame);
+      return;
+    }
+
+    if (frameType === "phone_run_wake") {
+      await this.handlePhoneRunWake(ws, frame as unknown as PhoneRunWakeFrame);
       return;
     }
   }
@@ -2087,11 +2426,13 @@ export class AcpSessionManager {
 
       const client = await this.ensureClient();
       this.flushOutOfTurnBuffer();
+      const mcpBindingId = this.preMintMcpBindingId();
       const res = await client.sessionNew({
         cwd: absCwd,
-        mcpServers: [this.buildMcpServer()],
+        mcpServers: [this.buildMcpServer(mcpBindingId)],
         ...this.buildSessionInitExtensions(),
       });
+      this.bindMcpSession(mcpBindingId, res.sessionId);
       this.createdSessionIds.add(res.sessionId);
       this.activeSessionId = res.sessionId;
       this.activeSessionCwd = absCwd;
@@ -2285,10 +2626,12 @@ export class AcpSessionManager {
       const supportsLoad = Boolean(this.agentCapabilities.loadSession);
       const isHermes = this.harness.name === "hermes";
 
+      const mcpBindingId = this.preMintMcpBindingId();
+      this.bindMcpSession(mcpBindingId, sessionId);
       const resumeParams = {
         sessionId,
         cwd,
-        mcpServers: [this.buildMcpServer(sessionId)],
+        mcpServers: [this.buildMcpServer(mcpBindingId)],
         ...this.buildSessionInitExtensions(),
       };
 
@@ -2599,6 +2942,31 @@ export class AcpSessionManager {
     const update = params.update;
     if (!update || typeof update !== "object") return;
 
+    if (this.isWorkerSession(params.sessionId)) {
+      if (this.loadingSessionIds.has(params.sessionId)) {
+        return;
+      }
+      if (
+        (update.sessionUpdate === "tool_call" ||
+          update.sessionUpdate === "tool_call_update") &&
+        typeof update.toolCallId === "string" &&
+        update.toolCallId.length > 0
+      ) {
+        this.recordSeenToolCall(params.sessionId, update.toolCallId, update);
+        return;
+      }
+      if (update.sessionUpdate === "agent_message_chunk") {
+        const chunkText =
+          typeof update.content?.text === "string" ? update.content.text : "";
+        if (!chunkText) return;
+        const workerTurn = this.runningTurns.get(params.sessionId);
+        if (workerTurn && workerTurn.isWorker) {
+          workerTurn.chunks.push(chunkText);
+        }
+      }
+      return;
+    }
+
     if (update.sessionUpdate === "available_commands_update") {
       this.handleAvailableCommandsUpdate(
         params.sessionId,
@@ -2762,8 +3130,51 @@ export class AcpSessionManager {
     }
 
     const prompt = formatPermissionPrompt(toolCall, correlated);
-    const choices = options.map((o) => o.name || o.optionId);
     const frameId = `perm-${Date.now()}-${++this.permSeq}-${Math.random().toString(36).slice(2, 6)}`;
+
+    if (sessionId && this.isWorkerSession(sessionId)) {
+      const workerCtx = this.workerContextBySessionId.get(sessionId);
+      const pending: PendingPermission = {
+        rpcId,
+        client,
+        sessionId,
+        acpSessionId: sessionId,
+        toolName,
+        promptHash,
+        frame: { id: frameId },
+        options,
+        resolved: false,
+        isWorker: true,
+        workerRunId: workerCtx?.runId,
+        choicesId: frameId,
+      };
+      const list = this.pendingPermissionsBySession.get(sessionId) ?? [];
+      list.push(pending);
+      this.pendingPermissionsBySession.set(sessionId, list);
+
+      if (workerCtx) {
+        this.emitWorkerEvent({
+          type: "host_run_event",
+          event_id: globalThis.crypto.randomUUID(),
+          run_id: workerCtx.runId,
+          acp_session_id: sessionId,
+          kind: "permission_request",
+          pinned: true,
+          choices_id: frameId,
+          tool_name: toolName,
+          prompt,
+          options: options.map((o) => ({
+            optionId: o.optionId,
+            name: o.name,
+            kind: o.kind,
+          })),
+          ts: new Date(this.nowMs()).toISOString(),
+        });
+      }
+      return;
+    }
+
+    const choices = options.map((o) => o.name || o.optionId);
     const acpSessionId = sessionId || this.activeSessionId || null;
     const activeTurnId =
       this.runningTurn &&
@@ -2790,6 +3201,7 @@ export class AcpSessionManager {
 
     const pending: PendingPermission = {
       rpcId,
+      client,
       sessionId,
       acpSessionId,
       toolName,
@@ -2797,14 +3209,47 @@ export class AcpSessionManager {
       frame,
       options,
       resolved: false,
+      isWorker: false,
     };
     this.pendingPermissions.push(pending);
+    if (sessionId) {
+      const list = this.pendingPermissionsBySession.get(sessionId) ?? [];
+      list.push(pending);
+      this.pendingPermissionsBySession.set(sessionId, list);
+    }
     this.unicastFrameFn(frame);
     this.emitTurnState({
       sessionId: acpSessionId,
       ...(activeTurnId ? { turnId: activeTurnId } : {}),
       state: "waiting_approval",
     });
+  }
+
+  private cancelWorkerPendingPermissions(
+    sessionId: string,
+    respondToClient: boolean,
+  ): void {
+    const list = this.pendingPermissionsBySession.get(sessionId);
+    if (!list || list.length === 0) return;
+    while (list.length > 0) {
+      const perm = list.shift()!;
+      if (perm.resolved) continue;
+      perm.resolved = true;
+      if (respondToClient && !perm.client.isClosed) {
+        perm.client.respond(perm.rpcId, { outcome: { outcome: "cancelled" } });
+      }
+      if (perm.choicesId) {
+        this.workerOutbox.unpinByChoicesId(perm.choicesId);
+        this.pendingWorkerMcpChoices.delete(perm.choicesId);
+      }
+      this.emitPermissionAudit(
+        perm.toolName,
+        "cancelled",
+        perm.promptHash,
+        sessionId,
+      );
+    }
+    this.pendingPermissionsBySession.delete(sessionId);
   }
 
   private cancelAllPendingPermissions(respondToClient: boolean): number {
@@ -2836,6 +3281,16 @@ export class AcpSessionManager {
         }
         list.push(frameId);
       }
+      if (perm.sessionId) {
+        const sessPerms = this.pendingPermissionsBySession.get(perm.sessionId);
+        if (sessPerms) {
+          const idx = sessPerms.indexOf(perm);
+          if (idx !== -1) sessPerms.splice(idx, 1);
+          if (sessPerms.length === 0) {
+            this.pendingPermissionsBySession.delete(perm.sessionId);
+          }
+        }
+      }
     }
     for (const [sessionKey, frameIds] of cancelledBySession.entries()) {
       this.emitChoicesSettled({
@@ -2847,20 +3302,86 @@ export class AcpSessionManager {
     return count;
   }
 
+  private settleWorkersForExitedClient(
+    exitedClient: AcpClient,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): void {
+    const exitDetail =
+      signal !== null
+        ? `code=${code ?? "null"}, signal=${signal}`
+        : `code=${code ?? "null"}`;
+    const hostedSessionIds: string[] = [];
+    for (const [sid, entry] of this.workerSessions.entries()) {
+      if (entry.client === exitedClient) {
+        hostedSessionIds.push(sid);
+      }
+    }
+
+    for (const sid of hostedSessionIds) {
+      this.cancelWorkerPendingPermissions(sid, false);
+      const turn = this.runningTurns.get(sid);
+      if (turn) {
+        this.runningTurns.delete(sid);
+      }
+      this.sessionQueues.delete(sid);
+      const ctx = this.workerContextBySessionId.get(sid);
+      const runState = ctx ? this.workerRunsById.get(ctx.runId) : undefined;
+      if (runState && !runState.terminalEmitted) {
+        runState.terminalEmitted = true;
+        this.emitWorkerEvent({
+          type: "host_run_event",
+          event_id: globalThis.crypto.randomUUID(),
+          run_id: runState.runId,
+          acp_session_id: sid,
+          kind: "failed",
+          pinned: true,
+          reason: "harness_exited",
+          error: `Harness ${this.harness.name} exited unexpectedly (${exitDetail})`,
+          ts: new Date(this.nowMs()).toISOString(),
+        });
+      }
+      const entry = this.workerSessions.get(sid);
+      if (entry) {
+        entry.activeRunId = null;
+      }
+      this.workerSessions.delete(sid);
+      this.workerContextBySessionId.delete(sid);
+      this.evictedWorkerSessionIds.add(sid);
+    }
+  }
+
   private handleHarnessExit(
     exitedClient: AcpClient,
     code: number | null,
     signal: NodeJS.Signals | null,
   ): void {
+    const workerProcIdx = this.workerProcesses.findIndex(
+      (p) => p.client === exitedClient,
+    );
+    if (workerProcIdx !== -1) {
+      this.workerProcesses.splice(workerProcIdx, 1);
+      while (this.workerProcessWaiters.length > 0) {
+        this.workerProcessWaiters.shift()?.();
+      }
+      if (!this.shuttingDown) {
+        this.settleWorkersForExitedClient(exitedClient, code, signal);
+      }
+      return;
+    }
+
     if (this.client === exitedClient) {
       this.client = null;
     }
     if (this.shuttingDown) return;
 
+    this.settleWorkersForExitedClient(exitedClient, code, signal);
+
     const abortedTurn = this.runningTurn;
     if (abortedTurn) {
       this.flushPendingTurnDelta(abortedTurn);
       this.clearTurnDeltaTimer(abortedTurn);
+      this.runningTurns.delete(abortedTurn.sessionId);
     }
 
     this.cancelAllPendingPermissions(false);
@@ -2994,6 +3515,16 @@ export class AcpSessionManager {
     matchedOpt: AcpPermissionOption,
   ): string | null {
     this.pendingPermissions.splice(index, 1);
+    if (perm.sessionId) {
+      const sessPerms = this.pendingPermissionsBySession.get(perm.sessionId);
+      if (sessPerms) {
+        const idx = sessPerms.indexOf(perm);
+        if (idx !== -1) sessPerms.splice(idx, 1);
+        if (sessPerms.length === 0) {
+          this.pendingPermissionsBySession.delete(perm.sessionId);
+        }
+      }
+    }
     perm.resolved = true;
     if (this.client && !this.client.isClosed) {
       this.client.respond(perm.rpcId, {
@@ -3319,11 +3850,13 @@ export class AcpSessionManager {
 
         const client = await this.ensureClient();
         this.flushOutOfTurnBuffer();
+        const mcpBindingId = this.preMintMcpBindingId();
         const res = await client.sessionNew({
           cwd: absCwd,
-          mcpServers: [this.buildMcpServer()],
+          mcpServers: [this.buildMcpServer(mcpBindingId)],
           ...this.buildSessionInitExtensions(),
         });
+        this.bindMcpSession(mcpBindingId, res.sessionId);
         this.createdSessionIds.add(res.sessionId);
         this.activeSessionId = res.sessionId;
         this.activeSessionCwd = absCwd;
@@ -3463,10 +3996,12 @@ export class AcpSessionManager {
         const supportsResume = Boolean(
           this.agentCapabilities.sessionCapabilities?.resume,
         );
+        const mcpBindingId = this.preMintMcpBindingId();
+        this.bindMcpSession(mcpBindingId, sessionId);
         const resumeParams = {
           sessionId,
           cwd,
-          mcpServers: [this.buildMcpServer(sessionId)],
+          mcpServers: [this.buildMcpServer(mcpBindingId)],
           ...this.buildSessionInitExtensions(),
         };
         // Suppress history replay notifications emitted synchronously during both
@@ -3525,11 +4060,13 @@ export class AcpSessionManager {
     try {
       client = await this.ensureClient();
       if (!this.activeSessionId) {
+        const mcpBindingId = this.preMintMcpBindingId();
         const res = await client.sessionNew({
           cwd: this.defaultCwd,
-          mcpServers: [this.buildMcpServer()],
+          mcpServers: [this.buildMcpServer(mcpBindingId)],
           ...this.buildSessionInitExtensions(),
         });
+        this.bindMcpSession(mcpBindingId, res.sessionId);
         this.createdSessionIds.add(res.sessionId);
         this.activeSessionId = res.sessionId;
         this.activeSessionCwd = this.defaultCwd;
@@ -3609,9 +4146,11 @@ export class AcpSessionManager {
     };
     this.cancelRequestedBeforeTurn = false;
     this.runningTurn = turn;
+    this.runningTurns.set(sessionId, turn);
 
     if (turn.cancelledByCommand) {
       this.runningTurn = null;
+      this.runningTurns.delete(sessionId);
       this.turnBusy = false;
       const targetMsgId = turn.delegationMessageId ?? turn.clientMessageId ?? undefined;
       const finalReplyId = this.sendStandaloneReply(
@@ -3758,6 +4297,9 @@ export class AcpSessionManager {
       }
     } finally {
       this.clearTurnDeltaTimer(turn);
+      if (this.runningTurns.get(turn.sessionId) === turn) {
+        this.runningTurns.delete(turn.sessionId);
+      }
       if (this.runningTurn === turn) {
         this.runningTurn = null;
         this.turnBusy = false;
@@ -3840,6 +4382,11 @@ export class AcpSessionManager {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
 
+    if (this.workerGcTimer) {
+      clearInterval(this.workerGcTimer);
+      this.workerGcTimer = null;
+    }
+
     if (this.outOfTurnTimer) {
       clearTimeout(this.outOfTurnTimer);
       this.outOfTurnTimer = null;
@@ -3855,9 +4402,18 @@ export class AcpSessionManager {
       this.clearTurnDeltaTimer(abortedTurn);
     }
     this.runningTurn = null;
+    this.runningTurns.clear();
     this.turnBusy = false;
 
     this.cancelAllPendingPermissions(true);
+    for (const sid of Array.from(this.pendingPermissionsBySession.keys())) {
+      this.cancelWorkerPendingPermissions(sid, true);
+    }
+    this.sessionQueues.clear();
+    this.pendingWorkerMcpChoices.clear();
+    while (this.workerProcessWaiters.length > 0) {
+      this.workerProcessWaiters.shift()?.();
+    }
     this.queue.length = 0;
     this.openUserChoiceIds.clear();
     this.replayCaptureBuffers.clear();
@@ -3883,8 +4439,1259 @@ export class AcpSessionManager {
       this.client = null;
       this.pendingClient = null;
     }
+    const secondaryProcs = [...this.workerProcesses];
+    this.workerProcesses.length = 0;
+    for (const proc of secondaryProcs) {
+      await proc.client.close().catch(() => {});
+    }
     if (this.startPromise) {
       await this.startPromise.catch(() => {});
+    }
+  }
+
+  // ─── SPEC-HITL-APP-10832 Phase 1a — Worker Pool & Peer Orchestration ────
+
+  private recordInboundEventId(eventId: string): boolean {
+    if (this.processedInboundEventIds.has(eventId)) return false;
+    if (
+      this.processedInboundEventIds.size >=
+      AcpSessionManager.MAX_PROCESSED_INBOUND_EVENTS
+    ) {
+      const oldest = this.processedInboundEventIds.values().next().value;
+      if (oldest !== undefined) {
+        this.processedInboundEventIds.delete(oldest);
+      }
+    }
+    this.processedInboundEventIds.add(eventId);
+    return true;
+  }
+
+  private getWorkerProcessForClient(
+    client: AcpClient,
+  ): WorkerProcessEntry | undefined {
+    return this.workerProcesses.find((p) => p.client === client);
+  }
+
+  private releaseWorkerProcessTurn(client: AcpClient, sessionId: string): void {
+    const proc = this.getWorkerProcessForClient(client);
+    if (!proc) return;
+    proc.busySessionIds.delete(sessionId);
+    proc.lastUsedAt = this.nowMs();
+    while (this.workerProcessWaiters.length > 0) {
+      this.workerProcessWaiters.shift()?.();
+    }
+  }
+
+  private async acquireSecondaryWorkerProcess(
+    preferredSessionId?: string,
+  ): Promise<WorkerProcessEntry> {
+    while (!this.shuttingDown) {
+      if (preferredSessionId) {
+        const owner = this.workerProcesses.find(
+          (p) => !p.client.isClosed && p.sessionIds.has(preferredSessionId),
+        );
+        if (owner) {
+          if (owner.busySessionIds.size === 0) {
+            return owner;
+          }
+          await new Promise<void>((resolve) =>
+            this.workerProcessWaiters.push(resolve),
+          );
+          continue;
+        }
+      }
+
+      const idle = this.workerProcesses.find(
+        (p) => !p.client.isClosed && p.busySessionIds.size === 0,
+      );
+      if (idle) {
+        return idle;
+      }
+
+      if (this.workerProcesses.length < this.maxWorkerProcesses) {
+        const launch = resolveHarnessLaunch(this.harness);
+        const transport = this.transportFactory(launch.command, launch.args, {
+          cwd: this.defaultCwd,
+        });
+        const client = new AcpClient(transport);
+        client.onSessionUpdate((params) => this.handleSessionUpdate(params));
+        client.onPermissionRequest((id, params) =>
+          this.handlePermissionRequest(client, id, params),
+        );
+        client.onExit((code, signal) =>
+          this.handleHarnessExit(client, code, signal),
+        );
+        try {
+          const initRes = await client.initialize();
+          if (this.shuttingDown) {
+            await client.close().catch(() => {});
+            throw new Error("Daemon shut down during worker subprocess init");
+          }
+          const entry: WorkerProcessEntry = {
+            id: `worker-proc-${++this.workerProcessSeq}`,
+            client,
+            capabilities: initRes.agentCapabilities ?? {},
+            busySessionIds: new Set(),
+            sessionIds: new Set(),
+            lastUsedAt: this.nowMs(),
+          };
+          this.workerProcesses.push(entry);
+          return entry;
+        } catch (err) {
+          await client.close().catch(() => {});
+          throw err;
+        }
+      }
+
+      await new Promise<void>((resolve) =>
+        this.workerProcessWaiters.push(resolve),
+      );
+    }
+    throw new Error("Daemon is shutting down");
+  }
+
+  private isWorkerSessionIdle(sessionId: string): boolean {
+    const entry = this.workerSessions.get(sessionId);
+    if (!entry) return false;
+    if (entry.activeRunId !== null) return false;
+    if (this.runningTurns.has(sessionId)) return false;
+    if ((this.sessionQueues.get(sessionId)?.length ?? 0) > 0) return false;
+    if ((this.pendingPermissionsBySession.get(sessionId)?.length ?? 0) > 0) {
+      return false;
+    }
+    return true;
+  }
+
+  private async evictWorkerSession(sessionId: string): Promise<boolean> {
+    const entry = this.workerSessions.get(sessionId);
+    if (!entry) return false;
+
+    this.workerSessions.delete(sessionId);
+    this.workerContextBySessionId.delete(sessionId);
+    this.sessionQueues.delete(sessionId);
+    this.pendingPermissionsBySession.delete(sessionId);
+    this.instructionsDeliveredSessions.delete(sessionId);
+    this.sessionModelsMap.delete(sessionId);
+    this.sessionCommandsMap.delete(sessionId);
+    this.evictedWorkerSessionIds.add(sessionId);
+
+    for (const [bindingId, sid] of Array.from(this.mcpBindings.entries())) {
+      if (sid === sessionId) {
+        this.mcpBindings.delete(bindingId);
+      }
+    }
+    for (const key of Array.from(this.seenToolCalls.keys())) {
+      if (key.startsWith(`${sessionId}:`)) {
+        this.seenToolCalls.delete(key);
+      }
+    }
+
+    const supportsClose = Boolean(entry.capabilities.sessionCapabilities?.close);
+    if (supportsClose && !entry.client.isClosed) {
+      await entry.client.closeSession(sessionId).catch((err) => {
+        process.stderr.write(
+          `[hitl-channel] session/close failed for worker ${sessionId}: ${
+            err instanceof Error ? err.message : err
+          }\n`,
+        );
+      });
+    }
+
+    const proc = this.getWorkerProcessForClient(entry.client);
+    if (proc) {
+      proc.sessionIds.delete(sessionId);
+      if (!supportsClose && proc.sessionIds.size === 0 && proc.busySessionIds.size === 0) {
+        const idx = this.workerProcesses.indexOf(proc);
+        if (idx !== -1) {
+          this.workerProcesses.splice(idx, 1);
+          await proc.client.close().catch(() => {});
+        }
+      }
+    }
+
+    return true;
+  }
+
+  async runWorkerGc(): Promise<number> {
+    if (this.shuttingDown) return 0;
+    let evicted = 0;
+    if (this.workerIdleTtlMs > 0) {
+      const cutoff = this.nowMs() - this.workerIdleTtlMs;
+      const expiredIds: string[] = [];
+      for (const [sid, entry] of this.workerSessions.entries()) {
+        if (entry.lastActiveAt <= cutoff && this.isWorkerSessionIdle(sid)) {
+          expiredIds.push(sid);
+        }
+      }
+      for (const sid of expiredIds) {
+        if (await this.evictWorkerSession(sid)) {
+          evicted++;
+        }
+      }
+    }
+    return evicted;
+  }
+
+  private async ensureWorkerPoolCapacity(): Promise<void> {
+    await this.runWorkerGc();
+    while (this.workerSessions.size >= this.maxWorkerSessions) {
+      let oldestIdle: WorkerSessionEntry | undefined;
+      for (const entry of this.workerSessions.values()) {
+        if (!this.isWorkerSessionIdle(entry.sessionId)) continue;
+        if (!oldestIdle || entry.lastActiveAt < oldestIdle.lastActiveAt) {
+          oldestIdle = entry;
+        }
+      }
+      if (!oldestIdle) {
+        throw new Error("worker_pool_full");
+      }
+      await this.evictWorkerSession(oldestIdle.sessionId);
+    }
+  }
+
+  private sendHostRunAck(
+    ws: HitlWebSocket | undefined,
+    payload: { event_id?: string; run_id?: string; acp_session_id?: string },
+  ): void {
+    const frame: HostRunAckFrame = {
+      type: "host_run_ack",
+      ...(payload.event_id ? { event_id: payload.event_id } : {}),
+      ...(payload.run_id ? { run_id: payload.run_id } : {}),
+      ...(payload.acp_session_id ? { acp_session_id: payload.acp_session_id } : {}),
+    };
+    if (ws && ws.readyState === 1 && ws.data?.features?.has("peer_orchestration")) {
+      if (
+        this.sendControlToClientFn(
+          ws,
+          frame as unknown as Record<string, unknown>,
+          "peer_orchestration",
+        )
+      ) {
+        return;
+      }
+    }
+    this.broadcastToCapableFn(
+      "peer_orchestration",
+      frame as unknown as Record<string, unknown>,
+    );
+  }
+
+  private async allocateWorkerSession(
+    frame: HostRunStartFrame,
+  ): Promise<{ client: AcpClient; capabilities: AcpAgentCapabilities; sessionId: string; cwd: string }> {
+    const absCwd = frame.cwd
+      ? expandHomeAndResolve(frame.cwd, this.defaultCwd)
+      : this.defaultCwd;
+    const requestedSessionId =
+      typeof frame.acp_session_id === "string" && frame.acp_session_id.trim().length > 0
+        ? frame.acp_session_id.trim()
+        : undefined;
+    const externalKey =
+      typeof frame.external_session_key === "string" &&
+      frame.external_session_key.trim().length > 0
+        ? frame.external_session_key.trim()
+        : undefined;
+
+    if (requestedSessionId) {
+      if (this.evictedWorkerSessionIds.has(requestedSessionId)) {
+        throw new Error(`host_session_expired: session '${requestedSessionId}' was closed`);
+      }
+      const existing = this.workerSessions.get(requestedSessionId);
+      if (existing && !existing.client.isClosed) {
+        const proc = this.getWorkerProcessForClient(existing.client);
+        if (proc && proc.busySessionIds.size > 0) {
+          await this.acquireSecondaryWorkerProcess(requestedSessionId);
+        }
+        existing.lastActiveAt = this.nowMs();
+        return {
+          client: existing.client,
+          capabilities: existing.capabilities,
+          sessionId: existing.sessionId,
+          cwd: existing.cwd,
+        };
+      }
+    }
+
+    if (!requestedSessionId && externalKey) {
+      for (const existing of this.workerSessions.values()) {
+        if (
+          existing.externalSessionKey === externalKey &&
+          !existing.client.isClosed
+        ) {
+          const proc = this.getWorkerProcessForClient(existing.client);
+          if (proc && proc.busySessionIds.size > 0) {
+            await this.acquireSecondaryWorkerProcess(existing.sessionId);
+          }
+          existing.lastActiveAt = this.nowMs();
+          return {
+            client: existing.client,
+            capabilities: existing.capabilities,
+            sessionId: existing.sessionId,
+            cwd: existing.cwd,
+          };
+        }
+      }
+    }
+
+    await this.ensureWorkerPoolCapacity();
+
+    const usePrimary = this.concurrentSessions && !this.primarySerializesTurns;
+    let client: AcpClient;
+    let capabilities: AcpAgentCapabilities;
+    let procEntry: WorkerProcessEntry | undefined;
+
+    if (usePrimary) {
+      client = await this.ensureClient();
+      capabilities = this.agentCapabilities;
+    } else {
+      procEntry = await this.acquireSecondaryWorkerProcess(requestedSessionId);
+      client = procEntry.client;
+      capabilities = procEntry.capabilities;
+    }
+
+    const switchToSecondaryOnBusy = async (): Promise<void> => {
+      this.primarySerializesTurns = true;
+      procEntry = await this.acquireSecondaryWorkerProcess(requestedSessionId);
+      client = procEntry.client;
+      capabilities = procEntry.capabilities;
+    };
+
+    if (requestedSessionId) {
+      const mcpBindingId = this.preMintMcpBindingId();
+      this.bindMcpSession(mcpBindingId, requestedSessionId);
+      const loadWithClient = async (targetClient: AcpClient, caps: AcpAgentCapabilities) => {
+        const params = {
+          sessionId: requestedSessionId,
+          cwd: absCwd,
+          mcpServers: [this.buildMcpServer(mcpBindingId)],
+          ...this.buildSessionInitExtensions(),
+        };
+        if (caps.loadSession) {
+          await targetClient.sessionLoad(params);
+        } else if (caps.sessionCapabilities?.resume) {
+          await targetClient.sessionResume(params);
+        } else {
+          throw new Error(
+            `host_session_expired: harness does not support resuming '${requestedSessionId}'`,
+          );
+        }
+      };
+      this.loadingSessionIds.add(requestedSessionId);
+      try {
+        try {
+          await loadWithClient(client, capabilities);
+        } catch (err) {
+          if (client === this.client && isConcurrencyBusyError(err)) {
+            await switchToSecondaryOnBusy();
+            await loadWithClient(client, capabilities);
+          } else {
+            throw err;
+          }
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("host_session_expired")) throw err;
+        throw new Error(`host_session_expired: ${msg}`);
+      } finally {
+        this.loadingSessionIds.delete(requestedSessionId);
+      }
+
+      this.workerCreatedSessionIds.add(requestedSessionId);
+      procEntry?.sessionIds.add(requestedSessionId);
+      const entry: WorkerSessionEntry = {
+        sessionId: requestedSessionId,
+        client,
+        capabilities,
+        cwd: absCwd,
+        ...(externalKey ? { externalSessionKey: externalKey } : {}),
+        createdAt: this.nowMs(),
+        lastActiveAt: this.nowMs(),
+        activeRunId: null,
+      };
+      this.workerSessions.set(requestedSessionId, entry);
+      return { client, capabilities, sessionId: requestedSessionId, cwd: absCwd };
+    }
+
+    const mcpBindingId = this.preMintMcpBindingId();
+    let res: { sessionId: string };
+    try {
+      res = await client.sessionNew({
+        cwd: absCwd,
+        mcpServers: [this.buildMcpServer(mcpBindingId)],
+        ...this.buildSessionInitExtensions(),
+      });
+    } catch (err) {
+      if (client === this.client && isConcurrencyBusyError(err)) {
+        await switchToSecondaryOnBusy();
+        res = await client.sessionNew({
+          cwd: absCwd,
+          mcpServers: [this.buildMcpServer(mcpBindingId)],
+          ...this.buildSessionInitExtensions(),
+        });
+      } else {
+        throw err;
+      }
+    }
+    this.bindMcpSession(mcpBindingId, res.sessionId);
+    this.workerCreatedSessionIds.add(res.sessionId);
+    procEntry?.sessionIds.add(res.sessionId);
+    const entry: WorkerSessionEntry = {
+      sessionId: res.sessionId,
+      client,
+      capabilities,
+      cwd: absCwd,
+      ...(externalKey ? { externalSessionKey: externalKey } : {}),
+      createdAt: this.nowMs(),
+      lastActiveAt: this.nowMs(),
+      activeRunId: null,
+    };
+    this.workerSessions.set(res.sessionId, entry);
+    return { client, capabilities, sessionId: res.sessionId, cwd: absCwd };
+  }
+
+  private async spillWorkerTurnToSecondary(
+    runState: WorkerRunState,
+    promptBlocks: AcpContentBlock[],
+  ): Promise<{ stopReason: string; chunks: string[]; newSessionId: string }> {
+    this.primarySerializesTurns = true;
+    const proc = await this.acquireSecondaryWorkerProcess();
+    const mcpBindingId = this.preMintMcpBindingId();
+    const res = await proc.client.sessionNew({
+      cwd: runState.cwd,
+      mcpServers: [this.buildMcpServer(mcpBindingId)],
+      ...this.buildSessionInitExtensions(),
+    });
+    const newSid = res.sessionId;
+    this.bindMcpSession(mcpBindingId, newSid);
+    this.workerCreatedSessionIds.add(newSid);
+    proc.sessionIds.add(newSid);
+
+    const oldSid = runState.acpSessionId;
+    const oldEntry = this.workerSessions.get(oldSid);
+    if (oldEntry) {
+      this.workerSessions.delete(oldSid);
+    }
+    const oldCtx = this.workerContextBySessionId.get(oldSid);
+    if (oldCtx) {
+      this.workerContextBySessionId.delete(oldSid);
+    }
+
+    runState.acpSessionId = newSid;
+    this.workerContextBySessionId.set(newSid, {
+      runId: runState.runId,
+      acpSessionId: newSid,
+      parentRunId: runState.parentRunId,
+      episodeRootRunId: runState.episodeRootRunId,
+      dispatchDepth: runState.dispatchDepth,
+      messageHop: runState.messageHop,
+      ...(runState.externalSessionKey
+        ? { externalSessionKey: runState.externalSessionKey }
+        : {}),
+      cwd: runState.cwd,
+    });
+    this.workerSessions.set(newSid, {
+      sessionId: newSid,
+      client: proc.client,
+      capabilities: proc.capabilities,
+      cwd: runState.cwd,
+      ...(runState.externalSessionKey
+        ? { externalSessionKey: runState.externalSessionKey }
+        : {}),
+      createdAt: this.nowMs(),
+      lastActiveAt: this.nowMs(),
+      activeRunId: runState.runId,
+    });
+    this.sendHostRunAck(runState.ws, {
+      run_id: runState.runId,
+      acp_session_id: newSid,
+    });
+
+    const spilledTurn: RunningTurn = {
+      turnId: `wturn-${this.nowMs()}-${++this.turnSeq}`,
+      sessionId: newSid,
+      isWorker: true,
+      workerRunId: runState.runId,
+      chunks: [],
+      delegationMessageId: null,
+      clientMessageId: null,
+      replyToolCalled: false,
+      cancelledByCommand: runState.cancelled,
+      deltaSeq: 0,
+      pendingDeltaText: "",
+      deltaTimer: null,
+      emittedDeltaBytes: 0,
+      deltaTruncated: false,
+      toolSteps: new Map(),
+    };
+    this.runningTurns.set(newSid, spilledTurn);
+    proc.busySessionIds.add(newSid);
+    try {
+      const promptRes = await proc.client.sessionPrompt({
+        sessionId: newSid,
+        prompt: promptBlocks,
+      });
+      this.instructionsDeliveredSessions.add(newSid);
+      return {
+        stopReason: promptRes.stopReason,
+        chunks: spilledTurn.chunks,
+        newSessionId: newSid,
+      };
+    } finally {
+      this.runningTurns.delete(newSid);
+      this.releaseWorkerProcessTurn(proc.client, newSid);
+    }
+  }
+
+  private async handleHostRunStart(
+    ws: HitlWebSocket,
+    frame: HostRunStartFrame,
+  ): Promise<void> {
+    const runId = typeof frame.run_id === "string" ? frame.run_id.trim() : "";
+    const prompt = typeof frame.prompt === "string" ? frame.prompt : "";
+    const eventId =
+      typeof frame.event_id === "string" ? frame.event_id.trim() : "";
+    if (!runId) return;
+
+    const existing = this.workerRunsById.get(runId);
+    if (existing) {
+      if (existing.acpSessionId || eventId) {
+        this.sendHostRunAck(ws, {
+          ...(eventId ? { event_id: eventId } : {}),
+          run_id: runId,
+          ...(existing.acpSessionId
+            ? { acp_session_id: existing.acpSessionId }
+            : {}),
+        });
+      }
+      return;
+    }
+
+    const absCwd = frame.cwd
+      ? expandHomeAndResolve(frame.cwd, this.defaultCwd)
+      : this.defaultCwd;
+    const runState: WorkerRunState = {
+      runId,
+      acpSessionId: frame.acp_session_id ?? "",
+      parentRunId: frame.parent_run_id ?? null,
+      episodeRootRunId: frame.episode_root_run_id ?? null,
+      dispatchDepth:
+        typeof frame.dispatch_depth === "number" ? frame.dispatch_depth : 0,
+      messageHop: typeof frame.message_hop === "number" ? frame.message_hop : 0,
+      ...(typeof frame.external_session_key === "string"
+        ? { externalSessionKey: frame.external_session_key }
+        : {}),
+      cwd: absCwd,
+      cancelled: false,
+      terminalEmitted: false,
+      ws,
+    };
+    this.workerRunsById.set(runId, runState);
+
+    if (runState.dispatchDepth > 3) {
+      runState.terminalEmitted = true;
+      this.emitWorkerEvent({
+        type: "host_run_event",
+        event_id: globalThis.crypto.randomUUID(),
+        run_id: runId,
+        acp_session_id: runState.acpSessionId,
+        kind: "failed",
+        pinned: true,
+        reason: "max_dispatch_depth_exceeded",
+        error: "max_dispatch_depth_exceeded",
+        ts: new Date(this.nowMs()).toISOString(),
+      });
+      return;
+    }
+
+    try {
+      const { sessionId } = await this.allocateWorkerSession(frame);
+      if (runState.cancelled) {
+        if (!runState.terminalEmitted) {
+          runState.terminalEmitted = true;
+          this.emitWorkerEvent({
+            type: "host_run_event",
+            event_id: globalThis.crypto.randomUUID(),
+            run_id: runId,
+            acp_session_id: sessionId,
+            kind: "cancelled",
+            pinned: true,
+            reason: runState.cancelReason ?? "cancelled",
+            ts: new Date(this.nowMs()).toISOString(),
+          });
+        }
+        return;
+      }
+
+      runState.acpSessionId = sessionId;
+      const sessEntry = this.workerSessions.get(sessionId);
+      if (sessEntry) {
+        sessEntry.activeRunId = runId;
+        sessEntry.lastActiveAt = this.nowMs();
+      }
+      this.workerContextBySessionId.set(sessionId, {
+        runId,
+        acpSessionId: sessionId,
+        parentRunId: runState.parentRunId,
+        episodeRootRunId: runState.episodeRootRunId,
+        dispatchDepth: runState.dispatchDepth,
+        messageHop: runState.messageHop,
+        ...(runState.externalSessionKey
+          ? { externalSessionKey: runState.externalSessionKey }
+          : {}),
+        cwd: runState.cwd,
+      });
+
+      this.sendHostRunAck(ws, {
+        ...(eventId ? { event_id: eventId } : {}),
+        run_id: runId,
+        acp_session_id: sessionId,
+      });
+      this.emitWorkerEvent({
+        type: "host_run_event",
+        event_id: globalThis.crypto.randomUUID(),
+        run_id: runId,
+        acp_session_id: sessionId,
+        kind: "started",
+        pinned: false,
+        ts: new Date(this.nowMs()).toISOString(),
+      });
+
+      void this.queueTurnForSession(sessionId, prompt, {
+        runId,
+        isFollowUp: false,
+      });
+    } catch (err) {
+      if (!runState.terminalEmitted) {
+        runState.terminalEmitted = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        const reason = msg.includes("host_session_expired")
+          ? "host_session_expired"
+          : msg.includes("worker_pool_full")
+            ? "worker_pool_full"
+            : "session_start_failed";
+        this.emitWorkerEvent({
+          type: "host_run_event",
+          event_id: globalThis.crypto.randomUUID(),
+          run_id: runId,
+          acp_session_id: runState.acpSessionId,
+          kind: "failed",
+          pinned: true,
+          reason,
+          error: msg,
+          ts: new Date(this.nowMs()).toISOString(),
+        });
+      }
+    }
+  }
+
+  private async handleHostRunMessage(
+    ws: HitlWebSocket,
+    frame: HostRunMessageFrame,
+  ): Promise<void> {
+    const eventId = typeof frame.event_id === "string" ? frame.event_id.trim() : "";
+    const runState =
+      typeof frame.run_id === "string"
+        ? this.workerRunsById.get(frame.run_id)
+        : undefined;
+    const acpSessionId =
+      (typeof frame.acp_session_id === "string" && frame.acp_session_id.trim()) ||
+      runState?.acpSessionId ||
+      "";
+    const sendAck = (): void => {
+      this.sendHostRunAck(ws, {
+        ...(eventId ? { event_id: eventId } : {}),
+        ...(typeof frame.run_id === "string" && frame.run_id.trim().length > 0
+          ? { run_id: frame.run_id.trim() }
+          : {}),
+        ...(acpSessionId ? { acp_session_id: acpSessionId } : {}),
+      });
+    };
+
+    if (eventId && !this.recordInboundEventId(eventId)) {
+      sendAck();
+      return;
+    }
+
+    if (!acpSessionId) return;
+
+    const ctx = this.workerContextBySessionId.get(acpSessionId);
+    if (ctx && typeof frame.message_hop === "number") {
+      ctx.messageHop = Math.max(ctx.messageHop, frame.message_hop);
+    }
+    if (runState && typeof frame.message_hop === "number") {
+      runState.messageHop = Math.max(runState.messageHop, frame.message_hop);
+    }
+
+    if (frame.kind === "permission_response") {
+      const choicesId =
+        typeof frame.choices_id === "string" ? frame.choices_id.trim() : "";
+      const optionId =
+        typeof frame.option_id === "string" ? frame.option_id.trim() : "";
+
+      if (choicesId && this.pendingWorkerMcpChoices.has(choicesId)) {
+        const pendingChoice = this.pendingWorkerMcpChoices.get(choicesId)!;
+        this.pendingWorkerMcpChoices.delete(choicesId);
+        this.workerOutbox.unpinByChoicesId(choicesId);
+        const matched =
+          pendingChoice.options.find((o) => o.optionId === optionId) ??
+          pendingChoice.options.find(
+            (o) => o.name.toLowerCase() === optionId.toLowerCase(),
+          );
+        const answerText = matched?.name ?? optionId;
+        await this.queueTurnForSession(
+          pendingChoice.acpSessionId,
+          `<hitl_system_event type="choice_response" choices_id="${choicesId}">${answerText}</hitl_system_event>`,
+          { runId: pendingChoice.runId, isFollowUp: true },
+        );
+        sendAck();
+        return;
+      }
+
+      const sessPerms = this.pendingPermissionsBySession.get(acpSessionId);
+      if (!sessPerms || sessPerms.length === 0) {
+        sendAck();
+        return;
+      }
+      const permIdx = choicesId
+        ? sessPerms.findIndex((p) => !p.resolved && p.choicesId === choicesId)
+        : sessPerms.findIndex((p) => !p.resolved);
+      if (permIdx === -1) {
+        sendAck();
+        return;
+      }
+      const perm = sessPerms[permIdx]!;
+      const matchedOpt =
+        perm.options.find((o) => o.optionId === optionId) ??
+        perm.options.find(
+          (o) =>
+            o.optionId.toLowerCase() === optionId.toLowerCase() ||
+            o.name.toLowerCase() === optionId.toLowerCase(),
+        );
+      if (!matchedOpt) return;
+
+      sessPerms.splice(permIdx, 1);
+      if (sessPerms.length === 0) {
+        this.pendingPermissionsBySession.delete(acpSessionId);
+      }
+      perm.resolved = true;
+      if (perm.choicesId) {
+        this.workerOutbox.unpinByChoicesId(perm.choicesId);
+      }
+      if (!perm.client.isClosed) {
+        perm.client.respond(perm.rpcId, {
+          outcome: { outcome: "selected", optionId: matchedOpt.optionId },
+        });
+      }
+      const approval = matchedOpt.kind.startsWith("reject")
+        ? "user_denied"
+        : "user_approved";
+      this.emitPermissionAudit(
+        perm.toolName,
+        approval,
+        perm.promptHash,
+        acpSessionId,
+      );
+      sendAck();
+      return;
+    }
+
+    if (frame.kind === "agent_message") {
+      const text = typeof frame.text === "string" ? frame.text : "";
+      if (!text.trim()) return;
+      const senderAttr = frame.sender_agent_id
+        ? ` sender_agent_id="${frame.sender_agent_id}"`
+        : "";
+      const nameAttr = frame.sender_name
+        ? ` sender_name="${frame.sender_name}"`
+        : "";
+      const hopAttr =
+        typeof frame.message_hop === "number"
+          ? ` message_hop="${frame.message_hop}"`
+          : "";
+      const envelope = `<hitl_system_event type="agent_message" event_id="${eventId}" run_id="${frame.run_id}"${senderAttr}${nameAttr}${hopAttr}>\n${text}\n</hitl_system_event>`;
+      await this.queueTurnForSession(acpSessionId, envelope, {
+        runId: frame.run_id,
+        isFollowUp: true,
+      });
+      sendAck();
+    }
+  }
+
+  private async handleHostRunCancel(
+    ws: HitlWebSocket,
+    frame: HostRunCancelFrame,
+  ): Promise<void> {
+    const runId = typeof frame.run_id === "string" ? frame.run_id.trim() : "";
+    const eventId =
+      typeof frame.event_id === "string" ? frame.event_id.trim() : "";
+    let runState = runId ? this.workerRunsById.get(runId) : undefined;
+    if (!runState && typeof frame.acp_session_id === "string") {
+      const ctx = this.workerContextBySessionId.get(frame.acp_session_id);
+      if (ctx) runState = this.workerRunsById.get(ctx.runId);
+    }
+    const sid =
+      runState?.acpSessionId ||
+      (typeof frame.acp_session_id === "string" ? frame.acp_session_id : "") ||
+      "";
+    const sendCancelAck = (): void => {
+      if (eventId || runId) {
+        this.sendHostRunAck(ws, {
+          ...(eventId ? { event_id: eventId } : {}),
+          ...(runId ? { run_id: runId } : {}),
+          ...(sid ? { acp_session_id: sid } : {}),
+        });
+      }
+    };
+    if (!runState || runState.terminalEmitted) {
+      sendCancelAck();
+      return;
+    }
+
+    runState.cancelled = true;
+    runState.cancelReason =
+      typeof frame.reason === "string" && frame.reason.trim().length > 0
+        ? frame.reason.trim()
+        : "cancelled";
+
+    if (!sid) {
+      runState.terminalEmitted = true;
+      this.emitWorkerEvent({
+        type: "host_run_event",
+        event_id: globalThis.crypto.randomUUID(),
+        run_id: runState.runId,
+        acp_session_id: "",
+        kind: "cancelled",
+        pinned: true,
+        reason: runState.cancelReason,
+        ts: new Date(this.nowMs()).toISOString(),
+      });
+      sendCancelAck();
+      return;
+    }
+
+    this.cancelWorkerPendingPermissions(sid, true);
+    const q = this.sessionQueues.get(sid);
+    if (q) {
+      const filtered = q.filter((item) => item.runId !== runState!.runId);
+      if (filtered.length === 0) {
+        this.sessionQueues.delete(sid);
+      } else {
+        this.sessionQueues.set(sid, filtered);
+      }
+    }
+
+    const activeTurn = this.runningTurns.get(sid);
+    const sessEntry = this.workerSessions.get(sid);
+    if (activeTurn && activeTurn.isWorker && activeTurn.workerRunId === runState.runId) {
+      activeTurn.cancelledByCommand = true;
+      if (sessEntry && !sessEntry.client.isClosed) {
+        sessEntry.client.sessionCancel(sid);
+      }
+      sendCancelAck();
+      return;
+    }
+
+    if (!runState.terminalEmitted) {
+      runState.terminalEmitted = true;
+      if (sessEntry) {
+        sessEntry.activeRunId = null;
+        sessEntry.lastActiveAt = this.nowMs();
+      }
+      this.emitWorkerEvent({
+        type: "host_run_event",
+        event_id: globalThis.crypto.randomUUID(),
+        run_id: runState.runId,
+        acp_session_id: sid,
+        kind: "cancelled",
+        pinned: true,
+        reason: runState.cancelReason,
+        ts: new Date(this.nowMs()).toISOString(),
+      });
+    }
+    sendCancelAck();
+  }
+
+  private handleHostRunAck(frame: HostRunAckFrame): void {
+    const eventId = typeof frame.event_id === "string" ? frame.event_id.trim() : "";
+    if (!eventId) return;
+    this.workerOutbox.commitById(eventId);
+  }
+
+  private async handlePhoneRunWake(
+    ws: HitlWebSocket,
+    frame: PhoneRunWakeFrame,
+  ): Promise<void> {
+    const eventId = typeof frame.event_id === "string" ? frame.event_id.trim() : "";
+    const acpSessionId =
+      typeof frame.acp_session_id === "string"
+        ? frame.acp_session_id.trim()
+        : "";
+    if (!acpSessionId) return;
+
+    if (eventId && !this.recordInboundEventId(eventId)) {
+      this.sendHostRunAck(ws, {
+        event_id: eventId,
+        run_id: frame.run_id,
+        acp_session_id: acpSessionId,
+      });
+      return;
+    }
+
+    const ctx = this.workerContextBySessionId.get(acpSessionId);
+    if (ctx && typeof frame.message_hop === "number") {
+      ctx.messageHop = Math.max(ctx.messageHop, frame.message_hop);
+    }
+
+    const bodyText =
+      frame.status === "failed"
+        ? frame.error ?? "Phone agent run failed."
+        : frame.output ?? "";
+    const senderAttr = frame.sender_agent_id
+      ? ` sender_agent_id="${frame.sender_agent_id}"`
+      : "";
+    const nameAttr = frame.sender_name
+      ? ` sender_name="${frame.sender_name}"`
+      : "";
+    const hopAttr =
+      typeof frame.message_hop === "number"
+        ? ` message_hop="${frame.message_hop}"`
+        : "";
+    const wakeEnvelope = `<phone_agent_event event_id="${eventId}" run_id="${frame.run_id}" status="${frame.status}"${senderAttr}${nameAttr}${hopAttr}>\n${bodyText}\n</phone_agent_event>`;
+
+    await this.queueTurnForSession(acpSessionId, wakeEnvelope, {
+      runId: ctx?.runId,
+      isFollowUp: true,
+    });
+
+    this.sendHostRunAck(ws, {
+      ...(eventId ? { event_id: eventId } : {}),
+      run_id: frame.run_id,
+      acp_session_id: acpSessionId,
+    });
+  }
+
+  async queueTurnForSession(
+    acpSessionId: string,
+    promptText: string,
+    opts?: { runId?: string; isFollowUp?: boolean },
+  ): Promise<void> {
+    if (this.shuttingDown) return;
+
+    if (!this.isWorkerSession(acpSessionId)) {
+      if (acpSessionId === this.activeSessionId) {
+        await this.handleInbound({
+          text: promptText,
+          meta: { sender_id: "phone_agent", type: "phone_run_wake" },
+        });
+        return;
+      }
+      // Non-active interactive session: queue onto sessionQueues & execute on primary client
+      const q = this.sessionQueues.get(acpSessionId) ?? [];
+      q.push({ prompt: promptText, runId: opts?.runId, isFollowUp: opts?.isFollowUp });
+      this.sessionQueues.set(acpSessionId, q);
+      if (!this.runningTurns.has(acpSessionId)) {
+        void this.drainInteractiveSessionQueue(acpSessionId);
+      }
+      return;
+    }
+
+    const q = this.sessionQueues.get(acpSessionId) ?? [];
+    q.push({
+      prompt: promptText,
+      runId: opts?.runId,
+      isFollowUp: opts?.isFollowUp,
+    });
+    this.sessionQueues.set(acpSessionId, q);
+
+    if (!this.runningTurns.has(acpSessionId)) {
+      await this.drainWorkerSessionQueue(acpSessionId);
+    }
+  }
+
+  private async drainInteractiveSessionQueue(acpSessionId: string): Promise<void> {
+    if (this.shuttingDown || this.runningTurns.has(acpSessionId)) return;
+    const q = this.sessionQueues.get(acpSessionId);
+    if (!q || q.length === 0) {
+      this.sessionQueues.delete(acpSessionId);
+      return;
+    }
+    const next = q.shift()!;
+    if (q.length === 0) this.sessionQueues.delete(acpSessionId);
+    try {
+      const client = await this.ensureClient();
+      const blocks: AcpContentBlock[] = [{ type: "text", text: next.prompt }];
+      const turn: RunningTurn = {
+        turnId: `iturn-${this.nowMs()}-${++this.turnSeq}`,
+        sessionId: acpSessionId,
+        isWorker: false,
+        chunks: [],
+        delegationMessageId: null,
+        clientMessageId: null,
+        replyToolCalled: false,
+        cancelledByCommand: false,
+        deltaSeq: 0,
+        pendingDeltaText: "",
+        deltaTimer: null,
+        emittedDeltaBytes: 0,
+        deltaTruncated: false,
+        toolSteps: new Map(),
+      };
+      this.runningTurns.set(acpSessionId, turn);
+      try {
+        await client.sessionPrompt({ sessionId: acpSessionId, prompt: blocks });
+      } finally {
+        this.runningTurns.delete(acpSessionId);
+      }
+    } catch (err) {
+      process.stderr.write(
+        `[hitl-channel] session turn error (${acpSessionId}): ${
+          err instanceof Error ? err.message : err
+        }\n`,
+      );
+    } finally {
+      if ((this.sessionQueues.get(acpSessionId)?.length ?? 0) > 0) {
+        void this.drainInteractiveSessionQueue(acpSessionId);
+      }
+    }
+  }
+
+  private async drainWorkerSessionQueue(acpSessionId: string): Promise<void> {
+    if (this.shuttingDown || this.runningTurns.has(acpSessionId)) return;
+    const q = this.sessionQueues.get(acpSessionId);
+    if (!q || q.length === 0) {
+      this.sessionQueues.delete(acpSessionId);
+      return;
+    }
+
+    const entry = this.workerSessions.get(acpSessionId);
+    if (!entry || entry.client.isClosed) {
+      this.sessionQueues.delete(acpSessionId);
+      return;
+    }
+
+    const next = q.shift()!;
+    if (q.length === 0) {
+      this.sessionQueues.delete(acpSessionId);
+    }
+
+    const runId =
+      next.runId ?? this.workerContextBySessionId.get(acpSessionId)?.runId ?? "";
+    const runState = runId ? this.workerRunsById.get(runId) : undefined;
+    if (runState?.cancelled && !next.isFollowUp) {
+      return;
+    }
+
+    await this.executeWorkerTurn(entry, acpSessionId, next.prompt, runState, Boolean(next.isFollowUp));
+
+    // Continue draining if more queued items arrived during the turn (use latest sessionId in case of spill)
+    const activeSid = runState?.acpSessionId || acpSessionId;
+    if (!this.shuttingDown && (this.sessionQueues.get(activeSid)?.length ?? 0) > 0) {
+      void this.drainWorkerSessionQueue(activeSid);
+    }
+  }
+
+  private async executeWorkerTurn(
+    entry: WorkerSessionEntry,
+    sessionId: string,
+    promptText: string,
+    runState: WorkerRunState | undefined,
+    isFollowUp: boolean,
+  ): Promise<void> {
+    const turn: RunningTurn = {
+      turnId: `wturn-${this.nowMs()}-${++this.turnSeq}`,
+      sessionId,
+      isWorker: true,
+      workerRunId: runState?.runId,
+      chunks: [],
+      delegationMessageId: null,
+      clientMessageId: null,
+      replyToolCalled: false,
+      cancelledByCommand: runState?.cancelled ?? false,
+      deltaSeq: 0,
+      pendingDeltaText: "",
+      deltaTimer: null,
+      emittedDeltaBytes: 0,
+      deltaTruncated: false,
+      toolSteps: new Map(),
+    };
+
+    this.runningTurns.set(sessionId, turn);
+    entry.activeRunId = runState?.runId ?? null;
+    entry.lastActiveAt = this.nowMs();
+    const proc = this.getWorkerProcessForClient(entry.client);
+    proc?.busySessionIds.add(sessionId);
+
+    let activeSessionIdForEvent = sessionId;
+    let clientForTurn = entry.client;
+
+    try {
+      let promptBlocks: AcpContentBlock[] = [{ type: "text", text: promptText }];
+      if (this.needsFirstPromptInstructions(sessionId)) {
+        promptBlocks = [
+          {
+            type: "text",
+            text: `<system_instructions>\n${DAEMON_INSTRUCTIONS}\n</system_instructions>`,
+          },
+          ...promptBlocks,
+        ];
+      }
+
+      if (turn.cancelledByCommand) {
+        if (runState && !runState.terminalEmitted) {
+          runState.terminalEmitted = true;
+          this.emitWorkerEvent({
+            type: "host_run_event",
+            event_id: globalThis.crypto.randomUUID(),
+            run_id: runState.runId,
+            acp_session_id: activeSessionIdForEvent,
+            kind: "cancelled",
+            pinned: true,
+            reason: runState.cancelReason ?? "cancelled",
+            ts: new Date(this.nowMs()).toISOString(),
+          });
+        }
+        return;
+      }
+
+      let stopReason: string;
+      let collectedChunks: string[];
+
+      try {
+        const res = await clientForTurn.sessionPrompt({
+          sessionId,
+          prompt: promptBlocks,
+        });
+        this.instructionsDeliveredSessions.add(sessionId);
+        stopReason = res.stopReason;
+        collectedChunks = turn.chunks;
+      } catch (err) {
+        if (
+          clientForTurn === this.client &&
+          !clientForTurn.isClosed &&
+          runState &&
+          isConcurrencyBusyError(err)
+        ) {
+          this.runningTurns.delete(sessionId);
+          this.releaseWorkerProcessTurn(clientForTurn, sessionId);
+          const spilled = await this.spillWorkerTurnToSecondary(
+            runState,
+            promptBlocks,
+          );
+          activeSessionIdForEvent = spilled.newSessionId;
+          stopReason = spilled.stopReason;
+          collectedChunks = spilled.chunks;
+        } else {
+          throw err;
+        }
+      }
+
+      const output = collectedChunks.join("");
+      const isCancelled =
+        turn.cancelledByCommand ||
+        Boolean(runState?.cancelled) ||
+        stopReason === "cancelled";
+
+      if (runState) {
+        if (isCancelled) {
+          if (!runState.terminalEmitted) {
+            runState.terminalEmitted = true;
+            this.emitWorkerEvent({
+              type: "host_run_event",
+              event_id: globalThis.crypto.randomUUID(),
+              run_id: runState.runId,
+              acp_session_id: activeSessionIdForEvent,
+              kind: "cancelled",
+              pinned: true,
+              reason: runState.cancelReason ?? "cancelled",
+              ts: new Date(this.nowMs()).toISOString(),
+            });
+          }
+        } else if (runState.terminalEmitted || isFollowUp) {
+          const hasQueuedMore =
+            (this.sessionQueues.get(activeSessionIdForEvent)?.length ?? 0) > 0;
+          if (!runState.terminalEmitted && !hasQueuedMore) {
+            runState.terminalEmitted = true;
+            this.emitWorkerEvent({
+              type: "host_run_event",
+              event_id: globalThis.crypto.randomUUID(),
+              run_id: runState.runId,
+              acp_session_id: activeSessionIdForEvent,
+              kind: "completed",
+              pinned: true,
+              output,
+              ts: new Date(this.nowMs()).toISOString(),
+            });
+          } else if (output.length > 0) {
+            this.emitWorkerEvent({
+              type: "host_run_event",
+              event_id: globalThis.crypto.randomUUID(),
+              run_id: runState.runId,
+              acp_session_id: activeSessionIdForEvent,
+              kind: "agent_message",
+              pinned: false,
+              text: output,
+              ts: new Date(this.nowMs()).toISOString(),
+            });
+          }
+        } else {
+          const hasQueuedMore =
+            (this.sessionQueues.get(activeSessionIdForEvent)?.length ?? 0) > 0;
+          if (hasQueuedMore) {
+            if (output.length > 0) {
+              this.emitWorkerEvent({
+                type: "host_run_event",
+                event_id: globalThis.crypto.randomUUID(),
+                run_id: runState.runId,
+                acp_session_id: activeSessionIdForEvent,
+                kind: "agent_message",
+                pinned: false,
+                text: output,
+                ts: new Date(this.nowMs()).toISOString(),
+              });
+            }
+          } else {
+            runState.terminalEmitted = true;
+            this.emitWorkerEvent({
+              type: "host_run_event",
+              event_id: globalThis.crypto.randomUUID(),
+              run_id: runState.runId,
+              acp_session_id: activeSessionIdForEvent,
+              kind: "completed",
+              pinned: true,
+              output,
+              ts: new Date(this.nowMs()).toISOString(),
+            });
+          }
+        }
+      }
+    } catch (err) {
+      if (!clientForTurn.isClosed && !this.shuttingDown && runState && !runState.terminalEmitted) {
+        runState.terminalEmitted = true;
+        this.emitWorkerEvent({
+          type: "host_run_event",
+          event_id: globalThis.crypto.randomUUID(),
+          run_id: runState.runId,
+          acp_session_id: activeSessionIdForEvent,
+          kind: "failed",
+          pinned: true,
+          reason: "turn_error",
+          error: err instanceof Error ? err.message : String(err),
+          ts: new Date(this.nowMs()).toISOString(),
+        });
+      }
+    } finally {
+      this.runningTurns.delete(sessionId);
+      this.runningTurns.delete(activeSessionIdForEvent);
+      this.releaseWorkerProcessTurn(clientForTurn, sessionId);
+      const latestEntry = this.workerSessions.get(activeSessionIdForEvent);
+      if (latestEntry) {
+        const hasPendingMore =
+          (this.sessionQueues.get(activeSessionIdForEvent)?.length ?? 0) > 0;
+        if (!hasPendingMore) {
+          latestEntry.activeRunId = null;
+        }
+        latestEntry.lastActiveAt = this.nowMs();
+      }
     }
   }
 }

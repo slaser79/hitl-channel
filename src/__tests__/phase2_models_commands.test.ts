@@ -223,6 +223,8 @@ describe("SPEC-HITL-APP-10831 Phase 2 AV5 & AV6: models, session_set_model, comm
       choicesId: true,
       models: false,
       commands: false,
+      peerOrchestration: false,
+      concurrentSessions: false,
     });
 
     const bridge = startHttpBridge({ notification: async () => {} } as unknown as Server, {
@@ -238,6 +240,8 @@ describe("SPEC-HITL-APP-10831 Phase 2 AV5 & AV6: models, session_set_model, comm
       choicesId: true,
       models: false,
       commands: false,
+      peerOrchestration: false,
+      concurrentSessions: false,
     });
 
     const daemon = await startDaemon({
@@ -259,6 +263,8 @@ describe("SPEC-HITL-APP-10831 Phase 2 AV5 & AV6: models, session_set_model, comm
       choicesId: true,
       models: true,
       commands: true,
+      peerOrchestration: true,
+      concurrentSessions: true,
     });
   });
 

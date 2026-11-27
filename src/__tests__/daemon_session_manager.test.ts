@@ -476,18 +476,19 @@ describe("AcpSessionManager (unit — AV3, AV4, AV5, AV8, AV9, AV10)", () => {
     expect(replies.at(-1)?.text).toContain("Directory does not exist");
     expect(rpcLog.length).toBe(rpcsBeforeErr);
 
-    // /new ~/subproj -> absolute cwd, http MCP bearer array, _meta.antigravity.systemPrompt.append
+    // /new ~/subproj -> absolute cwd, http MCP bearer + pre-minted mcpBindingId, _meta.antigravity.systemPrompt.append
     await handlers.onInbound({ text: "/new ~/subproj", meta: {} });
     const newCall = rpcLog.find((r) => r.method === "session/new");
     expect(newCall?.params.cwd).toBe(subDir);
-    expect(newCall?.params.mcpServers).toEqual([
-      {
-        type: "http",
-        name: "hitl-channel",
-        url: "http://127.0.0.1:45555/mcp",
-        headers: [{ name: "Authorization", value: "Bearer secret-mcp-token" }],
-      },
-    ]);
+    const newMcp = (newCall?.params.mcpServers as Array<{ type: string; name: string; url: string; headers: Array<{ name: string; value: string }> }>)?.[0];
+    expect(newMcp?.type).toBe("http");
+    expect(newMcp?.name).toBe("hitl-channel");
+    expect(newMcp?.url).toBe("http://127.0.0.1:45555/mcp");
+    expect(newMcp?.headers[0]).toEqual({ name: "Authorization", value: "Bearer secret-mcp-token" });
+    expect(newMcp?.headers[1]?.name).toBe("X-Hitl-Acp-Session-Id");
+    const bindingId = newMcp?.headers[1]?.value ?? "";
+    expect(bindingId.length).toBeGreaterThan(0);
+    expect(manager.resolveBoundAcpSessionId(bindingId)).toBe("new-0-2");
     expect((newCall?.params._meta as any)?.antigravity?.systemPrompt?.append).toBe(DAEMON_INSTRUCTIONS);
 
     // /sessions -> top 10 + active (outside top 10) appended at #11
