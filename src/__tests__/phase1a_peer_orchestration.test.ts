@@ -1605,7 +1605,7 @@ describe("SPEC-HITL-APP-10832 Phase 1a — Peer Orchestration (AV1, AV1b, AV4, A
         return false;
       }
     });
-    expect(inst!.capabilities).toEqual({
+      expect(inst!.capabilities).toEqual({
       sessions: false,
       streaming: false,
       choicesId: true,
@@ -1614,5 +1614,127 @@ describe("SPEC-HITL-APP-10832 Phase 1a — Peer Orchestration (AV1, AV1b, AV4, A
       peerOrchestration: false,
       concurrentSessions: false,
     });
+  });
+
+  it("echoes host_run_ack with event_id for host_run_start, host_run_message (initial + duplicate), and host_run_cancel", async () => {
+    const dir = makeTempDir();
+    const mgr = new AcpSessionManager({
+      harness: "agy",
+      defaultCwd: dir,
+      mcpUrl: "http://127.0.0.1:41115/mcp",
+      mcpToken: "tok",
+      instanceId: "inst-ack",
+      workerOutboxPath: join(dir, "outbox.jsonl"),
+      transportFactory: () =>
+        new MockAcpTransport((msg, p) => {
+          if (msg.method === "initialize") {
+            p.emit({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: { protocolVersion: 1, agentCapabilities: {} },
+            });
+          } else if (msg.method === "session/new") {
+            p.emit({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: { sessionId: "ws-ack-1" },
+            });
+          } else if (msg.method === "session/prompt") {
+            p.emit({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: { stopReason: "end_turn" },
+            });
+          } else if (msg.method === "session/cancel") {
+            p.emit({ jsonrpc: "2.0", id: msg.id, result: {} });
+          }
+        }),
+    });
+    cleanups.push(() => mgr.shutdown());
+
+    const frames: Record<string, unknown>[] = [];
+    const ws = {
+      readyState: 1,
+      data: { features: new Set(["peer_orchestration"]) },
+      send: (raw: string) => {
+        frames.push(JSON.parse(raw) as Record<string, unknown>);
+        return 1;
+      },
+    };
+    const handlers = mgr.getInboundHandlers();
+
+    await handlers.onControlFrame!(ws, {
+      type: "host_run_start",
+      event_id: "ev-start-1",
+      run_id: "run-ack-1",
+      prompt: "inspect repo",
+      dispatch_depth: 1,
+      message_hop: 0,
+    });
+    expect(
+      frames.some(
+        (f) =>
+          f.type === "host_run_ack" &&
+          f.event_id === "ev-start-1" &&
+          f.run_id === "run-ack-1" &&
+          f.acp_session_id === "ws-ack-1",
+      ),
+    ).toBe(true);
+
+    frames.length = 0;
+    await handlers.onControlFrame!(ws, {
+      type: "host_run_message",
+      event_id: "ev-msg-1",
+      run_id: "run-ack-1",
+      acp_session_id: "ws-ack-1",
+      kind: "agent_message",
+      text: "hello",
+      message_hop: 1,
+    });
+    expect(
+      frames.filter(
+        (f) =>
+          f.type === "host_run_ack" &&
+          f.event_id === "ev-msg-1" &&
+          f.run_id === "run-ack-1",
+      ),
+    ).toHaveLength(1);
+
+    // Duplicate event_id replays idempotent host_run_ack
+    frames.length = 0;
+    await handlers.onControlFrame!(ws, {
+      type: "host_run_message",
+      event_id: "ev-msg-1",
+      run_id: "run-ack-1",
+      acp_session_id: "ws-ack-1",
+      kind: "agent_message",
+      text: "hello",
+      message_hop: 1,
+    });
+    expect(
+      frames.filter(
+        (f) =>
+          f.type === "host_run_ack" &&
+          f.event_id === "ev-msg-1" &&
+          f.run_id === "run-ack-1",
+      ),
+    ).toHaveLength(1);
+
+    frames.length = 0;
+    await handlers.onControlFrame!(ws, {
+      type: "host_run_cancel",
+      event_id: "ev-cancel-1",
+      run_id: "run-ack-1",
+      acp_session_id: "ws-ack-1",
+      reason: "user_cancelled",
+    });
+    expect(
+      frames.some(
+        (f) =>
+          f.type === "host_run_ack" &&
+          f.event_id === "ev-cancel-1" &&
+          f.run_id === "run-ack-1",
+      ),
+    ).toBe(true);
   });
 });

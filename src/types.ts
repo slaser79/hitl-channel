@@ -376,6 +376,7 @@ export interface BufferedReply {
 
 export interface HostRunStartFrame {
   type: "host_run_start";
+  event_id?: string;
   run_id: string;
   prompt: string;
   cwd?: string;
@@ -404,6 +405,7 @@ export interface HostRunMessageFrame {
 
 export interface HostRunCancelFrame {
   type: "host_run_cancel";
+  event_id?: string;
   run_id: string;
   acp_session_id?: string;
   reason?: string;

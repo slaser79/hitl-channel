@@ -2235,12 +2235,12 @@ export class AcpSessionManager {
     }
 
     if (frameType === "host_run_message") {
-      await this.handleHostRunMessage(frame as unknown as HostRunMessageFrame);
+      await this.handleHostRunMessage(ws, frame as unknown as HostRunMessageFrame);
       return;
     }
 
     if (frameType === "host_run_cancel") {
-      await this.handleHostRunCancel(frame as unknown as HostRunCancelFrame);
+      await this.handleHostRunCancel(ws, frame as unknown as HostRunCancelFrame);
       return;
     }
 
@@ -4948,14 +4948,19 @@ export class AcpSessionManager {
   ): Promise<void> {
     const runId = typeof frame.run_id === "string" ? frame.run_id.trim() : "";
     const prompt = typeof frame.prompt === "string" ? frame.prompt : "";
+    const eventId =
+      typeof frame.event_id === "string" ? frame.event_id.trim() : "";
     if (!runId) return;
 
     const existing = this.workerRunsById.get(runId);
     if (existing) {
-      if (existing.acpSessionId) {
+      if (existing.acpSessionId || eventId) {
         this.sendHostRunAck(ws, {
+          ...(eventId ? { event_id: eventId } : {}),
           run_id: runId,
-          acp_session_id: existing.acpSessionId,
+          ...(existing.acpSessionId
+            ? { acp_session_id: existing.acpSessionId }
+            : {}),
         });
       }
       return;
@@ -5036,7 +5041,11 @@ export class AcpSessionManager {
         cwd: runState.cwd,
       });
 
-      this.sendHostRunAck(ws, { run_id: runId, acp_session_id: sessionId });
+      this.sendHostRunAck(ws, {
+        ...(eventId ? { event_id: eventId } : {}),
+        run_id: runId,
+        acp_session_id: sessionId,
+      });
       this.emitWorkerEvent({
         type: "host_run_event",
         event_id: globalThis.crypto.randomUUID(),
@@ -5075,12 +5084,11 @@ export class AcpSessionManager {
     }
   }
 
-  private async handleHostRunMessage(frame: HostRunMessageFrame): Promise<void> {
+  private async handleHostRunMessage(
+    ws: HitlWebSocket,
+    frame: HostRunMessageFrame,
+  ): Promise<void> {
     const eventId = typeof frame.event_id === "string" ? frame.event_id.trim() : "";
-    if (eventId && !this.recordInboundEventId(eventId)) {
-      return;
-    }
-
     const runState =
       typeof frame.run_id === "string"
         ? this.workerRunsById.get(frame.run_id)
@@ -5089,6 +5097,21 @@ export class AcpSessionManager {
       (typeof frame.acp_session_id === "string" && frame.acp_session_id.trim()) ||
       runState?.acpSessionId ||
       "";
+    const sendAck = (): void => {
+      this.sendHostRunAck(ws, {
+        ...(eventId ? { event_id: eventId } : {}),
+        ...(typeof frame.run_id === "string" && frame.run_id.trim().length > 0
+          ? { run_id: frame.run_id.trim() }
+          : {}),
+        ...(acpSessionId ? { acp_session_id: acpSessionId } : {}),
+      });
+    };
+
+    if (eventId && !this.recordInboundEventId(eventId)) {
+      sendAck();
+      return;
+    }
+
     if (!acpSessionId) return;
 
     const ctx = this.workerContextBySessionId.get(acpSessionId);
@@ -5120,15 +5143,22 @@ export class AcpSessionManager {
           `<hitl_system_event type="choice_response" choices_id="${choicesId}">${answerText}</hitl_system_event>`,
           { runId: pendingChoice.runId, isFollowUp: true },
         );
+        sendAck();
         return;
       }
 
       const sessPerms = this.pendingPermissionsBySession.get(acpSessionId);
-      if (!sessPerms || sessPerms.length === 0) return;
+      if (!sessPerms || sessPerms.length === 0) {
+        sendAck();
+        return;
+      }
       const permIdx = choicesId
         ? sessPerms.findIndex((p) => !p.resolved && p.choicesId === choicesId)
         : sessPerms.findIndex((p) => !p.resolved);
-      if (permIdx === -1) return;
+      if (permIdx === -1) {
+        sendAck();
+        return;
+      }
       const perm = sessPerms[permIdx]!;
       const matchedOpt =
         perm.options.find((o) => o.optionId === optionId) ??
@@ -5161,6 +5191,7 @@ export class AcpSessionManager {
         perm.promptHash,
         acpSessionId,
       );
+      sendAck();
       return;
     }
 
@@ -5182,17 +5213,39 @@ export class AcpSessionManager {
         runId: frame.run_id,
         isFollowUp: true,
       });
+      sendAck();
     }
   }
 
-  private async handleHostRunCancel(frame: HostRunCancelFrame): Promise<void> {
+  private async handleHostRunCancel(
+    ws: HitlWebSocket,
+    frame: HostRunCancelFrame,
+  ): Promise<void> {
     const runId = typeof frame.run_id === "string" ? frame.run_id.trim() : "";
+    const eventId =
+      typeof frame.event_id === "string" ? frame.event_id.trim() : "";
     let runState = runId ? this.workerRunsById.get(runId) : undefined;
     if (!runState && typeof frame.acp_session_id === "string") {
       const ctx = this.workerContextBySessionId.get(frame.acp_session_id);
       if (ctx) runState = this.workerRunsById.get(ctx.runId);
     }
-    if (!runState || runState.terminalEmitted) return;
+    const sid =
+      runState?.acpSessionId ||
+      (typeof frame.acp_session_id === "string" ? frame.acp_session_id : "") ||
+      "";
+    const sendCancelAck = (): void => {
+      if (eventId || runId) {
+        this.sendHostRunAck(ws, {
+          ...(eventId ? { event_id: eventId } : {}),
+          ...(runId ? { run_id: runId } : {}),
+          ...(sid ? { acp_session_id: sid } : {}),
+        });
+      }
+    };
+    if (!runState || runState.terminalEmitted) {
+      sendCancelAck();
+      return;
+    }
 
     runState.cancelled = true;
     runState.cancelReason =
@@ -5200,7 +5253,6 @@ export class AcpSessionManager {
         ? frame.reason.trim()
         : "cancelled";
 
-    const sid = runState.acpSessionId || frame.acp_session_id || "";
     if (!sid) {
       runState.terminalEmitted = true;
       this.emitWorkerEvent({
@@ -5213,6 +5265,7 @@ export class AcpSessionManager {
         reason: runState.cancelReason,
         ts: new Date(this.nowMs()).toISOString(),
       });
+      sendCancelAck();
       return;
     }
 
@@ -5234,6 +5287,7 @@ export class AcpSessionManager {
       if (sessEntry && !sessEntry.client.isClosed) {
         sessEntry.client.sessionCancel(sid);
       }
+      sendCancelAck();
       return;
     }
 
@@ -5254,6 +5308,7 @@ export class AcpSessionManager {
         ts: new Date(this.nowMs()).toISOString(),
       });
     }
+    sendCancelAck();
   }
 
   private handleHostRunAck(frame: HostRunAckFrame): void {
