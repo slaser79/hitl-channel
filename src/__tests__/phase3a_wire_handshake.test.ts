@@ -5,7 +5,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { Bonjour } from "bonjour-service";
+import { Bonjour, type ServiceConfig } from "bonjour-service";
 import { spawnAcpTransport } from "../acp_client.js";
 import { startDaemon } from "../daemon.js";
 import {
@@ -192,7 +192,7 @@ describe("SPEC-HITL-APP-10827 Milestone 3a AV1: /instance, mDNS, client_hello fe
     expect("defaultCwd" in bridgeInst).toBe(false);
   });
 
-  it("AV1: startMDNS includes mode and harness in TXT records and never leaks defaultCwd", () => {
+  it("AV1: startMDNS includes mode and harness in TXT records and never leaks defaultCwd", async () => {
     const published: Array<Record<string, unknown>> = [];
     const publishSpy = spyOn(Bonjour.prototype, "publish").mockImplementation(
       (opts: unknown) => {
@@ -214,6 +214,8 @@ describe("SPEC-HITL-APP-10827 Milestone 3a AV1: /instance, mDNS, client_hello fe
     } as { mode?: string; harness?: string });
 
     expect(published.length).toBe(1);
+    expect(published[0]!.type).toBe("hitl-channel");
+    expect(published[0]!.protocol).toBe("tcp");
     const txt = published[0]!.txt as Record<string, string>;
     expect(txt.instanceId).toBe("inst-codex-1234");
     expect(txt.displayName).toBe("codex@Mac");
@@ -221,6 +223,12 @@ describe("SPEC-HITL-APP-10827 Milestone 3a AV1: /instance, mDNS, client_hello fe
     expect(txt.harness).toBe("codex");
     expect("defaultCwd" in txt).toBe(false);
     expect(JSON.stringify(txt)).not.toContain("/secret/user/path");
+
+    // Verify bonjour-service encodes type/protocol cleanly to _hitl-channel._tcp.local
+    const mod = await import("bonjour-service/dist/lib/service.js");
+    const encoded = new mod.Service(published[0] as unknown as ServiceConfig);
+    expect(encoded.type).toBe("_hitl-channel._tcp");
+    expect(encoded.fqdn.endsWith("._hitl-channel._tcp.local")).toBe(true);
   });
 
   it("AV1: broadcastToCapable & sendControlToClient isolate Phase-3 frames from legacy sockets and never touch replyBuffer", () => {

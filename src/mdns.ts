@@ -50,7 +50,8 @@ export function startMDNS(
 
     advertisedService = bonjour.publish({
       name: serviceName,
-      type: "_hitl-channel._tcp",
+      type: "hitl-channel",
+      protocol: "tcp",
       port,
       txt,
     });
