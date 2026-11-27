@@ -789,6 +789,7 @@ interface WorkerRunState {
   cwd: string;
   streamDeltas?: boolean;
   cancelled: boolean;
+  closeAfterCancel?: boolean;
   cancelReason?: string;
   terminalEmitted: boolean;
   ws?: HitlWebSocket;
@@ -5050,6 +5051,9 @@ export class AcpSessionManager {
             ts: new Date(this.nowMs()).toISOString(),
           });
         }
+        if (runState.closeAfterCancel) {
+          await this.evictWorkerSession(sessionId);
+        }
         return;
       }
 
@@ -5274,21 +5278,25 @@ export class AcpSessionManager {
     if (!runState && externalKey) {
       for (const entry of this.workerSessions.values()) {
         if (entry.externalSessionKey === externalKey) {
-          const entryRunId =
-            entry.activeRunId ??
-            this.workerContextBySessionId.get(entry.sessionId)?.runId;
-          if (entryRunId) {
-            runState = this.workerRunsById.get(entryRunId);
+          if (entry.activeRunId) {
+            runState = this.workerRunsById.get(entry.activeRunId);
           }
           break;
         }
       }
-      if (!runState) {
+      if (!runState || runState.terminalEmitted) {
+        let lastMatch: WorkerRunState | undefined;
         for (const candidate of this.workerRunsById.values()) {
           if (candidate.externalSessionKey === externalKey) {
-            runState = candidate;
-            if (!candidate.terminalEmitted) break;
+            lastMatch = candidate;
+            if (!candidate.terminalEmitted) {
+              runState = candidate;
+              break;
+            }
           }
+        }
+        if (!runState && lastMatch) {
+          runState = lastMatch;
         }
       }
     }
@@ -5341,6 +5349,9 @@ export class AcpSessionManager {
       typeof frame.reason === "string" && frame.reason.trim().length > 0
         ? frame.reason.trim()
         : "cancelled";
+    if (closeSession) {
+      runState.closeAfterCancel = true;
+    }
 
     if (!sid) {
       runState.terminalEmitted = true;

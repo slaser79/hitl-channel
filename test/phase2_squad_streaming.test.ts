@@ -666,4 +666,133 @@ describe("SPEC-HITL-APP-10832 Phase 2a — Squad Mode opt-in worker streaming & 
       ),
     ).toBe(true);
   });
+
+  it("cancelling by external_session_key while a new run allocates skips stale completed runs and honours close_session eviction", async () => {
+    const dir = makeTempDir();
+    const closedSessions: string[] = [];
+    let sessionCount = 0;
+    let releaseSecondSessionAlloc: (() => void) | null = null;
+    const frames: Array<Record<string, unknown>> = [];
+
+    const manager = new AcpSessionManager({
+      harness: "agy",
+      defaultCwd: dir,
+      mcpUrl: "http://127.0.0.1:41204/mcp",
+      mcpToken: "tok",
+      instanceId: "inst-p2a-alloc-race",
+      workerOutboxPath: join(dir, "outbox.jsonl"),
+      transportFactory: () =>
+        new MockAcpTransport((msg, p) => {
+          if (msg.method === "initialize") {
+            p.emit({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: {
+                protocolVersion: 1,
+                agentCapabilities: { sessionCapabilities: { close: {} } },
+              },
+            });
+          } else if (msg.method === "session/new") {
+            sessionCount += 1;
+            const sid = `alloc-sess-${sessionCount}`;
+            if (sessionCount === 2) {
+              new Promise<void>((resolve) => {
+                releaseSecondSessionAlloc = resolve;
+              }).then(() => {
+                p.emit({ jsonrpc: "2.0", id: msg.id, result: { sessionId: sid } });
+              });
+              return;
+            }
+            p.emit({ jsonrpc: "2.0", id: msg.id, result: { sessionId: sid } });
+          } else if (msg.method === "session/close") {
+            const params = msg.params as { sessionId: string };
+            closedSessions.push(params.sessionId);
+            p.emit({ jsonrpc: "2.0", id: msg.id, result: {} });
+          } else if (msg.method === "session/prompt") {
+            p.emit({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+          }
+        }),
+      broadcastToCapableFn: (_feature, frame) => {
+        frames.push(frame as unknown as Record<string, unknown>);
+        return 1;
+      },
+    });
+    cleanups.push(() => manager.shutdown());
+
+    const ws = makeWs();
+    const handlers = manager.getInboundHandlers();
+
+    // Case A (P1 regression): Turn 1 completes so workerSessions.activeRunId is null while
+    // workerContextBySessionId still points to Turn 1. A Turn 2 allocation for the same
+    // external_session_key must still be resolved & cancelled by external_session_key.
+    await handlers.onControlFrame!(ws, {
+      type: "host_run_start",
+      run_id: "race-turn-1",
+      external_session_key: "squad:p1-race",
+      prompt: "turn 1",
+      dispatch_depth: 1,
+      message_hop: 0,
+    });
+    await waitFor(() =>
+      frames.some(
+        (f) => f.type === "host_run_event" && f.run_id === "race-turn-1" && f.kind === "completed",
+      ),
+    );
+
+    // Start Turn 2 (yields in allocateWorkerSession) and immediately send cancel before activeRunId binds
+    const turn2StartPromise = handlers.onControlFrame!(ws, {
+      type: "host_run_start",
+      run_id: "race-turn-2",
+      external_session_key: "squad:p1-race",
+      prompt: "turn 2",
+      dispatch_depth: 1,
+      message_hop: 0,
+    });
+    await handlers.onControlFrame!(ws, {
+      type: "host_run_cancel",
+      event_id: "ev-race-p1",
+      external_session_key: "squad:p1-race",
+      reason: "pause_during_alloc",
+    });
+    await turn2StartPromise;
+
+    await waitFor(() =>
+      frames.some(
+        (f) => f.type === "host_run_event" && f.run_id === "race-turn-2" && f.kind === "cancelled",
+      ),
+    );
+    expect(
+      frames.some(
+        (f) => f.type === "host_run_event" && f.run_id === "race-turn-2" && f.kind === "completed",
+      ),
+    ).toBe(false);
+
+    // Case B (P2 regression): host_run_cancel with close_session: true while a brand-new session
+    // is still awaiting allocateWorkerSession() must evict that session once allocation finishes.
+    const freshStartPromise = handlers.onControlFrame!(ws, {
+      type: "host_run_start",
+      run_id: "race-fresh-1",
+      external_session_key: "squad:p2-race",
+      prompt: "fresh turn",
+      dispatch_depth: 1,
+      message_hop: 0,
+    });
+    await waitFor(() => releaseSecondSessionAlloc !== null);
+
+    await handlers.onControlFrame!(ws, {
+      type: "host_run_cancel",
+      event_id: "ev-race-p2",
+      external_session_key: "squad:p2-race",
+      close_session: true,
+      reason: "conclude_during_alloc",
+    });
+
+    // Finish delayed session/new allocation after cancel was processed
+    releaseSecondSessionAlloc!();
+    await freshStartPromise;
+    await waitFor(() => closedSessions.includes("alloc-sess-2"));
+
+    expect(closedSessions).toContain("alloc-sess-2");
+    expect(manager.getStateSnapshot().workerSessionCount).toBe(1); // only alloc-sess-1 remains
+  });
 });
