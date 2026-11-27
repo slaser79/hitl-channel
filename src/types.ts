@@ -327,6 +327,7 @@ export interface StreamDeltaFrame {
   type: "stream_delta";
   sessionId: string;
   turnId: string;
+  runId?: string;
   seq: number;
   delta: string;
   reset?: boolean;
@@ -337,6 +338,7 @@ export interface ToolProgressFrame {
   type: "tool_progress";
   sessionId: string;
   turnId: string;
+  runId?: string;
   toolCallId: string;
   name: string;
   title: string;
@@ -386,6 +388,7 @@ export interface HostRunStartFrame {
   episode_root_run_id?: string | null;
   dispatch_depth: number;
   message_hop: number;
+  stream_deltas?: boolean;
   request_id?: string;
 }
 
@@ -406,8 +409,10 @@ export interface HostRunMessageFrame {
 export interface HostRunCancelFrame {
   type: "host_run_cancel";
   event_id?: string;
-  run_id: string;
+  run_id?: string;
   acp_session_id?: string;
+  external_session_key?: string;
+  close_session?: boolean;
   reason?: string;
 }
 

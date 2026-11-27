@@ -787,6 +787,7 @@ interface WorkerRunState {
   messageHop: number;
   externalSessionKey?: string;
   cwd: string;
+  streamDeltas?: boolean;
   cancelled: boolean;
   cancelReason?: string;
   terminalEmitted: boolean;
@@ -802,6 +803,7 @@ interface WorkerSessionEntry {
   createdAt: number;
   lastActiveAt: number;
   activeRunId: string | null;
+  closeAfterTurn?: boolean;
 }
 
 interface WorkerProcessEntry {
@@ -836,6 +838,7 @@ interface RunningTurn {
   sessionId: string;
   isWorker?: boolean;
   workerRunId?: string;
+  streamDeltas?: boolean;
   chunks: string[];
   delegationMessageId: string | null;
   clientMessageId: string | null;
@@ -1541,6 +1544,7 @@ export class AcpSessionManager {
       type: "stream_delta",
       sessionId: turn.sessionId,
       turnId: turn.turnId,
+      ...(turn.workerRunId ? { runId: turn.workerRunId } : {}),
       seq: ++turn.deltaSeq,
       delta,
       ...(opts?.truncated ? { truncated: true } : {}),
@@ -1603,7 +1607,7 @@ export class AcpSessionManager {
     if (!turn.deltaTimer) {
       turn.deltaTimer = setTimeout(() => {
         turn.deltaTimer = null;
-        if (this.runningTurn === turn) {
+        if (this.runningTurns.get(turn.sessionId) === turn) {
           this.flushPendingTurnDelta(turn);
         }
       }, this.streamCoalesceMs);
@@ -1674,6 +1678,7 @@ export class AcpSessionManager {
       type: "tool_progress",
       sessionId: turn.sessionId,
       turnId: turn.turnId,
+      ...(turn.workerRunId ? { runId: turn.workerRunId } : {}),
       toolCallId,
       name,
       title,
@@ -2953,6 +2958,10 @@ export class AcpSessionManager {
         update.toolCallId.length > 0
       ) {
         this.recordSeenToolCall(params.sessionId, update.toolCallId, update);
+        const workerTurn = this.runningTurns.get(params.sessionId);
+        if (workerTurn && workerTurn.isWorker && workerTurn.streamDeltas) {
+          this.handleRunningTurnToolUpdate(workerTurn, update);
+        }
         return;
       }
       if (update.sessionUpdate === "agent_message_chunk") {
@@ -2962,6 +2971,9 @@ export class AcpSessionManager {
         const workerTurn = this.runningTurns.get(params.sessionId);
         if (workerTurn && workerTurn.isWorker) {
           workerTurn.chunks.push(chunkText);
+          if (workerTurn.streamDeltas) {
+            this.queueStreamDelta(workerTurn, chunkText);
+          }
         }
       }
       return;
@@ -4702,6 +4714,9 @@ export class AcpSessionManager {
         if (proc && proc.busySessionIds.size > 0) {
           await this.acquireSecondaryWorkerProcess(requestedSessionId);
         }
+        if (externalKey && !existing.externalSessionKey) {
+          existing.externalSessionKey = externalKey;
+        }
         existing.lastActiveAt = this.nowMs();
         return {
           client: existing.client,
@@ -4900,6 +4915,7 @@ export class AcpSessionManager {
       createdAt: this.nowMs(),
       lastActiveAt: this.nowMs(),
       activeRunId: runState.runId,
+      ...(oldEntry?.closeAfterTurn ? { closeAfterTurn: true } : {}),
     });
     this.sendHostRunAck(runState.ws, {
       run_id: runState.runId,
@@ -4911,6 +4927,7 @@ export class AcpSessionManager {
       sessionId: newSid,
       isWorker: true,
       workerRunId: runState.runId,
+      streamDeltas: Boolean(runState.streamDeltas),
       chunks: [],
       delegationMessageId: null,
       clientMessageId: null,
@@ -4931,12 +4948,21 @@ export class AcpSessionManager {
         prompt: promptBlocks,
       });
       this.instructionsDeliveredSessions.add(newSid);
+      if (spilledTurn.streamDeltas) {
+        this.flushPendingTurnDelta(spilledTurn);
+      }
       return {
         stopReason: promptRes.stopReason,
         chunks: spilledTurn.chunks,
         newSessionId: newSid,
       };
+    } catch (err) {
+      if (spilledTurn.streamDeltas) {
+        this.flushPendingTurnDelta(spilledTurn);
+      }
+      throw err;
     } finally {
+      this.clearTurnDeltaTimer(spilledTurn);
       this.runningTurns.delete(newSid);
       this.releaseWorkerProcessTurn(proc.client, newSid);
     }
@@ -4969,6 +4995,11 @@ export class AcpSessionManager {
     const absCwd = frame.cwd
       ? expandHomeAndResolve(frame.cwd, this.defaultCwd)
       : this.defaultCwd;
+    const externalKey =
+      typeof frame.external_session_key === "string" &&
+      frame.external_session_key.trim().length > 0
+        ? frame.external_session_key.trim()
+        : undefined;
     const runState: WorkerRunState = {
       runId,
       acpSessionId: frame.acp_session_id ?? "",
@@ -4977,10 +5008,9 @@ export class AcpSessionManager {
       dispatchDepth:
         typeof frame.dispatch_depth === "number" ? frame.dispatch_depth : 0,
       messageHop: typeof frame.message_hop === "number" ? frame.message_hop : 0,
-      ...(typeof frame.external_session_key === "string"
-        ? { externalSessionKey: frame.external_session_key }
-        : {}),
+      ...(externalKey ? { externalSessionKey: externalKey } : {}),
       cwd: absCwd,
+      streamDeltas: frame.stream_deltas === true,
       cancelled: false,
       terminalEmitted: false,
       ws,
@@ -5005,6 +5035,7 @@ export class AcpSessionManager {
 
     try {
       const { sessionId } = await this.allocateWorkerSession(frame);
+      runState.acpSessionId = sessionId;
       if (runState.cancelled) {
         if (!runState.terminalEmitted) {
           runState.terminalEmitted = true;
@@ -5022,7 +5053,6 @@ export class AcpSessionManager {
         return;
       }
 
-      runState.acpSessionId = sessionId;
       const sessEntry = this.workerSessions.get(sessionId);
       if (sessEntry) {
         sessEntry.activeRunId = runId;
@@ -5224,17 +5254,57 @@ export class AcpSessionManager {
     const runId = typeof frame.run_id === "string" ? frame.run_id.trim() : "";
     const eventId =
       typeof frame.event_id === "string" ? frame.event_id.trim() : "";
+    const requestedSessionId =
+      typeof frame.acp_session_id === "string" &&
+      frame.acp_session_id.trim().length > 0
+        ? frame.acp_session_id.trim()
+        : undefined;
+    const externalKey =
+      typeof frame.external_session_key === "string" &&
+      frame.external_session_key.trim().length > 0
+        ? frame.external_session_key.trim()
+        : undefined;
+    const closeSession = frame.close_session === true;
+
     let runState = runId ? this.workerRunsById.get(runId) : undefined;
-    if (!runState && typeof frame.acp_session_id === "string") {
-      const ctx = this.workerContextBySessionId.get(frame.acp_session_id);
+    if (!runState && requestedSessionId) {
+      const ctx = this.workerContextBySessionId.get(requestedSessionId);
       if (ctx) runState = this.workerRunsById.get(ctx.runId);
     }
-    const sid =
-      runState?.acpSessionId ||
-      (typeof frame.acp_session_id === "string" ? frame.acp_session_id : "") ||
-      "";
+    if (!runState && externalKey) {
+      for (const entry of this.workerSessions.values()) {
+        if (entry.externalSessionKey === externalKey) {
+          const entryRunId =
+            entry.activeRunId ??
+            this.workerContextBySessionId.get(entry.sessionId)?.runId;
+          if (entryRunId) {
+            runState = this.workerRunsById.get(entryRunId);
+          }
+          break;
+        }
+      }
+      if (!runState) {
+        for (const candidate of this.workerRunsById.values()) {
+          if (candidate.externalSessionKey === externalKey) {
+            runState = candidate;
+            if (!candidate.terminalEmitted) break;
+          }
+        }
+      }
+    }
+
+    let sid = runState?.acpSessionId || requestedSessionId || "";
+    if (!sid && externalKey) {
+      for (const entry of this.workerSessions.values()) {
+        if (entry.externalSessionKey === externalKey) {
+          sid = entry.sessionId;
+          break;
+        }
+      }
+    }
+
     const sendCancelAck = (): void => {
-      if (eventId || runId) {
+      if (eventId || runId || sid) {
         this.sendHostRunAck(ws, {
           ...(eventId ? { event_id: eventId } : {}),
           ...(runId ? { run_id: runId } : {}),
@@ -5242,7 +5312,26 @@ export class AcpSessionManager {
         });
       }
     };
+
     if (!runState || runState.terminalEmitted) {
+      if (closeSession && sid) {
+        const sessEntry = this.workerSessions.get(sid);
+        if (sessEntry) {
+          if (this.runningTurns.has(sid) || !this.isWorkerSessionIdle(sid)) {
+            sessEntry.closeAfterTurn = true;
+            this.cancelWorkerPendingPermissions(sid, true);
+            const activeTurn = this.runningTurns.get(sid);
+            if (activeTurn && activeTurn.isWorker) {
+              activeTurn.cancelledByCommand = true;
+              if (!sessEntry.client.isClosed) {
+                sessEntry.client.sessionCancel(sid);
+              }
+            }
+          } else {
+            await this.evictWorkerSession(sid);
+          }
+        }
+      }
       sendCancelAck();
       return;
     }
@@ -5283,6 +5372,9 @@ export class AcpSessionManager {
     const activeTurn = this.runningTurns.get(sid);
     const sessEntry = this.workerSessions.get(sid);
     if (activeTurn && activeTurn.isWorker && activeTurn.workerRunId === runState.runId) {
+      if (closeSession && sessEntry) {
+        sessEntry.closeAfterTurn = true;
+      }
       activeTurn.cancelledByCommand = true;
       if (sessEntry && !sessEntry.client.isClosed) {
         sessEntry.client.sessionCancel(sid);
@@ -5308,6 +5400,15 @@ export class AcpSessionManager {
         ts: new Date(this.nowMs()).toISOString(),
       });
     }
+
+    if (closeSession && sessEntry) {
+      if (this.runningTurns.has(sid) || !this.isWorkerSessionIdle(sid)) {
+        sessEntry.closeAfterTurn = true;
+      } else {
+        await this.evictWorkerSession(sid);
+      }
+    }
+
     sendCancelAck();
   }
 
@@ -5502,6 +5603,7 @@ export class AcpSessionManager {
       sessionId,
       isWorker: true,
       workerRunId: runState?.runId,
+      streamDeltas: Boolean(runState?.streamDeltas),
       chunks: [],
       delegationMessageId: null,
       clientMessageId: null,
@@ -5585,6 +5687,10 @@ export class AcpSessionManager {
         }
       }
 
+      if (turn.streamDeltas) {
+        this.flushPendingTurnDelta(turn);
+      }
+
       const output = collectedChunks.join("");
       const isCancelled =
         turn.cancelledByCommand ||
@@ -5665,6 +5771,9 @@ export class AcpSessionManager {
         }
       }
     } catch (err) {
+      if (turn.streamDeltas) {
+        this.flushPendingTurnDelta(turn);
+      }
       if (!clientForTurn.isClosed && !this.shuttingDown && runState && !runState.terminalEmitted) {
         runState.terminalEmitted = true;
         this.emitWorkerEvent({
@@ -5680,6 +5789,7 @@ export class AcpSessionManager {
         });
       }
     } finally {
+      this.clearTurnDeltaTimer(turn);
       this.runningTurns.delete(sessionId);
       this.runningTurns.delete(activeSessionIdForEvent);
       this.releaseWorkerProcessTurn(clientForTurn, sessionId);
@@ -5691,6 +5801,10 @@ export class AcpSessionManager {
           latestEntry.activeRunId = null;
         }
         latestEntry.lastActiveAt = this.nowMs();
+      }
+      const entryNow = this.workerSessions.get(activeSessionIdForEvent);
+      if (entryNow?.closeAfterTurn && entryNow.activeRunId === null) {
+        await this.evictWorkerSession(activeSessionIdForEvent);
       }
     }
   }
